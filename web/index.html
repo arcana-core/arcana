@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Arcana Chat</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <!-- Two-column layout: left chat, right tabbed display -->
+  <div class="layout" style="display:flex;height:100vh;">
+    <div class="left" style="flex:0 0 42%;min-width:360px;max-width:640px;border-right:1px solid #e7e7e7;background:#f5f5f5;display:flex;position:relative;">
+    <div id="sidebar" class="sidebar" style="width:240px">
+      <div style="padding:8px"><button id="new-session">新会话</button></div>
+      <div id="session-list" ></div>
+    </div>
+      <div class="wechat">
+    <header class="chat-header">
+      <div class="title">Arcana</div>
+    </header>
+    <main id="messages" class="chat-body">
+      <div class="msg other">
+        <img class="avatar" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><circle cx='32' cy='32' r='32' fill='%23e5e5e5'/><text x='50%' y='55%' dominant-baseline='middle' text-anchor='middle' fill='%23999' font-size='28'>A</text></svg>" alt="bot" />
+        <div class="bubble">欢迎使用 Arcana，对我说点什么吧～</div>
+      </div>
+    </main>
+    <footer class="composer">
+      <button class="icon" title="更多">＋</button>
+      <textarea id="input" rows="1" placeholder="发送消息"></textarea>
+      <button id="send" class="send">发送</button>
+    </footer>
+      <div id="more-panel" style="position:absolute;left:8px;right:8px;bottom:66px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);padding:10px;display:none;">
+        <div style="font-weight:600;margin-bottom:6px;">高级选项</div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444;">
+          <input id="fullshell" type="checkbox" />
+          允许本次会话完全开放命令行
+        </label>
+        <div style="color:#a00;font-size:12px;margin-top:6px;">高风险：仅在受信环境、确有需要时临时开启。关闭后恢复受限模式。</div>
+        <hr style="margin:10px 0;border:none;border-top:1px dashed #eee;" />
+        <div style="font-weight:600;margin-bottom:6px;">设置 / 诊断</div>
+        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;">
+          <div>Provider</div>
+          <input id="cfg-provider" placeholder="openai|anthropic|google|openrouter|xai" />
+          <div>Model</div>
+          <input id="cfg-model" placeholder="provider:model-id 或仅 model-id" />
+          <div>Base URL</div>
+          <input id="cfg-base-url" placeholder="可选，自定义网关" />
+          <div>API Key</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input id="cfg-key" type="password" placeholder="仅用于更新，不会回显" />
+            <span id="cfg-key-set" style="font-size:12px;color:#666;">未设置</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <button id="cfg-save">保存设置</button>
+          <button id="cfg-run-doctor">运行诊断</button>
+          <button id="cfg-support-bundle">导出支持包</button>
+          <span id="support-link" style="margin-left:auto;font-size:12px;"></span>
+        </div>
+      </div>
+  </div>
+    </div>
+    <div class="right" style="flex:1;display:flex;flex-direction:column;min-width:0;background:#fff;">
+      <div class="display" style="display:flex;flex-direction:column;flex:1;min-height:0;">
+        <div class="tabs-bar" id="tabs-bar" style="display:flex;gap:4px;padding:8px;background:#fafafa;border-bottom:1px solid #e7e7e7;position:sticky;top:0;z-index:2;flex-wrap:wrap;">
+          <button class="tab active" data-tab="main">主Agent</button>
+          <button class="tab" data-tab="tools">工具</button>
+          <button class="tab" data-tab="subagents">子Agent</button>
+        </div>
+        <div class="tabs-views" id="tabs-views" style="flex:1;overflow:auto;background:#fff;">
+          <section id="logs-main" class="logs"></section>
+          <section id="logs-tools" class="logs" style="display:none"></section>
+          <section id="logs-subagents" class="logs" style="display:none"></section>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- Live2D 已暂时下线：保留占位但不加载/渲染 -->
+  <!-- <div id='live2d-stage' aria-hidden='true'></div> -->
+
+  <!--   <script src='https://cdn.jsdelivr.net/npm/pixi.js@6.5.8/dist/browser/pixi.min.js'></script> -->
+  <!--   <script src='https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js'></script> -->
+  <script src='app.js'></script>
+</body>
+</html>

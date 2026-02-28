@@ -1,0 +1,25 @@
+{
+  "name": "arcana",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "arcana": "./bin/arcana.js"
+  },
+  "scripts": {
+    "chat": "node ./bin/arcana.js chat",
+    "web:navigate": "node ./bin/arcana.js web navigate",
+    "web:extract": "node ./bin/arcana.js web extract",
+    "web:serve": "node ./server/server.mjs",
+    "doctor": "node ./bin/arcana.js doctor",
+    "support-bundle": "node ./bin/arcana.js support-bundle",
+    "web:search": "node ./bin/arcana.js web search",
+    "timer:once": "node ./bin/arcana.js timer once",
+    "timer:serve": "node ./bin/arcana.js timer serve"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.54.0",
+    "@mariozechner/pi-coding-agent": "^0.54.0",
+    "@sinclair/typebox": "^0.32.35",
+    "playwright": "^1.58.2"
+  }
+}
