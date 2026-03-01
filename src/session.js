@@ -7,6 +7,7 @@ import { ToolHostClient } from './tool-host-client.js';
 import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractTool, createProxyWebSearchTool } from './tools-toolhost-proxies.js';
 import createCodexSubagentTool from './tools-codex-subagent.js';
 import createNotebookTool from './tools-notebook.js';
+import createMemoryTools from './tools-memory.js';
 import createSubagentsTool from './tools-subagents.js';
 import { createTimerTool } from './tools-timer.js';
 import { loadArcanaConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
@@ -58,19 +59,33 @@ export async function createArcanaSession(opts={}){
   const baseOverride = normalizeOpenAIBase(cfg?.base_url || process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || '');
   if (baseOverride && model && model.provider === 'openai') model = { ...model, baseUrl: baseOverride };
 
-  // Create tool-host client and proxy tools
+  // Create tool-host client and proxy tools. We always register a proxy 'bash'
+  // tool, but activation is controlled by execPolicy via setActiveToolsByName.
   const toolHost = new ToolHostClient({ cwd });
   const webRender = createProxyWebRenderTool(toolHost);
   const webExtract = createProxyWebExtractTool(toolHost);
+  const webSearchProxy = createProxyWebSearchTool(toolHost);
+  const bashProxy = createProxyBashTool(toolHost);
+
   const { tools: pluginTools, pluginFiles, errors: pluginErrors } = await loadArcanaPlugins(cwd);
   const filteredPlugins = (pluginTools||[]).filter((t)=> t && !['web_render','web_extract','web_search','bash'].includes(t.name));
   const subagents = createSubagentsTool();
   const codex = createCodexSubagentTool();
   const notebook = createNotebookTool();
-  // Replace web_* tools with proxies; web_search proxy below.
-  const webSearchProxy = createProxyWebSearchTool(toolHost);
+  const memoryTools = createMemoryTools();
   const timerTool = createTimerTool();
-  const customTools = [notebook, codex, subagents, timerTool, ...filteredPlugins, webRender, webExtract, webSearchProxy];
+  const customTools = [
+    notebook,
+    ...memoryTools,
+    codex,
+    subagents,
+    timerTool,
+    ...filteredPlugins,
+    webRender,
+    webExtract,
+    webSearchProxy,
+    bashProxy,
+  ];
 
   const pkgRoot = arcanaPkgRoot();
   const repoRoot = dirname(pkgRoot);
@@ -117,8 +132,8 @@ export async function createArcanaSession(opts={}){
   // Backwards compatibility: allow env var when opts.execPolicy is not provided
   const rawPolicy = String(opts.execPolicy || process.env.ARCANA_EXEC_POLICY || '').trim().toLowerCase();
   const execPolicy = rawPolicy === 'open' ? 'open' : 'restricted';
-  // Build guarded read/grep/find/ls tools that enforce workspace boundaries.
-  // All operations call ensureReadAllowed(path) before touching the filesystem.
+
+  // Workspace-guarded built-in tools. All operations call ensureReadAllowed(path).
   const readTool = createReadTool(cwd, {
     operations: {
       access: async (p) => { await fsp.access(ensureReadAllowed(p)); },
@@ -127,9 +142,9 @@ export async function createArcanaSession(opts={}){
       detectImageMimeType: async (p) => {
         const e = extname(String(p)).toLowerCase();
         if (e === '.png') return 'image/png';
-        if (e === ' .jpg' || e === ' .jpeg') return 'image/jpeg';
-        if (e === ' .gif') return 'image/gif';
-        if (e === ' .webp') return 'image/webp';
+        if (e === '.jpg' || e === '.jpeg') return 'image/jpeg';
+        if (e === '.gif') return 'image/gif';
+        if (e === '.webp') return 'image/webp';
         return null;
       }
     }
@@ -142,7 +157,6 @@ export async function createArcanaSession(opts={}){
         return st.isDirectory();
       },
       readFile: async (p) => fsp.readFile(ensureReadAllowed(p), 'utf-8'),
-
     }
   });
 
@@ -153,6 +167,52 @@ export async function createArcanaSession(opts={}){
       readdir: async (p) => fsp.readdir(ensureReadAllowed(p)),
     }
   });
+
+  const findTool = createFindTool(cwd, {
+    operations: {
+      exists: async (p) => { try { await fsp.access(ensureReadAllowed(p)); return true; } catch { return false; } },
+      // Use globSync with ignore rules and enforce workspace guard.
+      glob: async (pattern, searchCwd, options) => {
+        const base = ensureReadAllowed(searchCwd || '.');
+        const ig = (options?.ignore && Array.isArray(options.ignore)) ? options.ignore : ['**/node_modules/**','**/.git/**'];
+        const limit = typeof options?.limit === 'number' ? options.limit : 1000;
+        const matches = globSync(pattern, { cwd: base, dot: true, absolute: true, ignore: ig }) || [];
+        return matches.slice(0, Math.max(1, limit));
+      }
+    }
+  });
+
+  // Register only read/grep/find/ls as base tools. We purposely exclude built-in
+  // bash/edit/write. 'bash' is available via our proxy in customTools and can be
+  // enabled by policy at runtime.
+  const baseTools = [readTool, grepTool, findTool, lsTool];
+
+  const created = await createAgentSession({
+    cwd,
+    tools: baseTools,
+    customTools,
+    model,
+    resourceLoader: loader,
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+  });
+
+  // Apply initial execution policy to active tool names so chat2 sessions
+  // honor the requested policy without an extra server-side toggle.
+  try {
+    const desired = new Set(created.session?.getActiveToolNames?.() || []);
+    ['read','grep','find','ls'].forEach((t) => desired.add(t));
+    if (execPolicy === 'open') desired.add('bash');
+    else desired.delete('bash');
+    desired.delete('edit');
+    desired.delete('write');
+    created.session?.setActiveToolsByName?.(Array.from(desired));
+  } catch {}
+
+  const arcanaSkills = loadArcanaSkills({ cwd, cfg, pkgRoot, repoRoot });
+  const visibleSkillNames = arcanaSkills.map(s=>s.name).filter(Boolean);
+  const toolNames = created.session?.getActiveToolNames ? created.session.getActiveToolNames() : baseTools.map(t=>t?.name).filter(Boolean);
+
+  return { session: created.session, model, toolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost };
 }
 
 export default { createArcanaSession };

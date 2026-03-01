@@ -8,6 +8,10 @@ let activeAssistant = null; // current assistant bubble to stream text into
 const LOG_CAP = 400; // per session per tab
 const logStore = new Map(); // sessionId -> { main:[], tools:[], subagents:[] }
 let activeLogTab = (localStorage.getItem('arcana.logs.activeTab') || 'main');
+// Cache last logged workspace per session AND per label to avoid duplicates.
+// Structure: Map<sessionId, Map<label, workspacePath>> so that
+//   - workspace: and workspaceRoot: can both appear once even if paths match.
+const lastWorkspaceBySession = new Map(); // sessionId -> Map<label, lastLoggedWorkspace>
 
 function getCurrentSessionId(){ try { return window.__arcana_currentSessionId || '' } catch { return '' } }
 function ensureBuckets(sessionId){
@@ -62,40 +66,68 @@ try{
   }
 } catch {}
 
-function logMain(sessionId, text){ addLogLine(sessionId, 'main', text); }
-function logTools(sessionId, text){ addLogLine(sessionId, 'tools', text); }
-function logSubagents(sessionId, text){ addLogLine(sessionId, 'subagents', text); }
+function logMain(sessionId, text){ addLogLine(sessionId, "main", text); }
+function logTools(sessionId, text){ addLogLine(sessionId, "tools", text); }
+function logSubagents(sessionId, text){ addLogLine(sessionId, "subagents", text); }
+
+// Helper: only log workspace for a session when it changes
+function logWorkspaceIfChanged(sessionId, label, workspace){
+  try{
+    const sid = String(sessionId || "");
+    const ws = String(workspace || "");
+    const lbl = String(label || "");
+    if (!sid || !ws || !lbl) return;
+    // Ensure per-session map exists
+    let perLabel = lastWorkspaceBySession.get(sid);
+    if (!perLabel){ perLabel = new Map(); lastWorkspaceBySession.set(sid, perLabel); }
+    const prev = perLabel.get(lbl);
+    if (prev === ws) return; // unchanged for this label; skip duplicate
+    perLabel.set(lbl, ws);
+    logMain(sid, label + " " + ws);
+  } catch {}
+}
 
 // Initialize tabs display once
 try{ setActiveLogTab(activeLogTab); } catch {}
 
 function avatarPath(role){ return role === 'user' ? 'avatar-user.svg' : 'avatar-bot.svg'; }
-
 // Workspace picker (desktop integration if available) — top-level so both
 // new-session button and ensureSession() can access it.
 async function pickWorkspace(){
-  try{
-    const last = localStorage.getItem('arcana.lastWorkspace') || '';
-    const defaultPath = last || (window.process && window.process.cwd ? window.process.cwd() : '');
-    let chosen = '';
-    if (window.arcana && typeof window.arcana.pickWorkspace === 'function'){
-      try{
-        const res = await window.arcana.pickWorkspace({ defaultPath });
-        if (res && Array.isArray(res.filePaths) && res.filePaths[0]) chosen = String(res.filePaths[0]);
-        else if (Array.isArray(res) && res[0]) chosen = String(res[0]);
-      }catch{}
-    }
-    if (!chosen){
-      const p = prompt('请输入工作区绝对路径（必须存在的文件夹）', defaultPath || '/');
-      if (!p) return '';
-      chosen = String(p || '');
-    }
-    if (!chosen) return '';
-    const ok = confirm('使用该工作区？\n' + chosen);
-    if (!ok) return '';
-    try { localStorage.setItem('arcana.lastWorkspace', chosen) } catch {}
-    return chosen;
-  }catch{ return '' }
+  const last = localStorage.getItem('arcana.lastWorkspace') || '';
+  const defaultPath = last || (window.process && window.process.cwd ? window.process.cwd() : '');
+  // Desktop (Electron): use native folder chooser via preload API
+  if (window.arcana && typeof window.arcana.pickWorkspace === 'function'){
+    try{
+      const res = await window.arcana.pickWorkspace({ defaultPath });
+      const chosen = (res && Array.isArray(res.filePaths) && res.filePaths[0]) ? String(res.filePaths[0])
+        : (Array.isArray(res) && res[0]) ? String(res[0]) : '';
+      if (chosen){ try { localStorage.setItem('arcana.lastWorkspace', chosen) } catch {} ; return chosen; }
+      return '';
+    }catch{ return '' }
+  }
+  // Browser-only fallback: minimal modal (no true directory access in browsers)
+  return await new Promise((resolve)=>{
+    try{
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;z-index:10000;';
+      const dialog = document.createElement('div');
+      dialog.style.cssText = 'width:520px;max-width:90vw;background:#fff;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.2);padding:16px;';
+      dialog.innerHTML = '<div style="font-weight:600;margin-bottom:8px">选择工作区</div>' +
+        '<div style="font-size:13px;color:#666;margin-bottom:8px">建议使用桌面应用获取系统级文件夹选择器。当前在浏览器环境下，仅支持手动输入工作区绝对路径。</div>' +
+        '<input id="ws-input" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="/绝对/路径" />' +
+        '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+        '  <button id="ws-cancel">取消</button>' +
+        '  <button id="ws-ok">确定</button>' +
+        '</div>';
+      overlay.appendChild(dialog);
+      document.body.appendChild(overlay);
+      const input = dialog.querySelector('#ws-input'); if (input) input.value = defaultPath || '/';
+      dialog.querySelector('#ws-cancel').addEventListener('click', ()=>{ cleanup(); resolve(''); });
+      dialog.querySelector('#ws-ok').addEventListener('click', ()=>{ const v = String((input && input.value) || '').trim(); cleanup(); resolve(v); });
+      function cleanup(){ try { document.body.removeChild(overlay); } catch{} }
+    }catch{ resolve('') }
+  });
 }
 
 function appendMessage(role, text = ''){
@@ -285,8 +317,9 @@ function renderSessionList(items){
     div.dataset.id = it.id;
     const dot = typing.get(it.id) ? '<span class=dot></span>' : '';
     const title = (it.title||'新会话');
-    const meta = it.updatedAt ? ('<span class=meta>' + new Date(it.updatedAt).toLocaleString() + '</span>') : '';
-    div.innerHTML = dot + title + meta;
+    const metaTime = it.updatedAt ? ('<span class=meta>' + new Date(it.updatedAt).toLocaleString() + '</span>') : '';
+    const metaWs = it.workspace ? ('<span class=meta ws>' + it.workspace + '</span>') : '';
+    div.innerHTML = dot + title + metaTime + metaWs;
     const del = document.createElement('button');
     del.className = 'del'; del.textContent = '删'; del.title = '删除会话';
     del.addEventListener('click', async (ev)=>{
@@ -315,6 +348,8 @@ async function openSession(id){
   renderMessages([]); // clear
   const obj = await loadSession(id);
   renderMessages((obj && Array.isArray(obj.messages)) ? obj.messages : []);
+  // Log session workspace only when it changes to avoid duplicate lines when switching
+  try { if (obj && obj.workspace) { logWorkspaceIfChanged(id, 'workspace:', obj.workspace); } } catch {}
   refreshList().catch(()=>{});
   try { renderLogsFor(id, activeLogTab) } catch {}
 }
@@ -372,7 +407,14 @@ try {
       // Logs panel + lifecycle
       const sid = data.sessionId || currentId;
       try { const em = (data && data.message && data.message.errorMessage) ? String(data.message.errorMessage) : null; if (em) { logMain(sid, '[error] ' + em); } } catch {}
-      if (data.type === 'server_info'){ logMain(sid, 'model: ' + data.model); logMain(sid, 'tools: ' + (data.tools||[]).join(', ')); logMain(sid, 'plugins: ' + (data.plugins||[]).length); logMain(sid, 'workspace: ' + data.workspace); return }
+      if (data.type === 'server_info'){
+        logMain(sid, 'model: ' + data.model);
+        logMain(sid, 'tools: ' + (data.tools||[]).join(', '));
+        logMain(sid, 'plugins: ' + (data.plugins||[]).length);
+        // Use a distinct label for the server-reported root and cache to avoid repeats
+        logWorkspaceIfChanged(sid, 'workspaceRoot:', data.workspace);
+        return;
+      }
       if (data.type === 'turn_start'){ logMain(sid, 'turn start'); return }
       if (data.type === 'turn_end'){ logMain(sid, 'turn end'); activeAssistant = null; return }
       if (data.type === 'tool_execution_start'){ logTools(sid, 'tool start: ' + data.toolName + (data.args ? (' ' + JSON.stringify(data.args)) : '')); return }

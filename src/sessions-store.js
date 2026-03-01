@@ -1,15 +1,52 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js'
+import { fileURLToPath } from 'node:url'
 
 // Simple JSON-backed chat session store under /sessions
 // Schema: { id, title, workspace, createdAt, updatedAt, messages: [{ role: 'user'|'assistant', text, ts }] }
+
+// Internal: compute arcana package root (arcana/)
+function arcanaPkgRoot(){
+  try { const here = fileURLToPath(new URL('.', import.meta.url)); return join(here, '..'); } catch { return process.cwd(); }
+}
+
+let migrationChecked = false;
+
+// Best-effort one-time migration from legacy .sessions folders to ARCANA_HOME/sessions
+function migrateLegacySessions(targetDir){
+  if (migrationChecked) return; migrationChecked = true;
+  try{
+    // If target already has sessions, skip migration
+    try { const names = readdirSync(targetDir).filter(n=>n.endsWith('.json')); if (names.length) return; } catch {}
+    const legacyRoots = [
+      join(arcanaPkgRoot(), '.sessions'),          // arcana/.sessions when running from repo
+      join(process.cwd(), '.sessions'),            // project root .sessions (if any)
+    ];
+    for (const root of legacyRoots){
+      if (!existsSync(root)) continue;
+      let migrated = 0;
+      try{
+        const names = readdirSync(root).filter(n=>n.endsWith('.json'));
+        for (const name of names){
+          const src = join(root, name);
+          const dst = join(targetDir, name);
+          if (existsSync(dst)) continue;
+          try { copyFileSync(src, dst); migrated++; } catch {}
+        }
+      } catch {}
+      if (migrated > 0) return; // stop after first legacy root with files
+    }
+  } catch {}
+}
 
 // Session store directory: /sessions
 function dir(){
   const home = ensureArcanaHomeDir()
   const d = arcanaHomePath('sessions')
   if (!existsSync(d)) mkdirSync(d, { recursive: true })
+  // Attempt legacy migration when the store is first touched
+  migrateLegacySessions(d)
   return d
 }
 

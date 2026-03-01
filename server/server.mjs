@@ -4,6 +4,7 @@ import { existsSync, statSync, realpathSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { createHash } from 'node:crypto';
 import { createArcanaSession } from '../src/session.js';
 import { eventBus, runWithContext } from '../src/event-bus.js';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed, resetWorkspaceRootCache } from '../src/workspace-guard.js';
@@ -19,7 +20,11 @@ import {
   buildHistoryPreludeText as ssPrelude,
   saveSession as ssSave,
 } from '../src/sessions-store.js';
+import { buildSopExtractionPrompt } from '../src/memory-reflection.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
+// Tier1 memory triggers (direct daily append)
+import { createMemoryTools } from '../src/tools-memory.js';
+import { detectProblemMention, truncateText } from '../src/memory-triggers.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const projectRoot = join(__dirname, '..'); // arcana/
@@ -32,6 +37,20 @@ let toolNames = [];
 let model;
 
 // Per-session (id+policy+cwd) sessions used by /api/chat2
+
+// Reflection/SOP extraction infra (per workspace)
+const DEDUPE_SOP_TTL_MS = 24*60*60*1000;
+const dedupeSop = new Map(); // key -> lastSeenMs
+const reflectionSessionsByWs = new Map(); // ws -> session
+// Tier1 trigger dedupe (per workspace/session) — keep small TTL; best effort
+const DEDUPE_TRIGGER_TTL_MS = 10*60*1000; // 10 minutes
+const dedupeUserIssue = new Map(); // key -> lastSeenMs
+const dedupeToolFail = new Map(); // key -> lastSeenMs
+
+// Singleton memory tools for direct append without going through the LLM
+const memoryTools = createMemoryTools();
+const memoryAppendTool = memoryTools.find((t) => t && t.name === 'memory_append');
+const reflectionQueueByWs = new Map(); // ws -> Promise chain
 const chatSessions = new Map();
 const bridgedById = new WeakSet();
 
@@ -87,6 +106,53 @@ async function ensureSessionFor(sessionId, policy, cwdForSession) {
   return sess;
 }
 
+// TTL helper with parameterized TTL
+function seenRecentlyTtl(map, key, ttlMs){
+  try {
+    const now = Date.now();
+    const ts = map.get(key) || 0;
+    if (now - ts < (ttlMs || 0)) return true;
+    map.set(key, now);
+    return false;
+  } catch { return false }
+}
+
+async function ensureReflectionSession(ws){
+  try {
+    const key = String(ws || workspaceRoot || '');
+    if (reflectionSessionsByWs.has(key)) return reflectionSessionsByWs.get(key);
+    const created = await createArcanaSession({ cwd: key, execPolicy: 'restricted' });
+    const sess = created.session;
+    try { sess.setActiveToolsByName?.(['read','grep','find','ls','memory_search','memory_get','memory_append']); } catch {}
+    reflectionSessionsByWs.set(key, sess);
+    return sess;
+  } catch { return null }
+}
+
+function hash(s){ try { return createHash('sha1').update(String(s||'')).digest('hex'); } catch { return String(s||'') } }
+
+function scheduleSopExtraction({ ws, sessionId, toolName, safeArgs, errTextRaw }){
+  try {
+    const w = String(ws || workspaceRoot || '');
+    const key = w + '|' + String(toolName || '?') + '|' + hash(String(safeArgs || '') + '|' + String(errTextRaw || ''));
+    if (seenRecentlyTtl(dedupeSop, key, DEDUPE_SOP_TTL_MS)) return; // dedupe within TTL
+
+    const prev = reflectionQueueByWs.get(w) || Promise.resolve();
+    let chain = prev.then(async () => {
+      try {
+        const sess = await ensureReflectionSession(w);
+        if (!sess) return;
+        const prompt = buildSopExtractionPrompt({ toolName, argsJson: safeArgs, errorText: errTextRaw });
+        await runWithContext({ workspaceRoot: w, sessionId }, async () => { try { await sess.prompt(prompt); } catch {} });
+      } catch {}
+      finally { try { broadcast({ type: 'memory_trigger', kind: 'sop_extract', toolName, sessionId }); } catch {} }
+    });
+    chain = chain.catch(() => {});
+    reflectionQueueByWs.set(w, chain);
+  } catch {}
+}
+
+
 function ensureEventBridgeForId(sess, sessionId) {
   if (!sess || bridgedById.has(sess)) return;
   bridgedById.add(sess);
@@ -99,6 +165,7 @@ function ensureEventBridgeForId(sess, sessionId) {
       });
     } catch {}
   }
+  const toolArgsByCallId = new Map(); // toolCallId -> args snapshot for SOP context
   sess.subscribe((ev) => {
     try {
       // Tool repeat aggregation (per-session)
@@ -113,6 +180,7 @@ function ensureEventBridgeForId(sess, sessionId) {
         } catch {}
         // Forward original start event with sessionId for filtering on the client
         broadcast({ type: 'tool_execution_start', toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {}, sessionId });
+        try { if (ev && ev.toolCallId) toolArgsByCallId.set(ev.toolCallId, ev.args || {}); } catch {}
       }
 
       // Forward updates/ends tagged with sessionId
@@ -121,6 +189,63 @@ function ensureEventBridgeForId(sess, sessionId) {
       }
       if (ev.type === 'tool_execution_end') {
         try { broadcast({ type: 'tool_execution_end', toolCallId: ev.toolCallId, toolName: ev.toolName, result: ev.result, isError: ev.isError, error: ev.error, sessionId }); } catch {}
+        // Best-effort SOP extraction on tool failures (deduped + serialized per workspace)
+        try {
+          const isErr = !!(ev?.isError || ev?.error || (ev?.result && ((ev.result.details && ev.result.details.ok===false) || ev.result.error)));
+          if (isErr) {
+            // Resolve workspace for this session
+            let ws = workspaceRoot;
+            try { const obj = ssLoad(String(sessionId||'').trim()); if (obj && obj.workspace) ws = String(obj.workspace); } catch {}
+
+            // Build safe args and raw error text
+            const origArgs = (ev && ev.toolCallId && toolArgsByCallId.has(ev.toolCallId)) ? toolArgsByCallId.get(ev.toolCallId) : (ev?.args || {});
+            try { if (ev && ev.toolCallId) toolArgsByCallId.delete(ev.toolCallId); } catch {}
+            const redactKeys = new Set(['stdin','password','token','apikey','api_key','apiKey','secret','secrets','key']);
+            const safeObj = (function(){
+              try {
+                const clone = JSON.parse(JSON.stringify(origArgs||{}));
+                for (const k of Object.keys(clone||{})){
+                  const low = String(k).toLowerCase();
+                  if (redactKeys.has(low)) clone[k] = '[redacted]';
+                  const v = clone[k];
+                  if (typeof v === 'string' && v.length > 400) clone[k] = v.slice(0,400) + '…';
+                }
+                return clone;
+              } catch { return origArgs || {} }
+            })();
+            let safeArgs = '';
+            try { safeArgs = JSON.stringify(safeObj, Object.keys(safeObj).sort()); } catch { try { safeArgs = JSON.stringify(safeObj); } catch { safeArgs = String(safeObj||''); } }
+
+            let errTextRaw = '';
+            try {
+              const cand = ev?.error?.message || ev?.error || ev?.result?.error?.message || ev?.result?.error || ev?.result?.stderr || ev?.result?.stdout;
+              if (typeof cand === 'string') errTextRaw = cand;
+              else if (cand != null) { try { errTextRaw = JSON.stringify(cand); } catch { errTextRaw = String(cand); } }
+              errTextRaw = String(errTextRaw||'').slice(0, 2000);
+            } catch {}
+
+            // Tier1: direct daily memory append of the failure (deduped), keep SOP extraction infra intact
+            try {
+              if (memoryAppendTool) {
+                const dedupeKey = String(sessionId || 'default') + '|' + hash(String(ev?.toolName || '?') + '|' + safeArgs + '|' + errTextRaw);
+                if (!seenRecentlyTtl(dedupeToolFail, dedupeKey, DEDUPE_TRIGGER_TTL_MS)) {
+                  const shortArgs = truncateText(safeArgs);
+                  const shortErr = truncateText(errTextRaw);
+                  const content = 'args: ' + shortArgs + '\n\nerror: ' + shortErr;
+                  runWithContext({ workspaceRoot: ws, sessionId }, async () => {
+                    try {
+                      const r = await memoryAppendTool.execute('srv-tool-fail', { target:'daily', heading: 'tool_fail:' + String(ev?.toolName || '?'), content });
+                      const ok = !!(r && r.details && r.details.ok);
+                      if (ok) { try { broadcast({ type: 'memory_trigger', kind: 'tool_fail', toolName: ev?.toolName || '?', sessionId, path: r.details && r.details.path }); } catch {} }
+                    } catch {}
+                  });
+                }
+              }
+            } catch {}
+
+            scheduleSopExtraction({ ws, sessionId, toolName: ev?.toolName || '?', safeArgs, errTextRaw });
+          }
+        } catch {}
       }
 
       // Turn lifecycle
@@ -237,6 +362,17 @@ async function handleChat(req, res) {
     if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
     const sess = await ensurePolicySession(policy);
     applyExecPolicyToSession(sess, policy);
+    // Tier1: user_issue detection -> direct daily memory append (deduped)
+    try {
+      if (memoryAppendTool && detectProblemMention(message)) {
+        const key = 'legacy' + '|' + hash(message);
+        if (!seenRecentlyTtl(dedupeUserIssue, key, DEDUPE_TRIGGER_TTL_MS)) {
+          await runWithContext({ workspaceRoot }, async () => {
+            try { await memoryAppendTool.execute('srv-user-issue', { target:'daily', heading:'user_issue', content: message }); } catch {}
+          });
+        }
+      }
+    } catch {}
     let out = '';
     const unsub = sess.subscribe((ev) => {
       if (ev.type === 'message_update' && ev.message && ev.message.role === 'assistant') {
@@ -273,6 +409,17 @@ async function handleChat2(req, res) {
     const sess = await ensureSessionFor(sessionId, policy, ws);
     applyExecPolicyToSession(sess, policy);
 
+    // Tier1: user_issue detection -> direct daily memory append (deduped)
+    try {
+      if (memoryAppendTool && detectProblemMention(message)) {
+        const key = String(sessionId || 'default') + '|' + hash(message);
+        if (!seenRecentlyTtl(dedupeUserIssue, key, DEDUPE_TRIGGER_TTL_MS)) {
+          await runWithContext({ sessionId, workspaceRoot: ws }, async () => {
+            try { await memoryAppendTool.execute('srv-user-issue', { target:'daily', heading:'user_issue', content: message }); } catch {}
+          });
+        }
+      }
+    } catch {}
     // Persist user message and build context prelude
     ssAppend(sessionId, { role: 'user', text: message });
     const obj = ssLoad(sessionId);
