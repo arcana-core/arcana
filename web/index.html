@@ -27,6 +27,7 @@
     <footer class="composer">
       <button class="icon" title="更多">＋</button>
       <textarea id="input" rows="1" placeholder="发送消息"></textarea>
+      <button id="stop" style="margin-right:6px">停止</button>
       <button id="send" class="send">发送</button>
     </footer>
       <div id="more-panel" style="position:absolute;left:8px;right:8px;bottom:66px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);padding:10px;display:none;">
@@ -51,10 +52,11 @@
             <span id="cfg-key-set" style="font-size:12px;color:#666;">未设置</span>
           </div>
         </div>
-        <div style="display:flex;gap:8px;margin-top:8px;">
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center;">
           <button id="cfg-save">保存设置</button>
           <button id="cfg-run-doctor">运行诊断</button>
           <button id="cfg-support-bundle">导出支持包</button>
+          <button id="cfg-vault" title="在运行时设置/清除允许的环境变量">密码箱</button>
           <span id="support-link" style="margin-left:auto;font-size:12px;"></span>
         </div>
       </div>
@@ -71,6 +73,15 @@
           <section id="logs-main" class="logs"></section>
           <section id="logs-tools" class="logs" style="display:none"></section>
           <section id="logs-subagents" class="logs" style="display:none"></section>
+        </div>
+        <!-- Live Info panel under logs -->
+        <div id="live-info" class="live-info" style="border-top:1px solid #e7e7e7;padding:8px 10px;background:#fafafa;display:grid;grid-template-columns: 1fr;gap:6px 12px;">
+          <div class="li-item"><span class="li-label">模型</span><span id="li-model" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">工作区</span><span id="li-workspace" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">可见工具</span><span id="li-tools" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">本轮使用</span><span id="li-tools-used" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">技能</span><span id="li-skills" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">思考/耗时</span><span id="li-thinking" class="li-value">—</span></div>
         </div>
       </div>
     </div>

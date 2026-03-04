@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import * as pw from "../src/pw-runtime.js";
+import * as pw from "../pw-runtime.js";
 
 export function createWebExtractTool(){
   const Params = Type.Object({

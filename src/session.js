@@ -1,21 +1,23 @@
 import { createAgentSession, DefaultResourceLoader, createReadTool, createGrepTool, createFindTool, createLsTool } from '@mariozechner/pi-coding-agent';
 import { getModel } from '@mariozechner/pi-ai';
 import { loadArcanaPlugins } from './plugin-loader.js';
+import { startServicesOnce } from './services/manager.js';
 // Scheme C: tool-host isolation. Use proxy tools that delegate to a
 // persistent child process which can be killed to cancel hangs.
 import { ToolHostClient } from './tool-host-client.js';
-import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractTool, createProxyWebSearchTool } from './tools-toolhost-proxies.js';
-import createCodexSubagentTool from './tools-codex-subagent.js';
-import createNotebookTool from './tools-notebook.js';
-import createMemoryTools from './tools-memory.js';
-import createSubagentsTool from './tools-subagents.js';
-import { createTimerTool } from './tools-timer.js';
+import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractTool, createProxyWebSearchTool } from './tools/toolhost-proxies.js';
+import createCodexSubagentTool from './tools/codex-subagent.js';
+import createNotebookTool from './tools/notebook.js';
+import createMemoryTools from './tools/memory.js';
+import createSubagentsTool from './tools/subagents.js';
+import { createTimerTool } from './tools/timer.js';
 import { loadArcanaConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname } from 'node:path';
 import { resolveArcanaHome } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, promises as fsp } from 'node:fs';
 import { buildArcanaSkillsPrompt, loadArcanaSkills } from './skills.js';
+import { loadSkillTools } from './skill-tools.js';
 import { ensureArcanaSkillsWatcher } from './skills-watch.js';
 import { emit } from './event-bus.js';
 import { ensureReadAllowed } from './workspace-guard.js';
@@ -66,6 +68,8 @@ export async function createArcanaSession(opts={}){
   const webExtract = createProxyWebExtractTool(toolHost);
   const webSearchProxy = createProxyWebSearchTool(toolHost);
   const bashProxy = createProxyBashTool(toolHost);
+  // Start core workspace services once per process. This runs before plugins.
+  try { await startServicesOnce(); } catch {}
 
   const { tools: pluginTools, pluginFiles, errors: pluginErrors } = await loadArcanaPlugins(cwd);
   const filteredPlugins = (pluginTools||[]).filter((t)=> t && !['web_render','web_extract','web_search','bash'].includes(t.name));
@@ -74,6 +78,17 @@ export async function createArcanaSession(opts={}){
   const notebook = createNotebookTool();
   const memoryTools = createMemoryTools();
   const timerTool = createTimerTool();
+  const pkgRoot = arcanaPkgRoot();
+  const repoRoot = dirname(pkgRoot);
+  // Skill-scoped tools (preload definitions; activation controlled by skill gate)
+  const arcanaSkills = loadArcanaSkills({ cwd, cfg, pkgRoot, repoRoot });
+  let skillTools = []; let skillToolMap = new Map();
+  try {
+    const res = await loadSkillTools(arcanaSkills);
+    skillTools = res.tools || [];
+    skillToolMap = res.skillToolNamesBySkill || new Map();
+  } catch {}
+
   const customTools = [
     notebook,
     ...memoryTools,
@@ -81,14 +96,14 @@ export async function createArcanaSession(opts={}){
     subagents,
     timerTool,
     ...filteredPlugins,
+    ...skillTools,
     webRender,
     webExtract,
     webSearchProxy,
     bashProxy,
   ];
 
-  const pkgRoot = arcanaPkgRoot();
-  const repoRoot = dirname(pkgRoot);
+  
 
   // Compute skills prompt early so the resource loader can append it
   let skillsPrompt = buildArcanaSkillsPrompt({ cwd, cfg, pkgRoot, repoRoot });
@@ -208,11 +223,10 @@ export async function createArcanaSession(opts={}){
     created.session?.setActiveToolsByName?.(Array.from(desired));
   } catch {}
 
-  const arcanaSkills = loadArcanaSkills({ cwd, cfg, pkgRoot, repoRoot });
   const visibleSkillNames = arcanaSkills.map(s=>s.name).filter(Boolean);
   const toolNames = created.session?.getActiveToolNames ? created.session.getActiveToolNames() : baseTools.map(t=>t?.name).filter(Boolean);
 
-  return { session: created.session, model, toolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost };
+  return { session: created.session, model, toolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost, skillToolMap };
 }
 
 export default { createArcanaSession };

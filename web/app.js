@@ -391,6 +391,16 @@ try { sendBtn.removeEventListener('click', send) } catch {}
 try { input.removeEventListener('keydown', ()=>{}) } catch {}
 sendBtn.addEventListener('click', ()=>{ sendWithSession().catch(()=>{}) });
 input.addEventListener('keydown', (e)=>{ if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendWithSession().catch(()=>{}) } });
+// Stop button -> hard abort current run
+try {
+  const stopBtn = document.querySelector('#stop');
+  if (stopBtn) stopBtn.addEventListener('click', async ()=>{
+    try{
+      const sid = getCurrentSessionId(); if (!sid) return;
+      await fetch('/api/abort', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid }) });
+    } catch {}
+  });
+} catch {}
 
 // SSE: single connection; filter UI updates by sessionId
 try {
@@ -406,18 +416,38 @@ try {
 
       // Logs panel + lifecycle
       const sid = data.sessionId || currentId;
+            if (data.type === 'open_vault'){
+        try { openVault(Array.isArray(data.names) ? data.names : []).catch(()=>{}) } catch {}
+        logMain(sid, 'open vault' + (Array.isArray(data.names) && data.names.length ? (': ' + data.names.join(', ')) : ''));
+        return;
+      }
       try { const em = (data && data.message && data.message.errorMessage) ? String(data.message.errorMessage) : null; if (em) { logMain(sid, '[error] ' + em); } } catch {}
       if (data.type === 'server_info'){
         logMain(sid, 'model: ' + data.model);
         logMain(sid, 'tools: ' + (data.tools||[]).join(', '));
-        logMain(sid, 'plugins: ' + (data.plugins||[]).length);
+        if (Array.isArray(data.skills)) logMain(sid, 'skills: ' + data.skills.join(', '));
+        // Live Info
+        try { LI.model = String(data.model||''); LI.tools = Array.isArray(data.tools)? data.tools.slice() : []; LI.workspace = String(data.workspace||''); LI.skills = Array.isArray(data.skills) ? data.skills.slice() : []; renderLiveInfo(); } catch {}
         // Use a distinct label for the server-reported root and cache to avoid repeats
         logWorkspaceIfChanged(sid, 'workspaceRoot:', data.workspace);
         return;
       }
-      if (data.type === 'turn_start'){ logMain(sid, 'turn start'); return }
-      if (data.type === 'turn_end'){ logMain(sid, 'turn end'); activeAssistant = null; return }
-      if (data.type === 'tool_execution_start'){ logTools(sid, 'tool start: ' + data.toolName + (data.args ? (' ' + JSON.stringify(data.args)) : '')); return }
+      if (data.type === 'turn_start'){
+        try {
+          LI.usedThisTurn = new Set();
+          LI.thinkingChars = 0;
+          LI.thinkingMs = 0;
+          LI.turns += 1;
+        } catch {}
+        logMain(sid, 'turn start');
+        return;
+      }
+      if (data.type === 'turn_end'){ try { renderLiveInfo(); } catch {} logMain(sid, 'turn end'); activeAssistant = null; return }
+      if (data.type === 'tool_execution_start'){
+        try { if (data.toolName) LI.usedThisTurn.add(String(data.toolName)); renderLiveInfo(); } catch {}
+        logTools(sid, 'tool start: ' + data.toolName + (data.args ? (' ' + JSON.stringify(data.args)) : ''));
+        return;
+      }
       if (data.type === 'tool_execution_end'){
         const isErr = !!(data.isError || data.error);
         let errMsg = '';
@@ -425,7 +455,20 @@ try {
         logTools(sid, 'tool end: ' + data.toolName + (isErr ? (' error: ' + (errMsg||'')) : ' ok'));
         return;
       }
-      if (data.type === 'tool_repeat'){ logTools(sid, 'repeat: ' + data.toolName + ' x' + data.count + (data.args ? (' ' + JSON.stringify(data.args)) : '')); return }
+      if (data.type === 'tool_repeat'){
+        logTools(sid, 'repeat: ' + data.toolName + ' x' + data.count + (data.args ? (' ' + JSON.stringify(data.args)) : ''));
+        return;
+      }
+      if (data.type === 'skills_refresh'){
+        try {
+          renderLiveInfo();
+        } catch {}
+        return;
+      }
+      if (data.type === 'env_refresh'){
+        try { appendLog('[vault] 已刷新环境变量'); } catch {}
+        return;
+      }
       if (data.type === 'tool_execution_update'){
         const raw = (typeof data.partialResult !== 'undefined') ? data.partialResult : data.update;
         let info = '';
@@ -434,12 +477,17 @@ try {
         return;
       }
 
-      // Thinking bubbles for active chat
-      if (data.type === 'thinking_start'){ if (!activeAssistant) { activeAssistant = appendMessage('assistant','') } setTyping(activeAssistant, true); logMain(sid, 'thinking start'); return }
-      if (data.type === 'thinking_progress'){ if (typeof data.chars === 'number') logMain(sid, 'thinking progress: ' + data.chars + ' chars'); return }
-      if (data.type === 'thinking_end'){ if (activeAssistant) setTyping(activeAssistant, false); if (typeof data.chars !== 'undefined' || typeof data.tookMs !== 'undefined') logMain(sid, 'thinking end: ' + (data.chars || 0) + ' chars, ' + (data.tookMs || 0) + ' ms'); return }
 
-      // Stream assistant text/images to the open chat only
+      // New events: steer enqueued / abort done
+      if (data.type === 'steer_enqueued') { logMain(sid, 'steer enqueued: ' + (data.text||'')); return }
+      if (data.type === 'abort_done') { logMain(sid, 'aborted'); if (activeAssistant) setTyping(activeAssistant, false); return }
+
+      // Thinking bubbles for active chat
+      if (data.type === 'thinking_start'){ if (!activeAssistant) { activeAssistant = appendMessage('assistant','') } setTyping(activeAssistant, true); try { LI.thinkingChars = 0; LI.thinkingMs = 0; renderLiveInfo(); } catch {} logMain(sid, 'thinking start'); return }
+      if (data.type === 'thinking_progress'){ if (typeof data.chars === 'number') { try { LI.thinkingChars = Number(data.chars)||0; renderLiveInfo(); } catch {} } logMain(sid, 'thinking progress: ' + (data.chars||0) + ' chars'); return }
+      if (data.type === 'thinking_end'){ if (activeAssistant) setTyping(activeAssistant, false); try { if (typeof data.chars !== 'undefined') LI.thinkingChars = Number(data.chars)||0; if (typeof data.tookMs !== 'undefined') LI.thinkingMs = Number(data.tookMs)||0; renderLiveInfo(); } catch {} if (typeof data.chars !== 'undefined' || typeof data.tookMs !== 'undefined') logMain(sid, 'thinking end: ' + (data.chars || 0) + ' chars, ' + (data.tookMs || 0) + ' ms'); return }
+
+      if (data.type === 'skills_refresh'){ try { LI.skillsHint = '技能已刷新'; renderLiveInfo(); } catch {} return }
       if (data.type === 'assistant_text'){
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
         if (!activeAssistant) activeAssistant = appendMessage('assistant','');
@@ -491,3 +539,223 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
     } catch(e){ appendLog('[sessions] 初始加载失败(' + i + '/' + attempts + '): ' + (((e && e.message) || e))); if (i < attempts) { await sleep(delay); delay = Math.min(2000, delay * 2) } }
   }
 })().catch((e)=>{ appendLog('[sessions] 初始加载异常: ' + (((e && e.message) || e))) });
+
+
+// ---- Live Info Panel ----
+const LI = {
+  model: '',
+  workspace: '',
+  tools: [],
+  skills: [],
+  usedThisTurn: new Set(),
+  turns: 0,
+  thinkingChars: 0,
+  thinkingMs: 0,
+  skillsHint: '',
+};
+function liSet(id, text){ const el=document.getElementById(id); if (el) el.textContent=String((text===undefined||text===null)? '—' : text); }
+function renderLiveInfo(){
+  liSet('li-model', LI.model || '—');
+  liSet('li-workspace', LI.workspace || '—');
+  liSet('li-tools', (LI.tools && LI.tools.length) ? LI.tools.join(', ') : '—');
+  liSet('li-tools-used', (LI.usedThisTurn && LI.usedThisTurn.size) ? Array.from(LI.usedThisTurn).join(', ') : '—');
+  liSet('li-skills', (LI.skills && LI.skills.length) ? LI.skills.join(', ') : '—');
+  liSet('li-thinking', String((LI.thinkingChars||0)) + ' chars / ' + String((LI.thinkingMs||0)) + ' ms');
+}
+
+// --- Vault (Env) UI ---
+let VAULT_PASSPHRASE_CACHE = '';
+
+function buildVaultRow(v, vault){
+  const tr = document.createElement('div');
+  tr.className = 'vault-row';
+  tr.style.cssText = 'display:grid;grid-template-columns: 180px 1fr 80px;gap:8px;align-items:center;margin:4px 0;';
+  const name = String(v && v.name || '');
+  const has = !!(v && v.hasValue);
+  const stored = !!(v && v.stored);
+  const encrypted = !!(vault && vault.encrypted);
+  const locked = !!(vault && vault.locked);
+
+  const nameEl = document.createElement('div');
+  nameEl.textContent = name || '(未命名)';
+  nameEl.style.cssText = 'font-family:monospace;font-size:12px;word-break:break-all;';
+
+  const valWrap = document.createElement('div');
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.placeholder = has ? '已设置（留空保持不变）' : '未设置（输入新值）';
+  input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px;border:1px solid #ddd;border-radius:6px;';
+
+  const extra = document.createElement('div');
+  extra.style.cssText = 'display:flex;gap:6px;align-items:center;';
+  const clear = document.createElement('input'); clear.type = 'checkbox'; clear.id = 'clear-' + name;
+  const clearLbl = document.createElement('label'); clearLbl.htmlFor = clear.id; clearLbl.textContent = '清除'; clearLbl.style.fontSize = '12px';
+  clear.addEventListener('change', ()=>{ input.disabled = clear.checked; if (clear.checked) input.value = ''; });
+  extra.appendChild(clear); extra.appendChild(clearLbl);
+
+  valWrap.appendChild(input);
+  valWrap.appendChild(extra);
+
+  tr.appendChild(nameEl);
+  tr.appendChild(valWrap);
+  const status = document.createElement('div');
+  let statusText = '';
+  let statusColor = '';
+  if (has){
+    statusText = '已设置';
+    statusColor = '#0a0';
+  } else if (stored && encrypted && locked){
+    statusText = '已保存(需解锁)';
+    statusColor = '#b58900';
+  } else if (stored){
+    statusText = '已保存';
+    statusColor = '#666';
+  } else {
+    statusText = '未设置';
+    statusColor = '#a00';
+  }
+  status.textContent = statusText;
+  status.style.cssText='font-size:12px;color:' + statusColor;
+  tr.appendChild(status);
+
+  tr.dataset.varName = name;
+  tr.querySelector = tr.querySelector.bind(tr);
+  return tr;
+}
+
+async function openVault(){
+  // Create overlay
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:10000;';
+  const dialog = document.createElement('div');
+  dialog.style.cssText = 'width:720px;max-width:95vw;max-height:90vh;overflow:auto;background:#fff;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.25);padding:14px;';
+  dialog.innerHTML = 
+    "<div style=\"display:flex;align-items:center;gap:8px;\">" +
+    "<div style=\"font-weight:600;font-size:15px;\">密码箱（环境变量）</div>" +
+    "<div id=\"vault-sub\" style=\"font-size:12px;color:#666;\">加载中…</div>" +
+    "<div style=\"margin-left:auto;\"><button id=\"vault-close\">×</button></div>" +
+    "</div>" +
+    "<div id=\"vault-body\" style=\"margin-top:8px;\"></div>" +
+    "<div style=\"display:flex;gap:8px;justify-content:flex-end;margin-top:10px;\">" +
+    "  <button id=\"vault-cancel\">取消</button>" +
+    "  <button id=\"vault-save\">保存</button>" +
+    "</div>";
+  overlay.appendChild(dialog); document.body.appendChild(overlay);
+
+  function close(){ try { document.body.removeChild(overlay); } catch {} }
+  try { dialog.querySelector('#vault-close').addEventListener('click', close) } catch {}
+  try { dialog.querySelector('#vault-cancel').addEventListener('click', close) } catch {}
+
+  const bodyEl = dialog.querySelector('#vault-body');
+  bodyEl.innerHTML = "<div style=\"font-size:12px;color:#666;\">加载中…</div>";
+  let vars = [];
+  let vaultMeta = {};
+  try {
+    const r = await fetch('/api/env');
+    const j = await r.json();
+    vars = Array.isArray(j && j.vars) ? j.vars : [];
+    vaultMeta = j && typeof j.vault === 'object' && j.vault ? j.vault : {};
+  } catch { bodyEl.innerHTML = "<div style=\"color:#a00;font-size:12px;\">读取失败</div>"; return }
+
+  try {
+    const subEl = dialog.querySelector('#vault-sub');
+    if (subEl){
+      const vm = vaultMeta || {};
+      const hasFile = !!vm.hasFile;
+      const encrypted = !!vm.encrypted;
+      const locked = !!vm.locked;
+      let text = '';
+      if (!hasFile){
+        text = '落盘：未创建';
+      } else if (encrypted && locked){
+        text = '落盘：已加密·已锁定（需口令解锁）';
+      } else if (encrypted){
+        text = '落盘：已加密';
+      } else {
+        text = '落盘：未加密';
+      }
+      if (vm.path){
+        text += ' · ' + String(vm.path);
+      }
+      subEl.textContent = text;
+    }
+  } catch {}
+
+  // Build list
+  bodyEl.innerHTML = "";
+  const list = document.createElement('div');
+  for (const v of vars) list.appendChild(buildVaultRow(v, vaultMeta));
+
+  // Add custom row helper
+  const addWrap = document.createElement('div');
+  addWrap.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px;';
+  addWrap.innerHTML = 
+    "<span style=\"font-size:12px;color:#666;\">新增变量</span>" +
+    "<input id=\"vault-new-name\" placeholder=\"名称（仅限 ARCANA_* 或 *_API_KEY）\" style=\"flex:0 0 280px;padding:6px;border:1px solid #ddd;border-radius:6px;\" />" +
+    "<input id=\"vault-new-value\" placeholder=\"值\" type=\"password\" style=\"flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;\" />" +
+    "<button id=\"vault-add\">添加</button>";
+  addWrap.querySelector('#vault-add').addEventListener('click', ()=>{
+    const n = String((addWrap.querySelector('#vault-new-name')||{}).value || '').trim();
+    const v = String((addWrap.querySelector('#vault-new-value')||{}).value || '');
+    if (!n) return;
+    const row = buildVaultRow({ name:n, hasValue:false }, vaultMeta);
+    row.querySelector('input[type=password]').value = v;
+    list.appendChild(row);
+    (addWrap.querySelector('#vault-new-name')||{}).value = '';
+    (addWrap.querySelector('#vault-new-value')||{}).value = '';
+  });
+
+  bodyEl.appendChild(list);
+  bodyEl.appendChild(addWrap);
+
+  const passWrap = document.createElement('div');
+  passWrap.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:8px;font-size:12px;color:#666;';
+  passWrap.innerHTML = 
+    "<span style=\"flex:0 0 auto;\">保险箱口令</span>" +
+    "<input id=\"vault-passphrase\" type=\"password\" placeholder=\"用于解锁/加密持久化文件\" style=\"flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;\" />" +
+    "<label style=\"display:flex;align-items:center;gap:4px;flex:0 0 auto;\">" +
+    "  <input id=\"vault-remember-pass\" type=\"checkbox\" />" +
+    "  <span>记住（本页会话）</span>" +
+    "</label>";
+  const passInput = passWrap.querySelector('#vault-passphrase');
+  if (passInput){ passInput.value = VAULT_PASSPHRASE_CACHE || ''; }
+  bodyEl.appendChild(passWrap);
+
+  // Save
+  dialog.querySelector('#vault-save').addEventListener('click', async ()=>{
+    try {
+      const rows = Array.from(list.querySelectorAll('.vault-row'));
+      const set = {}; const unset = [];
+      for (const r of rows){
+        const name = String(r.dataset.varName || '').trim(); if (!name) continue;
+        const clear = r.querySelector('input[type=checkbox]');
+        const val = r.querySelector('input[type=password]');
+        if (clear && clear.checked){ unset.push(name); continue; }
+        const v = String((val && val.value) || '');
+        if (v) set[name] = v;
+      }
+      const payload = { set, unset };
+      const passEl = dialog.querySelector('#vault-passphrase');
+      const rememberEl = dialog.querySelector('#vault-remember-pass');
+      const pass = String((passEl && passEl.value) || '');
+      if (pass){ payload.passphrase = pass; }
+      if (rememberEl && rememberEl.checked){
+        VAULT_PASSPHRASE_CACHE = pass;
+      } else {
+        VAULT_PASSPHRASE_CACHE = '';
+      }
+      const resp = await fetch('/api/env', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify(payload) });
+      if (!resp.ok){
+        if (resp.status === 423){ appendLog('[vault] 已加密且锁定：请输入口令再保存/解锁'); return; }
+        if (resp.status === 403){ appendLog('[vault] 口令不正确'); return; }
+        appendLog('[vault] 保存失败'); return;
+      }
+      const j = await resp.json();
+      if (!j || j.ok !== true){ appendLog('[vault] 保存失败'); return; }
+      appendLog('[vault] 已保存');
+      close();
+    } catch { appendLog('[vault] 保存失败'); }
+  });
+}
+
+try { (document.getElementById('cfg-vault')||{}).addEventListener('click', ()=>{ openVault().catch(()=>{}) }) } catch {}

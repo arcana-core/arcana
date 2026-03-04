@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import * as pw from "../src/pw-runtime.js";
+import * as pw from "../pw-runtime.js";
 
 // Web Search tool (ESM). Uses the Playwright runtime to open a search
 // engine results page and extracts readable text. Parameters use TypeBox

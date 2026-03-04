@@ -1,7 +1,7 @@
 import { Type } from '@sinclair/typebox';
 import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { join, resolve, relative } from 'node:path';
-import { ensureReadAllowed, ensureWriteAllowed, resolveWorkspaceRoot } from './workspace-guard.js';
+import { ensureReadAllowed, ensureWriteAllowed, resolveWorkspaceRoot } from '../workspace-guard.js';
 
 // Minimal deterministic memory tools (append-only).
 // Files: <workspace>/MEMORY.md, optional <workspace>/memory.md, and <workspace>/memory/YYYY-MM-DD.md

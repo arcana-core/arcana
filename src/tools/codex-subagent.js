@@ -1,8 +1,8 @@
 import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import CodexRunner from "./subagents/codex-runner.js";
-import { resolveWorkspaceRoot, normalizeAllowedPaths } from "./workspace-guard.js";
+import CodexRunner from "../subagents/codex-runner.js";
+import { resolveWorkspaceRoot, normalizeAllowedPaths } from "../workspace-guard.js";
 
 // Codex tool (external agent). Codex performs edits; Arcana never applies patches itself.
 export function createCodexSubagentTool() {

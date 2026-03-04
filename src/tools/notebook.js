@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { resolveWorkspaceRoot } from "./workspace-guard.js";
+import { resolveWorkspaceRoot } from "../workspace-guard.js";
 
 export function createNotebookTool() {
   const Params = Type.Object({

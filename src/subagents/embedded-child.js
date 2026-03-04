@@ -1,7 +1,7 @@
 import readline from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import { resolveWorkspaceRoot } from '../workspace-guard.js';
-import createCodexSubagentTool from '../tools-codex-subagent.js';
+import createCodexSubagentTool from '../tools/codex-subagent.js';
 
 const initRaw = process.env.SUBAGENT_INIT || '{}';
 let init = {};

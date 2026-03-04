@@ -1,4 +1,4 @@
-// Arcana skills prompt integration (OpenClaw style)
+// Arcana skills prompt integration
 // - Resolve skill directories from config, env, and sensible defaults
 // - Load skills via pi-coding-agent helpers
 // - Dedupe by name+filePath
@@ -6,8 +6,9 @@
 // - Export buildArcanaSkillsPrompt({ cwd, cfg, pkgRoot, repoRoot }) -> string
 //   (empty string when there are no visible skills)
 
-import { formatSkillsForPrompt, loadSkillsFromDir } from '@mariozechner/pi-coding-agent';
+import { formatSkillsForPrompt, loadSkillsFromDir, parseFrontmatter } from '@mariozechner/pi-coding-agent';
 import { existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
@@ -65,16 +66,11 @@ export function resolveArcanaSkillsDirs({ cwd, cfg, pkgRoot, repoRoot } = {}) {
     .filter(Boolean)
     .map((p) => resolvePathLike(p, cwdUse));
 
-  // 3) Defaults: <cwd>/skills, <cwd>/.agents/skills, <cwd>/openclaw/skills
+  // 3) Defaults: <cwd>/skills, <cwd>/.agents/skills
   const defaults = [
     resolve(cwdUse, 'skills'),
     resolve(cwdUse, '.agents', 'skills'),
-    resolve(cwdUse, 'openclaw', 'skills'),
   ];
-  // Also consider repoRoot/openclaw/skills if repoRoot is provided (handles running from arcana/pkg)
-  if (repoRoot) {
-    defaults.push(resolve(repoRoot, 'openclaw', 'skills'));
-  }
 
   // plus <pkgRoot>/skills if present
   if (pkgRoot) {
@@ -94,6 +90,39 @@ export function resolveArcanaSkillsDirs({ cwd, cfg, pkgRoot, repoRoot } = {}) {
     }
   }
   return merged;
+}
+
+function expandHomePath(p){
+  try{
+    if (!p) return p;
+    const home = homedir();
+    const s = String(p);
+    if (s === '~') return home;
+    if (s.startsWith('~/')) return join(home, s.slice(2));
+    if (s.startsWith('~')) return join(home, s.slice(1));
+    return p;
+  } catch { return p }
+}
+
+function readSkillToolsFromFrontmatter(skillFile){
+  try{
+    const raw = readFileSync(skillFile, 'utf-8');
+    const { frontmatter } = parseFrontmatter(raw);
+    const arc = frontmatter && frontmatter.arcana;
+    const arr = Array.isArray(arc && arc.tools) ? arc.tools : [];
+    const out = [];
+    for (const t of arr){
+      if (!t || !t.name) continue;
+      out.push({
+        name: String(t.name),
+        label: t.label ? String(t.label) : undefined,
+        description: t.description ? String(t.description) : undefined,
+        allowedHosts: Array.isArray(t.allowedHosts) ? t.allowedHosts.map(String) : undefined,
+        allowedWritePaths: Array.isArray(t.allowedWritePaths) ? t.allowedWritePaths.map(String) : undefined,
+      });
+    }
+    return out;
+  } catch { return [] }
 }
 
 function unwrapLoadedSkills(loaded){
@@ -119,7 +148,10 @@ export function loadArcanaSkills({ cwd, cfg, pkgRoot, repoRoot } = {}) {
         const key = String(s?.name||'') + '|' + String(s?.filePath||'');
         if (seen.has(key)) continue;
         seen.add(key);
-        all.push({ ...s, filePath: compactPath(s.filePath) });
+        const filePathCompact = compactPath(s.filePath);
+        const filePathReal = expandHomePath(s.filePath);
+        const tools = readSkillToolsFromFrontmatter(filePathReal);
+        all.push({ ...s, filePath: filePathCompact, tools });
       }
     } catch {
       continue;

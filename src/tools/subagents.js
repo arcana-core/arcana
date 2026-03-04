@@ -1,5 +1,5 @@
 import { Type } from '@sinclair/typebox';
-import { listRuns, spawnSubagent, steerSubagent, killSubagent } from './subagents/manager.js';
+import { listRuns, spawnSubagent, steerSubagent, killSubagent } from '../subagents/manager.js';
 
 export function createSubagentsTool(){
   const Params = Type.Object({

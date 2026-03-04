@@ -4,6 +4,7 @@ import { createArcanaSession } from '../src/session.js';
 import { runDoctor, printDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
 import { webCLI } from '../src/cli-web.js';
+import { wechatCLI } from '../src/cli-wechat.js';
 import { runDueOnce, serveLoop, runJobById } from '../src/timer/runner.js';
 import { listJobSummaries as timerList, listRuns as timerListRuns } from '../src/timer/store.js';
 
@@ -16,6 +17,11 @@ Usage:
   arcana web extract                        # extract readable text from current page
   arcana web search <query> [--engine <e>]  # search via browser (engine: auto|duckduckgo|bing|baidu)
   arcana web serve [--port <n>]             # start lightweight web UI
+  arcana wechat token [--force]             # fetch/cache Official Account access_token
+  arcana wechat upload-cover <file>         # upload permanent image, print thumb_media_id
+  arcana wechat draft --title ... --content-file <html> --thumb-media-id <id> [--author ... --digest ...]
+  arcana wechat publish --media-id <id> [--wait] [--timeout-sec n]
+  arcana wechat publish-file --title ... --content-file <html> --thumb-media-id <id> [--wait]
   arcana timer once                      # run due jobs once and exit
   arcana timer serve                     # run scheduler loop (Ctrl+C to stop)
   arcana timer run <id>                  # run a specific job now
@@ -89,6 +95,7 @@ async function main(){
   if (cmd === 'doctor') return doctor(argv);
   if (cmd === 'support-bundle') return supportBundle(argv);
   if (cmd === 'web') return webCLI({ args: argv });
+  if (cmd === 'wechat') return wechatCLI({ args: argv });
   if (cmd === 'timer') return timerCLI({ args: argv });
   return console.log(HELP);
 }

@@ -1,16 +1,18 @@
 import http from 'node:http';
-import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, statSync, realpathSync } from 'node:fs';
+import { readFile, writeFile, chmod } from 'node:fs/promises';
+import { existsSync, statSync, realpathSync, readFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
 import { createArcanaSession } from '../src/session.js';
 import { eventBus, runWithContext } from '../src/event-bus.js';
+import { parseFrontmatter, parseSkillBlock } from '@mariozechner/pi-coding-agent';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed, resetWorkspaceRootCache } from '../src/workspace-guard.js';
 import { runDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
 import { loadArcanaConfig } from '../src/config.js';
+import { loadArcanaSkills } from '../src/skills.js';
 import {
   createSession as ssCreate,
   listSessions as ssList,
@@ -23,11 +25,11 @@ import {
 import { buildSopExtractionPrompt } from '../src/memory-reflection.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
 // Tier1 memory triggers (direct daily append)
-import { createMemoryTools } from '../src/tools-memory.js';
-import { detectProblemMention, truncateText } from '../src/memory-triggers.js';
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const projectRoot = join(__dirname, '..'); // arcana/
+
+import { createMemoryTools } from '../src/tools/memory.js';
+import { detectProblemMention, truncateText } from '../src/memory-triggers.js';
+const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..'); // arcana/
 let workspaceRoot = null; // set on start
 
 // Legacy per-policy sessions used by /api/chat
@@ -35,6 +37,28 @@ const sessionsByPolicy = new Map();
 let pluginFiles = [];
 let toolNames = [];
 let model;
+let skillNames = [];
+
+// Apply execution policy to a session by toggling active tools.
+// - Always enable safe read-only tools: read, grep, find, ls
+// - Enable bash only when policy === "open"
+// - Always remove edit/write tools
+// - Preserve any currently active custom/extension tools
+function applyExecPolicyToSession(sess, policy) {
+  try {
+    const desired = new Set(sess.getActiveToolNames?.() || []);
+    ['read','grep','find','ls'].forEach((t) => desired.add(t));
+    if (String(policy || '').toLowerCase() === 'open') desired.add('bash');
+    else desired.delete('bash');
+    desired.delete('edit');
+    desired.delete('write');
+    const list = Array.from(desired);
+    sess.setActiveToolsByName?.(list);
+    // Keep a copy for diagnostics broadcast on new SSE connections
+    toolNames = list;
+  } catch {}
+}
+
 
 // Per-session (id+policy+cwd) sessions used by /api/chat2
 
@@ -53,6 +77,10 @@ const memoryAppendTool = memoryTools.find((t) => t && t.name === 'memory_append'
 const reflectionQueueByWs = new Map(); // ws -> Promise chain
 const chatSessions = new Map();
 const bridgedById = new WeakSet();
+// Map sessionId -> Map(skillName -> toolNames[])
+const skillToolMapById = new Map();
+// For legacy policy sessions (no id), keep last mapping per policy
+const policySkillToolMap = new Map(); // key: 'open'|'restricted' -> Map(skill->tools)
 
 // Per-session state for event aggregation
 const toolRepeatById = new Map(); // sessionId -> Map(key -> count)
@@ -67,19 +95,342 @@ let thinkStats = null;
 const clients = new Set(); // Response objects
 let subagentHooked = false;
 
-function applyExecPolicyToSession(sess, policy) {
+// Env vault: runtime env setter + on-disk vault
+function isValidEnvName(n){
   try {
-    const desired = new Set(sess.getActiveToolNames?.() || []);
-    ['read', 'grep', 'find', 'ls'].forEach((t) => desired.add(t));
-    if (String(policy || '').toLowerCase() === 'open') desired.add('bash');
-    else desired.delete('bash');
-    desired.delete('edit');
-    desired.delete('write');
-    const list = Array.from(desired);
-    sess.setActiveToolsByName?.(list);
-    toolNames = list;
+    const s = String(n || '');
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
+  } catch { return false; }
+}
+
+// --- On-disk vault state + helpers ---
+const VAULT_PATH = arcanaHomePath('vault.json');
+// Public-ish meta exposed via /api/env.vault
+const vaultInfo = {
+  path: VAULT_PATH,
+  hasFile: false,
+  encrypted: false,
+  locked: false,
+  names: new Set(), // env var names stored in vault
+};
+// In-memory decrypted values (only when unlocked/plain)
+let vaultValues = {};
+
+function vaultMetaForResponse(){
+  try {
+    return {
+      path: String(vaultInfo.path || ''),
+      hasFile: !!vaultInfo.hasFile,
+      encrypted: !!vaultInfo.encrypted,
+      locked: !!vaultInfo.locked,
+      names: Array.from(vaultInfo.names || []),
+    };
+  } catch {
+    return {
+      path: String(VAULT_PATH || ''),
+      hasFile: false,
+      encrypted: false,
+      locked: false,
+      names: [],
+    };
+  }
+}
+
+function filterValid(obj){
+  const out = {};
+  try {
+    for (const [k, v] of Object.entries(obj || {})){
+      if (!isValidEnvName(k)) continue;
+      out[k] = v == null ? '' : String(v);
+    }
+  } catch {}
+  return out;
+}
+
+function applyEnvFrom(values){
+  try {
+    for (const [k, v] of Object.entries(filterValid(values))){
+      process.env[k] = v == null ? '' : String(v);
+    }
   } catch {}
 }
+
+// KDF + crypto helpers
+function deriveVaultKey(passphrase, kdfParams){
+  const base = kdfParams || {};
+  const N = typeof base.N === 'number' ? base.N : 16384;
+  const r = typeof base.r === 'number' ? base.r : 8;
+  const p = typeof base.p === 'number' ? base.p : 1;
+  const saltB64 = base.saltB64 || randomBytes(16).toString('base64');
+  const salt = Buffer.from(String(saltB64), 'base64');
+  const key = scryptSync(String(passphrase || ''), salt, 32, { N, r, p });
+  return { key, kdf:{ saltB64, N, r, p } };
+}
+
+function encryptValues(values, passphrase){
+  const { key, kdf } = deriveVaultKey(passphrase, null);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = Buffer.from(JSON.stringify(filterValid(values)), 'utf8');
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const names = Object.keys(filterValid(values));
+  return {
+    version: 1,
+    encrypted: true,
+    updatedAt: new Date().toISOString(),
+    names,
+    kdf,
+    cipher: {
+      alg: 'aes-256-gcm',
+      ivB64: iv.toString('base64'),
+      tagB64: tag.toString('base64'),
+    },
+    ciphertextB64: ciphertext.toString('base64'),
+  };
+}
+
+function decryptValues(fileObj, passphrase){
+  if (!fileObj || !fileObj.encrypted){
+    return filterValid((fileObj && fileObj.values) || {});
+  }
+  const { key } = deriveVaultKey(passphrase, fileObj.kdf || {});
+  const cipherMeta = fileObj.cipher || {};
+  const ivB64 = cipherMeta.ivB64 || fileObj.ivB64 || fileObj.iv;
+  const tagB64 = cipherMeta.tagB64 || fileObj.tagB64 || fileObj.tag;
+  const ciphertextB64 = fileObj.ciphertextB64 || fileObj.ciphertext;
+  const iv = Buffer.from(String(ivB64 || ''), 'base64');
+  const tag = Buffer.from(String(tagB64 || ''), 'base64');
+  const enc = Buffer.from(String(ciphertextB64 || ''), 'base64');
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const out = Buffer.concat([decipher.update(enc), decipher.final()]);
+  const obj = JSON.parse(out.toString('utf8') || '{}');
+  return filterValid(obj && typeof obj === 'object' ? obj : {});
+}
+
+async function readVaultFile(){
+  try {
+    if (!existsSync(VAULT_PATH)) return null;
+    const text = readFileSync(VAULT_PATH, 'utf8');
+    if (!text) return null;
+    const data = JSON.parse(text);
+    const encrypted = !!data && !!data.encrypted;
+    let names = [];
+    if (Array.isArray(data.names)) names = data.names;
+    else if (!encrypted && data && data.values && typeof data.values === 'object') names = Object.keys(data.values);
+    names = names.filter((n) => isValidEnvName(n));
+    return { data, encrypted, names };
+  } catch { return null; }
+}
+
+async function writeVaultFile(obj){
+  try { ensureArcanaHomeDir(); } catch {}
+  const json = JSON.stringify(obj, null, 2);
+  try {
+    await writeFile(VAULT_PATH, json, { mode: 0o600 });
+  } catch {
+    await writeFile(VAULT_PATH, json);
+  }
+  try { await chmod(VAULT_PATH, 0o600); } catch {}
+}
+
+async function loadVaultFromDisk(){
+  try {
+    const file = await readVaultFile();
+    if (!file){
+      vaultInfo.hasFile = false;
+      vaultInfo.encrypted = false;
+      vaultInfo.locked = false;
+      vaultInfo.names = new Set();
+      vaultValues = {};
+      return;
+    }
+    vaultInfo.hasFile = true;
+    vaultInfo.encrypted = !!file.encrypted;
+    vaultInfo.names = new Set(Array.isArray(file.names) ? file.names : []);
+    if (!file.encrypted){
+      const vals = filterValid((file.data && file.data.values) || {});
+      vaultInfo.locked = false;
+      vaultValues = vals;
+      applyEnvFrom(vals);
+      return;
+    }
+    const envPass = String(process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
+    if (!envPass){
+      vaultInfo.locked = true;
+      vaultValues = {};
+      return;
+    }
+    try {
+      const vals = decryptValues(file.data, envPass);
+      vaultInfo.locked = false;
+      vaultValues = vals;
+      applyEnvFrom(vals);
+    } catch {
+      vaultInfo.locked = true;
+      vaultValues = {};
+    }
+  } catch {
+    vaultInfo.hasFile = false;
+    vaultInfo.encrypted = false;
+    vaultInfo.locked = false;
+    vaultInfo.names = new Set();
+    vaultValues = {};
+  }
+}
+
+const ERR_VAULT_LOCKED = 'VAULT_LOCKED';
+const ERR_VAULT_BAD_PASSPHRASE = 'VAULT_BAD_PASSPHRASE';
+
+async function persistVaultUpdate({ set, unset, passphrase }){
+  try {
+    const pass = String(passphrase || '').trim();
+    const file = await readVaultFile();
+    const wasEncrypted = !!(file && file.encrypted);
+    let baseValues = {};
+
+    if (!file){
+      baseValues = {};
+    } else if (!file.encrypted){
+      baseValues = filterValid((file.data && file.data.values) || {});
+    } else {
+      if (!pass){
+        const err = new Error('vault_locked');
+        err.code = ERR_VAULT_LOCKED;
+        throw err;
+      }
+      try {
+        baseValues = decryptValues(file.data, pass);
+      } catch {
+        const err = new Error('vault_bad_passphrase');
+        err.code = ERR_VAULT_BAD_PASSPHRASE;
+        throw err;
+      }
+    }
+
+    const cleanSet = filterValid(set || {});
+    const cleanUnset = Array.isArray(unset) ? unset.filter((n) => isValidEnvName(n)) : [];
+    for (const [k, v] of Object.entries(cleanSet)) baseValues[k] = v;
+    for (const n of cleanUnset) { delete baseValues[n]; }
+
+    const finalValues = filterValid(baseValues);
+    const names = Object.keys(finalValues);
+    const shouldEncrypt = !!pass || wasEncrypted;
+
+    if (shouldEncrypt){
+      if (!pass){
+        const err = new Error('vault_locked');
+        err.code = ERR_VAULT_LOCKED;
+        throw err;
+      }
+      const obj = encryptValues(finalValues, pass);
+      await writeVaultFile(obj);
+      vaultInfo.hasFile = true;
+      vaultInfo.encrypted = true;
+      vaultInfo.locked = false;
+      vaultInfo.names = new Set(names);
+      vaultValues = finalValues;
+      return;
+    }
+
+    const obj = {
+      version: 1,
+      encrypted: false,
+      updatedAt: new Date().toISOString(),
+      values: finalValues,
+    };
+    await writeVaultFile(obj);
+    vaultInfo.hasFile = true;
+    vaultInfo.encrypted = false;
+    vaultInfo.locked = false;
+    vaultInfo.names = new Set(names);
+    vaultValues = finalValues;
+  } catch (e) {
+    if (e && (e.code === ERR_VAULT_LOCKED || e.code === ERR_VAULT_BAD_PASSPHRASE)){
+      throw e;
+    }
+    throw e;
+  }
+}
+
+async function handleGetEnv(req, res){
+  try {
+    const vault = vaultMetaForResponse();
+    const names = Array.isArray(vault.names) ? vault.names : [];
+    const vars = names.map((name) => ({
+      name,
+      hasValue: !!process.env[name],
+      stored: Array.isArray(vault.names) ? vault.names.includes(name) : false,
+    }));
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ vars, vault }));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'env_list_failed', message: e?.message || String(e) }));
+  }
+}
+
+// Set/unset environment variables at runtime + persist to vault.
+// Body shape: { set: { VAR: value, ... }, unset: [ 'VAR2', ... ], passphrase?: '...' }
+async function handlePostEnv(req, res){
+  try {
+    const bufs = []; for await (const chunk of req) bufs.push(chunk);
+    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
+    const toSet = (body && body.set && typeof body.set === 'object') ? body.set : {};
+    const toUnset = Array.isArray(body && body.unset) ? body.unset : [];
+    const passphrase = String((body && body.passphrase) || process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
+
+    // First: update vault on disk (may be encrypted)
+    try {
+      await persistVaultUpdate({ set: toSet, unset: toUnset, passphrase });
+    } catch (e) {
+      if (e && e.code === ERR_VAULT_LOCKED){
+        res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked', message: 'Vault is encrypted; provide passphrase.' }));
+        return;
+      }
+      if (e && e.code === ERR_VAULT_BAD_PASSPHRASE){
+        res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
+        return;
+      }
+      throw e;
+    }
+
+    // Apply simple name validation to live process.env
+    let touchedWorkspace = false;
+    for (const [kRaw, vRaw] of Object.entries(toSet)){
+      const k = String(kRaw || '').trim();
+      if (!isValidEnvName(k)) continue;
+      const v = vRaw == null ? '' : String(vRaw);
+      process.env[k] = v;
+      if (k === 'ARCANA_WORKSPACE') touchedWorkspace = true;
+    }
+    for (const nRaw of toUnset){
+      const n = String(nRaw || '').trim();
+      if (!isValidEnvName(n)) continue;
+      try { delete process.env[n]; } catch {}
+      if (n === 'ARCANA_WORKSPACE') touchedWorkspace = true;
+    }
+
+    if (touchedWorkspace){
+      try { resetWorkspaceRootCache(); } catch {}
+      workspaceRoot = resolveWorkspaceRoot();
+      // Reset model/tool sessions so changes take effect immediately and refresh diagnostics info
+      resetSessions();
+      try { await ensurePolicySession('restricted'); } catch {}
+    }
+
+    // Notify clients: env changed + refreshed server_info
+    try { broadcast({ type: 'env_refresh' }); } catch {}
+    try {
+      const modelLabel = model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '<auto>';
+      broadcast({ type: 'server_info', model: modelLabel, tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
+    } catch {}
+
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
+  } catch (e) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'env_update_failed', message: e?.message || String(e) }));
+  }
+}
+
 
 async function ensurePolicySession(policy) {
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
@@ -90,6 +441,8 @@ async function ensurePolicySession(policy) {
   pluginFiles = created.pluginFiles || pluginFiles || [];
   toolNames = created.toolNames || toolNames || [];
   model = created.model || model || null;
+  skillNames = created.skillNames || skillNames || [];
+  try { if (created.skillToolMap) policySkillToolMap.set(pol, created.skillToolMap); } catch {}
   ensureEventBridge(sess);
   return sess;
 }
@@ -102,6 +455,14 @@ async function ensureSessionFor(sessionId, policy, cwdForSession) {
   const created = await createArcanaSession({ cwd: cwdForSession || workspaceRoot, execPolicy: pol });
   const sess = created.session;
   chatSessions.set(key, sess);
+  try {
+    // Update globals for diagnostics (safe to overwrite; just for /api/events server_info)
+    pluginFiles = created.pluginFiles || pluginFiles || [];
+    toolNames = created.toolNames || toolNames || [];
+    model = created.model || model || null;
+    skillNames = created.skillNames || skillNames || [];
+    if (created.skillToolMap) skillToolMapById.set(String(sessionId || 'default'), created.skillToolMap);
+  } catch {}
   ensureEventBridgeForId(sess, sessionId);
   return sess;
 }
@@ -152,6 +513,20 @@ function scheduleSopExtraction({ ws, sessionId, toolName, safeArgs, errTextRaw }
   } catch {}
 }
 
+function activateToolsForSkill({ sess, sessionId, skillName, policy }){
+  try {
+    const map = sessionId ? (skillToolMapById.get(String(sessionId)) || new Map()) : (policySkillToolMap.get(String(policy||'restricted')) || new Map());
+    const names = map.get(String(skillName || '')) || [];
+    if (!names || !names.length) return false;
+    const desired = new Set(sess.getActiveToolNames?.() || []);
+    for (const n of names) desired.add(n);
+    const list = Array.from(desired);
+    sess.setActiveToolsByName?.(list);
+    try { broadcast({ type: 'tools_active', tools: list, sessionId }); } catch {}
+    return true;
+  } catch { return false }
+}
+
 
 function ensureEventBridgeForId(sess, sessionId) {
   if (!sess || bridgedById.has(sess)) return;
@@ -181,6 +556,16 @@ function ensureEventBridgeForId(sess, sessionId) {
         // Forward original start event with sessionId for filtering on the client
         broadcast({ type: 'tool_execution_start', toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {}, sessionId });
         try { if (ev && ev.toolCallId) toolArgsByCallId.set(ev.toolCallId, ev.args || {}); } catch {}
+        // If the agent is reading a SKILL.md, auto-activate that skill's tools for this session
+        try {
+          if (ev.toolName === 'read' && ev.args && ev.args.path && /\bSKILL\.md$/i.test(String(ev.args.path))) {
+            const obj = ssLoad(String(sessionId||'').trim());
+            const ws = (obj && obj.workspace) ? String(obj.workspace) : workspaceRoot;
+            const pRaw = String(ev.args.path||'');
+            const p = pRaw.startsWith('/') ? pRaw : join(ws || '', pRaw);
+            try { const text = readFileSync(p, 'utf-8'); const { frontmatter } = parseFrontmatter(text); const name = frontmatter && frontmatter.name; if (name) activateToolsForSkill({ sess, sessionId, skillName: String(name) }); } catch {}
+          }
+        } catch {}
       }
 
       // Forward updates/ends tagged with sessionId
@@ -348,7 +733,7 @@ async function handleEvents(req, res) {
   res.writeHead(200, sseHeaders());
   clients.add(res);
   const modelLabel = model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '<auto>';
-  send(res, { type: 'server_info', model: modelLabel, tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot });
+  send(res, { type: 'server_info', model: modelLabel, tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
   req.on('close', () => { try { clients.delete(res); } catch {} });
 }
 
@@ -408,6 +793,11 @@ async function handleChat2(req, res) {
 
     const sess = await ensureSessionFor(sessionId, policy, ws);
     applyExecPolicyToSession(sess, policy);
+    // If user explicitly invoked a skill via a skill block (/skill:name), activate its tools
+    try {
+      const blk = parseSkillBlock(message);
+      if (blk && blk.name) activateToolsForSkill({ sess, sessionId, skillName: String(blk.name), policy });
+    } catch {}
 
     // Tier1: user_issue detection -> direct daily memory append (deduped)
     try {
@@ -454,8 +844,42 @@ async function handleChat2(req, res) {
       }
     });
 
-    try { await runWithContext({ sessionId, workspaceRoot: ws }, () => sess.prompt(payloadMsg)); } catch {}
+    // If session is already streaming, treat this request as a steering message
+    // so it interrupts the remaining plan after the current tool finishes.
+    if (sess && sess.isStreaming) {
+      try {
+        await runWithContext({ sessionId, workspaceRoot: ws }, () =>
+          sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
+        );
+        try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
+      } catch {}
+      try { unsub && unsub(); } catch {}
+      // For steer, we reply immediately; front-end will continue via SSE.
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: '' }));
+      return;
+    }
+
+    // Normal path: not streaming -> start a new agent turn
+    let promptError = null;
+    try {
+      await runWithContext({ sessionId, workspaceRoot: ws }, () => sess.prompt(payloadMsg));
+    } catch (e) {
+      promptError = e;
+    }
     try { unsub && unsub(); } catch {}
+
+    if (promptError) {
+      let msg = '';
+      try {
+        msg = String(promptError && (promptError.message || promptError)) || 'agent_prompt_failed';
+      } catch {
+        msg = 'agent_prompt_failed';
+      }
+      try { console.error('[arcana:chat2] prompt failed:', msg); } catch {}
+      try { broadcast({ type: 'error', sessionId, message: msg }); } catch {}
+      res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg }));
+      return;
+    }
 
     // Fallback persistence
     if (lastAssistantText) {
@@ -474,6 +898,60 @@ async function handleChat2(req, res) {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: respText }));
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: e?.message || String(e) }));
+  }
+}
+
+// POST /api/abort  — hard-stop current run and active tool (if any)
+async function handleAbort(req, res) {
+  try {
+    const bufs = []; for await (const chunk of req) bufs.push(chunk);
+    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
+    const sessionId = String(body.sessionId || '').trim();
+    if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
+
+    const obj0 = ssLoad(sessionId);
+    const ws = (obj0 && obj0.workspace) ? String(obj0.workspace) : workspaceRoot;
+    const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
+    const sess = await ensureSessionFor(sessionId, policy, ws);
+    applyExecPolicyToSession(sess, policy);
+
+    try { await runWithContext({ sessionId, workspaceRoot: ws }, () => sess.abort()); } catch {}
+    try { broadcast({ type: 'abort_done', sessionId }); } catch {}
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'abort_failed', message: e?.message || String(e) }));
+  }
+}
+
+// Optional: explicit steer endpoint — enqueue a steering message while streaming
+async function handleSteer(req, res) {
+  try {
+    const bufs = []; for await (const chunk of req) bufs.push(chunk);
+    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
+    const message = String(body.message || '').trim();
+    const sessionId = String(body.sessionId || '').trim();
+    const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
+    if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
+    if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
+
+    // Persist user message and build prelude like chat2 for consistency
+    ssAppend(sessionId, { role: 'user', text: message });
+    const obj0 = ssLoad(sessionId);
+    const ws = (obj0 && obj0.workspace) ? String(obj0.workspace) : workspaceRoot;
+    const prelude = ssPrelude(obj0);
+    const payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
+
+    const sess = await ensureSessionFor(sessionId, policy, ws);
+    applyExecPolicyToSession(sess, policy);
+    try {
+      await runWithContext({ sessionId, workspaceRoot: ws }, () =>
+        sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
+      );
+      try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
+    } catch {}
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'steer_failed', message: e?.message || String(e) }));
   }
 }
 
@@ -562,7 +1040,7 @@ async function handlePostConfig(req, res) {
 
     await writeFile(path, JSON.stringify(cfgObj, null, 2), 'utf-8');
     resetSessions();
-    broadcast({ type: 'server_info', model: '', tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot });
+    broadcast({ type: 'server_info', model: '', tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
   } catch (e) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'config_write_failed', message: e?.message || String(e) }));
@@ -644,11 +1122,17 @@ function createRequestHandler() {
     if (req.method === 'GET' && url.pathname === '/health') { res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, plugins: (pluginFiles?.length || 0) })); return; }
     if (req.method === 'GET' && url.pathname === '/api/events') { await handleEvents(req, res); return; }
 
+    if (req.method === 'GET' && url.pathname === '/api/env') { await handleGetEnv(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/env') { await handlePostEnv(req, res); return; }
     // Legacy chat
     if (req.method === 'POST' && url.pathname === '/api/chat') { await handleChat(req, res); return; }
 
     // Concurrent chat + persistence
     if (req.method === 'POST' && url.pathname === '/api/chat2') { await handleChat2(req, res); return; }
+
+    // Interrupt/steer APIs
+    if (req.method === 'POST' && url.pathname === '/api/abort') { await handleAbort(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/steer') { await handleSteer(req, res); return; }
 
     // Sessions CRUD
     if (req.method === 'GET' && url.pathname === '/api/sessions') { await handleListSessions(req, res); return; }
@@ -673,6 +1157,7 @@ function createRequestHandler() {
 export async function startArcanaWebServer({ port, workspaceRoot: wsRoot } = {}) {
   if (wsRoot) { process.env.ARCANA_WORKSPACE = String(wsRoot); try { resetWorkspaceRootCache(); } catch {} }
   workspaceRoot = resolveWorkspaceRoot();
+  try { ensureArcanaHomeDir(); await loadVaultFromDisk(); } catch {}
 
   const server = http.createServer(createRequestHandler());
   const desiredPort = typeof port === 'number' ? port : (process.env.PORT ? Number(process.env.PORT) : 5678);

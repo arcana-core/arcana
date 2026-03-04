@@ -1,6 +1,6 @@
 import { Type } from '@sinclair/typebox';
-import { addJob, listJobSummaries, listRuns as storeListRuns, enableJob, disableJob, removeJob, patchJob, findJob } from './timer/store.js';
-import { runDueOnce, runJobById } from './timer/runner.js';
+import { addJob, listJobSummaries, listRuns as storeListRuns, enableJob, disableJob, removeJob, patchJob, findJob } from '../timer/store.js';
+import { runDueOnce, runJobById } from '../timer/runner.js';
 
 export function createTimerTool(){
   const Schedule = Type.Object({

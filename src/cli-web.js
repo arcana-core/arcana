@@ -32,7 +32,7 @@ async function search(query, engine){
     }
   } catch {}
   // Fallback: simple search using src tool
-  const simple = (await import('./tools-web-search.js')).default;
+  const simple = (await import('./tools/web-search.js')).default;
   const tool = simple();
   const out = await tool.execute('cli', { query, engine: engine||'duckduckgo' });
   const text = (out && out.content || []).filter(c=>c.type==='text').map(c=>c.text).join('\n');
@@ -40,8 +40,15 @@ async function search(query, engine){
 }
 
 async function serve(port){
-  if (port) process.env.PORT = String(port);
-  await import('../server/server.mjs');
+  const desiredPort = typeof port === 'number' && Number.isFinite(port) ? port : undefined;
+  if (desiredPort) process.env.PORT = String(desiredPort);
+  const mod = await import('../server/server.mjs');
+  const fn = mod && (mod.startArcanaWebServer || mod.default?.startArcanaWebServer);
+  if (typeof fn !== 'function'){
+    throw new Error('startArcanaWebServer not exported from server/server.mjs');
+  }
+  const workspaceRoot = String(process.env.ARCANA_WORKSPACE || process.cwd());
+  await fn({ port: desiredPort, workspaceRoot });
 }
 
 export async function webCLI({ args }){
