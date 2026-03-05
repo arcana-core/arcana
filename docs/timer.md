@@ -30,5 +30,5 @@ Storage
 
 Notes
 - exec uses /bin/zsh -lc to run commands; output is logged.
-- arcana appends to .sessions/ and logs assistant text.
+- arcana appends to the default agent's session history (under `~/.arcana/agents/default/sessions/`) and logs assistant text.
 - one-shot at schedules clear nextRunAtMs after execution.

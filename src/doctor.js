@@ -122,7 +122,7 @@ export async function runDoctor({ cwd } = {}){
 
   // skills
   let skills = [];
-  try { skills = loadArcanaSkills({ cwd: cwd||process.cwd() }) || []; } catch {}
+  try { skills = loadArcanaSkills({ workspaceRoot: cwd||process.cwd() }) || []; } catch {}
   const skillsOk = skills.length >= 0; // presence is optional
   checks.push({
     id: 'skills',
@@ -130,7 +130,7 @@ export async function runDoctor({ cwd } = {}){
     status: status(skillsOk, skills.length === 0),
     code: skills.length ? 'SKILLS_FOUND' : 'SKILLS_NONE',
     details: { count: skills.length },
-    next: skills.length ? [] : ['Add skills under ./skills or set ARCANA_SKILLS_DIRS to extend capabilities.']
+    next: skills.length ? [] : ['Add skills under ~/.arcana/agents/<agentId>/skills (default), or under ./skills for shared skills, or set ARCANA_SKILLS_DIRS to extend capabilities.']
   });
 
   // playwright

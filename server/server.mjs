@@ -1,8 +1,9 @@
 import http from 'node:http';
 import { readFile, writeFile, chmod } from 'node:fs/promises';
-import { existsSync, statSync, realpathSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, realpathSync, readFileSync, readdirSync, mkdirSync, writeFileSync, copyFileSync, appendFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import os from 'node:os';
 
 import { createHash, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
 import { createArcanaSession } from '../src/session.js';
@@ -27,10 +28,308 @@ import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
 // Tier1 memory triggers (direct daily append)
 
 
-import { createMemoryTools } from '../src/tools/memory.js';
-import { detectProblemMention, truncateText } from '../src/memory-triggers.js';
+import { detectProblemMention, detectCorrectionMention, truncateText } from '../src/memory-triggers.js';
 const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..'); // arcana/
 let workspaceRoot = null; // set on start
+
+const DEFAULT_AGENT_ID = 'default';
+
+// Feature flags for automatic memory writes
+function envFlagEnabled(name){
+  try {
+    const v = String(process.env[name] || '').trim().toLowerCase();
+    if (!v) return false;
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  } catch { return false; }
+}
+
+const MEMORY_TRIGGERS_ENABLED = envFlagEnabled('ARCANA_MEMORY_TRIGGERS');
+function envFlagDefaultTrue(name){
+  try {
+    const v = String(process.env[name] || '').trim().toLowerCase();
+    if (!v) return true;
+    if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
+    if (v === '1' || v === 'true' || v === 'yes' || v === 'on') return true;
+    return true;
+  } catch { return true; }
+}
+const SOP_EXTRACTION_ENABLED = envFlagDefaultTrue('ARCANA_SOP_EXTRACTION');
+
+function expandHomeDirPath(input){
+  if (!input) return input;
+  const s = String(input);
+  if (s === '~'){
+    try { return os.homedir(); } catch { return s; }
+  }
+  if (s.startsWith('~/') || s.startsWith('~\\')){
+    try {
+      const home = os.homedir && os.homedir();
+      if (home) return join(home, s.slice(2));
+    } catch {
+      // ignore
+    }
+  }
+  return s;
+}
+
+function safeRealpath(p){
+  const s = String(p || '').trim();
+  if (!s) return '';
+  try { return realpathSync(s); } catch { return s; }
+}
+
+function nowIso(){
+  try { return new Date().toISOString(); } catch { return String(new Date()); }
+}
+
+// Load a snapshot of all agents under ~/.arcana/agents/<agentId>/agent.json.
+function loadAgentsSnapshot(){
+  ensureArcanaHomeDir();
+  const agentsDir = arcanaHomePath('agents');
+  let entries = [];
+  try {
+    entries = readdirSync(agentsDir, { withFileTypes: true });
+  } catch {
+    return { agentsDir, agents: [] };
+  }
+  const agents = [];
+  for (const entry of entries){
+    try {
+      if (!entry || typeof entry.name !== 'string') continue;
+      const isDir = entry.isDirectory ? entry.isDirectory() : true;
+      if (!isDir) continue;
+      const dirId = entry.name;
+      const agentDirRaw = join(agentsDir, dirId);
+      const metaPath = join(agentDirRaw, 'agent.json');
+      let metaStat;
+      try { metaStat = statSync(metaPath); } catch { continue; }
+      if (!metaStat || !metaStat.isFile()) continue;
+      const agentHomeDir = safeRealpath(agentDirRaw);
+      let meta = null;
+      try {
+        const raw = readFileSync(metaPath, 'utf-8');
+        if (raw) meta = JSON.parse(raw);
+      } catch {}
+      let agentId = dirId;
+      try {
+        const idFromFile = meta && meta.agentId ? String(meta.agentId || '').trim() : '';
+        if (idFromFile) agentId = idFromFile;
+      } catch {}
+      let workspaceRoot = '';
+      try {
+        const rawWs = meta && (meta.workspaceRoot || meta.workspaceDir || '');
+        if (rawWs) workspaceRoot = safeRealpath(expandHomeDirPath(rawWs));
+      } catch {}
+      let createdAt = '';
+      if (meta && typeof meta.createdAt === 'string' && meta.createdAt.trim()){
+        createdAt = meta.createdAt.trim();
+      }
+      if (!createdAt){
+        const ts = metaStat.birthtimeMs || metaStat.ctimeMs || metaStat.mtimeMs || Date.now();
+        try { createdAt = new Date(ts).toISOString(); } catch { createdAt = nowIso(); }
+      }
+      agents.push({ agentId, agentDir: agentHomeDir, agentHomeDir, workspaceRoot, createdAt });
+    } catch {
+      // ignore entry-level errors
+    }
+  }
+  agents.sort((a, b) => {
+    const aT = String(a.createdAt || '');
+    const bT = String(b.createdAt || '');
+    if (!aT && !bT) return String(a.agentId || '').localeCompare(String(b.agentId || ''));
+    if (!aT) return 1;
+    if (!bT) return -1;
+    return aT.localeCompare(bT);
+  });
+  return { agentsDir, agents };
+  }
+function normalizeAgentId(raw){
+  const s = String(raw || '').trim();
+  return s || DEFAULT_AGENT_ID;
+}
+
+function findAgentMeta(agentId){
+  const id = normalizeAgentId(agentId);
+  const snap = loadAgentsSnapshot();
+  const agents = Array.isArray(snap && snap.agents) ? snap.agents : [];
+  for (const a of agents){
+    const cur = String(a && a.agentId || '').trim();
+    if (cur === id) return a;
+  }
+  return null;
+}
+
+function seedAgentHomeBootstrap(agentHomeDir, agentId){
+  const safeId = normalizeAgentId(agentId);
+  function writeIfMissing(name, content){
+    const p = join(agentHomeDir, name);
+    try {
+      if (existsSync(p)) return;
+      mkdirSync(agentHomeDir, { recursive: true });
+      writeFileSync(p, content, 'utf-8');
+    } catch {}
+  }
+  writeIfMissing('AGENTS.md',
+    '# Agent Home\n\n' +
+    'This directory belongs to agent "' + safeId + '".\n' +
+    'Use this file for agent-level rules, routing notes, and shared context.\n');
+  writeIfMissing('MEMORY.md',
+    '# MEMORY\n\n' +
+    'Use this file to capture long-term notes, decisions, and links for agent "' + safeId + '".\n');
+  writeIfMissing('SOUL.md',
+    '# SOUL.md - Who You Are\n\n' +
+    'Describe the persona, tone, and boundaries for this agent.\n');
+  writeIfMissing('USER.md',
+    '# USER.md - Who I Am\n\n' +
+    'Describe the primary user or team this agent serves, plus preferences and constraints.\n');
+  writeIfMissing('TOOLS.md',
+    '# TOOLS.md - Tools and Capabilities\n\n' +
+    'List important tools, APIs, and workflows this agent should know about.\n');
+
+  const memDir = join(agentHomeDir, 'memory');
+  const skillsDir = join(agentHomeDir, 'skills');
+  const agentsSkillsDir = join(agentHomeDir, '.agents', 'skills');
+  try { mkdirSync(memDir, { recursive: true }); } catch {}
+  try { mkdirSync(skillsDir, { recursive: true }); } catch {}
+  try { mkdirSync(agentsSkillsDir, { recursive: true }); } catch {}
+
+  const servicesIniPath = join(agentHomeDir, 'services.ini');
+  if (!existsSync(servicesIniPath)) {
+    const servicesIniLines = [
+      '; Arcana services configuration',
+      '; Each section [serviceId] defines an auto-starting service.',
+      ';',
+      '; Example Feishu WebSocket bridge service:',
+      ';',
+      '; [feishu]',
+      '; command = node $ARCANA_PKG_ROOT/skills/feishu/scripts/feishu-bridge.mjs',
+      '; env.FEISHU_APP_ID = your-app-id',
+      '; env.FEISHU_APP_SECRET = your-app-secret',
+      '; env.FEISHU_DOMAIN = feishu',
+      '',
+    ];
+    try { writeFileSync(servicesIniPath, servicesIniLines.join('\n'), 'utf-8'); } catch {}
+  }
+}
+
+function copyDirRecursive(src, dst){
+  try {
+    const st = statSync(src);
+    if (!st || !st.isDirectory()) return;
+  } catch { return; }
+  try { mkdirSync(dst, { recursive: true }); } catch {}
+  let entries = [];
+  try { entries = readdirSync(src, { withFileTypes: true }); } catch { entries = []; }
+  for (const entry of entries){
+    try {
+      if (!entry || typeof entry.name !== 'string') continue;
+      const from = join(src, entry.name);
+      const to = join(dst, entry.name);
+      const isDir = entry.isDirectory ? entry.isDirectory() : false;
+      if (isDir) {
+        copyDirRecursive(from, to);
+      } else {
+        const isFile = entry.isFile ? entry.isFile() : true;
+        if (isFile && !existsSync(to)) copyFileSync(from, to);
+      }
+    } catch {}
+  }
+}
+
+function ensureDefaultAgentExists(){
+  ensureArcanaHomeDir();
+  const agentsBase = arcanaHomePath('agents');
+  try { mkdirSync(agentsBase, { recursive: true }); } catch {}
+
+  const agentHomeDir = arcanaHomePath('agents', DEFAULT_AGENT_ID);
+
+  // One-time bootstrap: if "default" is missing, clone the newest existing agent home (if any).
+  try {
+    if (!existsSync(agentHomeDir)) {
+      const snap = loadAgentsSnapshot();
+      const agents = Array.isArray(snap && snap.agents) ? snap.agents : [];
+      let latest = null;
+      for (const a of agents){
+        if (!a) continue;
+        const id = String(a.agentId || '').trim();
+        if (!id || id === DEFAULT_AGENT_ID) continue;
+        if (!latest) latest = a;
+        else {
+          const cur = String(a.createdAt || '');
+          const prev = String(latest.createdAt || '');
+          if (cur && (!prev || cur.localeCompare(prev) > 0)) {
+            latest = a;
+          }
+        }
+      }
+      if (latest && latest.agentHomeDir && existsSync(latest.agentHomeDir)) {
+        copyDirRecursive(latest.agentHomeDir, agentHomeDir);
+        const agentJsonPath = join(agentHomeDir, 'agent.json');
+        let meta = null;
+        try {
+          if (existsSync(agentJsonPath)) {
+            const raw = readFileSync(agentJsonPath, 'utf-8');
+            meta = raw ? JSON.parse(raw) : null;
+          }
+        } catch { meta = null; }
+        if (!meta || typeof meta !== 'object') meta = {};
+        meta.agentId = DEFAULT_AGENT_ID;
+        try { writeFileSync(agentJsonPath, JSON.stringify(meta, null, 2), 'utf-8'); } catch {}
+      }
+    }
+  } catch {}
+
+  let meta = findAgentMeta(DEFAULT_AGENT_ID);
+  if (meta && meta.workspaceRoot && existsSync(meta.workspaceRoot)) return meta;
+
+  let ws = String(process.env.ARCANA_WORKSPACE || '').trim();
+  if (!ws) {
+    try {
+      const cfg = loadArcanaConfig();
+      const cand = cfg?.workspace_root || cfg?.workspaceRoot || cfg?.workspace_dir || cfg?.workspaceDir;
+      if (cand) ws = expandHomeDirPath(cand);
+    } catch {}
+  }
+  if (!ws) ws = process.cwd();
+  try { mkdirSync(ws, { recursive: true }); } catch {}
+  try { mkdirSync(join(ws, 'artifacts'), { recursive: true }); } catch {}
+
+  try { mkdirSync(agentHomeDir, { recursive: true }); } catch {}
+  const agentJsonPath = join(agentHomeDir, 'agent.json');
+  let metaObj = null;
+  try {
+    if (existsSync(agentJsonPath)) {
+      const raw = readFileSync(agentJsonPath, 'utf-8');
+      metaObj = raw ? JSON.parse(raw) : null;
+    }
+  } catch { metaObj = null; }
+  if (!metaObj || typeof metaObj !== 'object') metaObj = {};
+  metaObj.agentId = DEFAULT_AGENT_ID;
+  metaObj.workspaceRoot = safeRealpath(expandHomeDirPath(ws));
+  if (!metaObj.createdAt) metaObj.createdAt = nowIso();
+  try { writeFileSync(agentJsonPath, JSON.stringify(metaObj, null, 2), 'utf-8'); } catch {}
+  seedAgentHomeBootstrap(agentHomeDir, DEFAULT_AGENT_ID);
+  meta = findAgentMeta(DEFAULT_AGENT_ID) || {
+    agentId: DEFAULT_AGENT_ID,
+    agentDir: agentHomeDir,
+    agentHomeDir,
+    workspaceRoot: metaObj.workspaceRoot,
+    createdAt: metaObj.createdAt,
+  };
+  return meta;
+}
+
+function resolveSessionContext(sessionId, explicitAgentId){
+  const sid = String(sessionId || '').trim();
+  const rawAgentId = explicitAgentId || DEFAULT_AGENT_ID;
+  const agentId = normalizeAgentId(rawAgentId);
+  const obj = sid ? ssLoad(sid, { agentId }) : null;
+  const agent = findAgentMeta(agentId) || ensureDefaultAgentExists();
+  const ws = agent && agent.workspaceRoot ? agent.workspaceRoot : workspaceRoot;
+  const agentHomeDir = agent && agent.agentHomeDir ? agent.agentHomeDir : arcanaHomePath('agents', agentId);
+  return { session: obj, agent, agentId, agentHomeDir, workspaceRoot: ws };
+}
+
 
 // Legacy per-policy sessions used by /api/chat
 const sessionsByPolicy = new Map();
@@ -69,11 +368,8 @@ const reflectionSessionsByWs = new Map(); // ws -> session
 // Tier1 trigger dedupe (per workspace/session) — keep small TTL; best effort
 const DEDUPE_TRIGGER_TTL_MS = 10*60*1000; // 10 minutes
 const dedupeUserIssue = new Map(); // key -> lastSeenMs
+const dedupeUserCorrection = new Map(); // key -> lastSeenMs
 const dedupeToolFail = new Map(); // key -> lastSeenMs
-
-// Singleton memory tools for direct append without going through the LLM
-const memoryTools = createMemoryTools();
-const memoryAppendTool = memoryTools.find((t) => t && t.name === 'memory_append');
 const reflectionQueueByWs = new Map(); // ws -> Promise chain
 const chatSessions = new Map();
 const bridgedById = new WeakSet();
@@ -83,10 +379,13 @@ const skillToolMapById = new Map();
 const policySkillToolMap = new Map(); // key: 'open'|'restricted' -> Map(skill->tools)
 
 // Per-session state for event aggregation
+const mediaRefsByTurn = new Map(); // sessionId -> Set(ref)
 const toolRepeatById = new Map(); // sessionId -> Map(key -> count)
 const thinkStatsById = new Map(); // sessionId -> { startedAt, chars }
 
+const sessionUsageTotalsById = new Map(); // sessionId -> totalTokens
 // Legacy global state (used by /api/chat)
+const legacyMediaRefsByTurn = new Set();
 const bridgedSessions = new WeakSet();
 const toolRepeat = new Map();
 let thinkStats = null;
@@ -133,6 +432,79 @@ function vaultMetaForResponse(){
       locked: false,
       names: [],
     };
+  }
+}
+
+function pad2(n){ return String(n).padStart(2, '0'); }
+function localParts(d = new Date()){
+  return {
+    Y: d.getFullYear(),
+    M: pad2(d.getMonth() + 1),
+    D: pad2(d.getDate()),
+    h: pad2(d.getHours()),
+    m: pad2(d.getMinutes()),
+  };
+}
+
+function agentDailyMemoryPath(agentHomeDir, dateStr){
+  const base = String(agentHomeDir || '').trim();
+  if (!base) return '';
+  let Y;
+  let M;
+  let D;
+  if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(String(dateStr))){
+    const parts = String(dateStr).split('-');
+    Y = parts[0];
+    M = parts[1];
+    D = parts[2];
+  } else {
+    const p = localParts();
+    Y = String(p.Y);
+    M = p.M;
+    D = p.D;
+  }
+  const memDir = join(base, 'memory');
+  try { mkdirSync(memDir, { recursive: true }); } catch {}
+  return join(memDir, Y + '-' + M + '-' + D + '.md');
+}
+
+function agentLongtermMemoryPath(agentHomeDir){
+  const base = String(agentHomeDir || '').trim();
+  if (!base) return '';
+  try { mkdirSync(base, { recursive: true }); } catch {}
+  return join(base, 'MEMORY.md');
+}
+
+function buildAgentMemoryBlock(kind, heading, content){
+  const p = localParts();
+  const stamp = p.Y + '-' + p.M + '-' + p.D + ' ' + p.h + ':' + p.m;
+  const head = heading ? (' - ' + heading) : '';
+  const label = kind === 'daily' ? (p.h + ':' + p.m) : stamp;
+  const body = String(content || '').replace(/\s+$/, '');
+  return '\n\n## ' + label + head + '\n\n' + body + '\n';
+}
+
+function appendToAgentDailyMemory({ agentHomeDir, heading, content, date }){
+  try {
+    const path = agentDailyMemoryPath(agentHomeDir, date);
+    if (!path) return null;
+    const block = buildAgentMemoryBlock('daily', heading, content);
+    appendFileSync(path, block, { encoding: 'utf-8' });
+    return { path, bytes: Buffer.byteLength(block, 'utf-8') };
+  } catch {
+    return null;
+  }
+}
+
+function appendToAgentLongtermMemory({ agentHomeDir, heading, content }){
+  try {
+    const path = agentLongtermMemoryPath(agentHomeDir);
+    if (!path) return null;
+    const block = buildAgentMemoryBlock('longterm', heading, content);
+    appendFileSync(path, block, { encoding: 'utf-8' });
+    return { path, bytes: Buffer.byteLength(block, 'utf-8') };
+  } catch {
+    return null;
   }
 }
 
@@ -266,6 +638,14 @@ async function loadVaultFromDisk(){
       const vals = decryptValues(file.data, envPass);
       vaultInfo.locked = false;
       vaultValues = vals;
+      try {
+        if (!vaultInfo.names || !(vaultInfo.names instanceof Set)){
+          vaultInfo.names = new Set();
+        }
+        for (const n of Object.keys(vals || {})){
+          if (isValidEnvName(n)) vaultInfo.names.add(n);
+        }
+      } catch {}
       applyEnvFrom(vals);
     } catch {
       vaultInfo.locked = true;
@@ -354,15 +734,233 @@ async function persistVaultUpdate({ set, unset, passphrase }){
   }
 }
 
+function resolveAgentHomeDirForEnv(agentIdRaw){
+  try {
+    const id = normalizeAgentId(agentIdRaw);
+    const meta = findAgentMeta(id) || (id === DEFAULT_AGENT_ID ? ensureDefaultAgentExists() : null);
+    if (meta && (meta.agentHomeDir || meta.agentDir)) return meta.agentHomeDir || meta.agentDir;
+    return arcanaHomePath('agents', id);
+  } catch {
+    return arcanaHomePath('agents', normalizeAgentId(agentIdRaw));
+  }
+}
+
+function agentVaultPath(agentHomeDir){
+  const base = String(agentHomeDir || '').trim();
+  if (!base) return '';
+  return join(base, 'vault.json');
+}
+
+async function readAgentVaultFile(agentHomeDir){
+  try {
+    const path = agentVaultPath(agentHomeDir);
+    if (!path || !existsSync(path)) return null;
+    const text = readFileSync(path, 'utf8');
+    if (!text) return { path, data: null, encrypted: false, names: [], inheritGlobal: true };
+    const data = JSON.parse(text);
+    const encrypted = !!data && !!data.encrypted;
+    let names = [];
+    if (Array.isArray(data.names)) names = data.names;
+    else if (!encrypted && data && data.values && typeof data.values === 'object') names = Object.keys(data.values);
+    names = names.filter((n) => isValidEnvName(n));
+    const inheritGlobal = (typeof data.inheritGlobal === 'boolean') ? data.inheritGlobal : true;
+    return { path, data, encrypted, names, inheritGlobal };
+  } catch {
+    return null;
+  }
+}
+
+async function writeAgentVaultFile(agentHomeDir, obj){
+  const base = String(agentHomeDir || '').trim();
+  if (!base) return;
+  try { mkdirSync(base, { recursive: true }); } catch {}
+  const path = agentVaultPath(base);
+  const json = JSON.stringify(obj, null, 2);
+  try {
+    await writeFile(path, json, { mode: 0o600 });
+  } catch {
+    await writeFile(path, json);
+  }
+  try { await chmod(path, 0o600); } catch {}
+}
+
+async function readAgentVaultState(agentHomeDir){
+  const base = String(agentHomeDir || '').trim();
+  const path = agentVaultPath(base);
+  const emptyMeta = {
+    path: path || '',
+    hasFile: false,
+    encrypted: false,
+    locked: false,
+    names: [],
+    inheritGlobal: true,
+  };
+  try {
+    const file = await readAgentVaultFile(base);
+    if (!file || !file.data){
+      const meta = { ...emptyMeta };
+      if (file && file.path) meta.path = file.path;
+      if (file) meta.hasFile = true;
+      return { meta, values: {} };
+    }
+    const data = file.data;
+    const encrypted = !!file.encrypted;
+    const inheritGlobal = (typeof file.inheritGlobal === 'boolean') ? file.inheritGlobal : true;
+    let names = Array.isArray(file.names) ? file.names : [];
+    names = names.filter((n) => isValidEnvName(n));
+    const meta = {
+      path: file.path || path || '',
+      hasFile: true,
+      encrypted,
+      locked: false,
+      names,
+      inheritGlobal,
+    };
+
+    let values = {};
+    if (!encrypted){
+      values = filterValid((data && data.values && typeof data.values === 'object') ? data.values : {});
+      meta.locked = false;
+      return { meta, values };
+    }
+
+    const envPass = String(process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
+    if (!envPass){
+      meta.locked = true;
+      return { meta, values: {} };
+    }
+    try {
+      values = decryptValues(data, envPass);
+      meta.locked = false;
+      return { meta, values };
+    } catch {
+      meta.locked = true;
+      return { meta, values: {} };
+    }
+  } catch {
+    return { meta: emptyMeta, values: {} };
+  }
+}
+
+async function persistAgentVaultUpdate({ agentHomeDir, set, unset, passphrase, inheritGlobal }){
+  try {
+    const pass = String(passphrase || '').trim();
+    const file = await readAgentVaultFile(agentHomeDir);
+    const wasEncrypted = !!(file && file.encrypted);
+    const prevData = file && file.data;
+    let baseValues = {};
+    let inherit = (prevData && typeof prevData.inheritGlobal === 'boolean') ? prevData.inheritGlobal : true;
+
+    if (typeof inheritGlobal === 'boolean') inherit = inheritGlobal;
+
+    if (!file || !prevData){
+      baseValues = {};
+    } else if (!file.encrypted){
+      baseValues = filterValid((prevData && prevData.values) || {});
+    } else {
+      if (!pass){
+        const err = new Error('vault_locked');
+        err.code = ERR_VAULT_LOCKED;
+        throw err;
+      }
+      try {
+        baseValues = decryptValues(prevData, pass);
+      } catch {
+        const err = new Error('vault_bad_passphrase');
+        err.code = ERR_VAULT_BAD_PASSPHRASE;
+        throw err;
+      }
+    }
+
+    const cleanSet = filterValid(set || {});
+    const cleanUnset = Array.isArray(unset) ? unset.filter((n) => isValidEnvName(n)) : [];
+    for (const [k, v] of Object.entries(cleanSet)) baseValues[k] = v;
+    for (const n of cleanUnset) { delete baseValues[n]; }
+
+    const finalValues = filterValid(baseValues);
+    const names = Object.keys(finalValues);
+    const shouldEncrypt = !!pass || wasEncrypted;
+
+    if (shouldEncrypt){
+      if (!pass){
+        const err = new Error('vault_locked');
+        err.code = ERR_VAULT_LOCKED;
+        throw err;
+      }
+      const obj = encryptValues(finalValues, pass);
+      obj.inheritGlobal = inherit;
+      await writeAgentVaultFile(agentHomeDir, obj);
+      return {
+        names,
+        inheritGlobal: inherit,
+        encrypted: true,
+        locked: false,
+      };
+    }
+
+    const obj = {
+      version: 1,
+      encrypted: false,
+      updatedAt: new Date().toISOString(),
+      inheritGlobal: inherit,
+      values: finalValues,
+    };
+    await writeAgentVaultFile(agentHomeDir, obj);
+    return {
+      names,
+      inheritGlobal: inherit,
+      encrypted: false,
+      locked: false,
+    };
+  } catch (e) {
+    if (e && (e.code === ERR_VAULT_LOCKED || e.code === ERR_VAULT_BAD_PASSPHRASE)){
+      throw e;
+    }
+    throw e;
+  }
+}
+
 async function handleGetEnv(req, res){
   try {
-    const vault = vaultMetaForResponse();
-    const names = Array.isArray(vault.names) ? vault.names : [];
-    const vars = names.map((name) => ({
-      name,
-      hasValue: !!process.env[name],
-      stored: Array.isArray(vault.names) ? vault.names.includes(name) : false,
-    }));
+    const url = new URL(req.url, 'http://localhost');
+    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
+    const agentId = agentIdParam || DEFAULT_AGENT_ID;
+    const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
+
+    const globalVault = vaultMetaForResponse();
+    const globalNames = Array.isArray(globalVault.names) ? globalVault.names : [];
+
+    const { meta: agentVault, values: agentValues } = await readAgentVaultState(agentHomeDir);
+    const agentNames = Array.isArray(agentVault.names) ? agentVault.names : [];
+    const inheritEffective = agentVault.inheritGlobal !== false;
+
+    const allNamesSet = new Set();
+    for (const n of globalNames){ if (n) allNamesSet.add(String(n)); }
+    for (const n of agentNames){ if (n) allNamesSet.add(String(n)); }
+    const allNames = Array.from(allNamesSet);
+    allNames.sort();
+
+    const vars = allNames.map((name) => {
+      const storedGlobal = globalNames.includes(name);
+      const storedAgent = agentNames.includes(name);
+      const scope = storedAgent ? 'agent' : (storedGlobal ? 'global' : '');
+      let hasValue = false;
+      if (storedAgent && !agentVault.locked){
+        const v = agentValues && Object.prototype.hasOwnProperty.call(agentValues, name) ? agentValues[name] : undefined;
+        if (v) hasValue = true;
+      }
+      if (!hasValue && inheritEffective && process.env[name]){
+        hasValue = true;
+      }
+      return { name, storedGlobal, storedAgent, scope, hasValue };
+    });
+
+    const vault = {
+      global: globalVault,
+      agent: agentVault,
+      inheritGlobal: inheritEffective,
+    };
+
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ vars, vault }));
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'env_list_failed', message: e?.message || String(e) }));
@@ -370,7 +968,7 @@ async function handleGetEnv(req, res){
 }
 
 // Set/unset environment variables at runtime + persist to vault.
-// Body shape: { set: { VAR: value, ... }, unset: [ 'VAR2', ... ], passphrase?: '...' }
+// Body shape: { agentId?: string, scope?: 'global'|'agent', set: { VAR: value, ... }, unset: [ 'VAR2', ... ], passphrase?: '...', inheritGlobal?: boolean }
 async function handlePostEnv(req, res){
   try {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
@@ -379,46 +977,71 @@ async function handlePostEnv(req, res){
     const toUnset = Array.isArray(body && body.unset) ? body.unset : [];
     const passphrase = String((body && body.passphrase) || process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
 
-    // First: update vault on disk (may be encrypted)
+    let agentId = '';
     try {
-      await persistVaultUpdate({ set: toSet, unset: toUnset, passphrase });
-    } catch (e) {
-      if (e && e.code === ERR_VAULT_LOCKED){
-        res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked', message: 'Vault is encrypted; provide passphrase.' }));
-        return;
+      if (body && Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null){
+        agentId = String(body.agentId || '').trim();
       }
-      if (e && e.code === ERR_VAULT_BAD_PASSPHRASE){
-        res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
-        return;
+    } catch {}
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
+
+    const scopeRaw = String((body && body.scope) || '').trim().toLowerCase();
+    const scope = (scopeRaw === 'agent') ? 'agent' : 'global';
+    const inheritGlobal = (body && typeof body.inheritGlobal === 'boolean') ? body.inheritGlobal : undefined;
+
+    if (scope === 'global'){
+      try {
+        await persistVaultUpdate({ set: toSet, unset: toUnset, passphrase });
+      } catch (e) {
+        if (e && e.code === ERR_VAULT_LOCKED){
+          res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked', message: 'Vault is encrypted; provide passphrase.' }));
+          return;
+        }
+        if (e && e.code === ERR_VAULT_BAD_PASSPHRASE){
+          res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
+          return;
+        }
+        throw e;
       }
-      throw e;
+
+      let touchedWorkspace = false;
+      for (const [kRaw, vRaw] of Object.entries(toSet)){
+        const k = String(kRaw || '').trim();
+        if (!isValidEnvName(k)) continue;
+        const v = vRaw == null ? '' : String(vRaw);
+        process.env[k] = v;
+        if (k === 'ARCANA_WORKSPACE') touchedWorkspace = true;
+      }
+      for (const nRaw of toUnset){
+        const n = String(nRaw || '').trim();
+        if (!isValidEnvName(n)) continue;
+        try { delete process.env[n]; } catch {}
+        if (n === 'ARCANA_WORKSPACE') touchedWorkspace = true;
+      }
+
+      if (touchedWorkspace){
+        try { resetWorkspaceRootCache(); } catch {}
+        workspaceRoot = resolveWorkspaceRoot();
+        resetSessions();
+        try { await ensurePolicySession('restricted'); } catch {}
+      }
+    } else {
+      const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
+      try {
+        await persistAgentVaultUpdate({ agentHomeDir, set: toSet, unset: toUnset, passphrase, inheritGlobal });
+      } catch (e) {
+        if (e && e.code === ERR_VAULT_LOCKED){
+          res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked', message: 'Vault is encrypted; provide passphrase.' }));
+          return;
+        }
+        if (e && e.code === ERR_VAULT_BAD_PASSPHRASE){
+          res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
+          return;
+        }
+        throw e;
+      }
     }
 
-    // Apply simple name validation to live process.env
-    let touchedWorkspace = false;
-    for (const [kRaw, vRaw] of Object.entries(toSet)){
-      const k = String(kRaw || '').trim();
-      if (!isValidEnvName(k)) continue;
-      const v = vRaw == null ? '' : String(vRaw);
-      process.env[k] = v;
-      if (k === 'ARCANA_WORKSPACE') touchedWorkspace = true;
-    }
-    for (const nRaw of toUnset){
-      const n = String(nRaw || '').trim();
-      if (!isValidEnvName(n)) continue;
-      try { delete process.env[n]; } catch {}
-      if (n === 'ARCANA_WORKSPACE') touchedWorkspace = true;
-    }
-
-    if (touchedWorkspace){
-      try { resetWorkspaceRootCache(); } catch {}
-      workspaceRoot = resolveWorkspaceRoot();
-      // Reset model/tool sessions so changes take effect immediately and refresh diagnostics info
-      resetSessions();
-      try { await ensurePolicySession('restricted'); } catch {}
-    }
-
-    // Notify clients: env changed + refreshed server_info
     try { broadcast({ type: 'env_refresh' }); } catch {}
     try {
       const modelLabel = model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '<auto>';
@@ -431,11 +1054,26 @@ async function handlePostEnv(req, res){
   }
 }
 
-
 async function ensurePolicySession(policy) {
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   if (sessionsByPolicy.has(pol)) return sessionsByPolicy.get(pol);
-  const created = await createArcanaSession({ cwd: workspaceRoot, execPolicy: pol });
+
+  // Run policy sessions inside ALS context for the default agent so that
+  // agentHomeRoot/workspaceRoot, memory, services, and persona all
+  // resolve consistently.
+  const defaultAgentMeta = ensureDefaultAgentExists();
+  const agentId = DEFAULT_AGENT_ID;
+  const ws = (defaultAgentMeta && defaultAgentMeta.workspaceRoot) ? defaultAgentMeta.workspaceRoot : (workspaceRoot || resolveWorkspaceRoot());
+  const agentHomeDir = (defaultAgentMeta && defaultAgentMeta.agentHomeDir) ? defaultAgentMeta.agentHomeDir : arcanaHomePath('agents', agentId);
+
+  const ctx = {
+    sessionId: 'policy:' + pol,
+    agentId,
+    agentHomeRoot: agentHomeDir,
+    workspaceRoot: ws,
+  };
+
+  const created = await runWithContext(ctx, () => createArcanaSession({ workspaceRoot: ws, agentHomeRoot: agentHomeDir, execPolicy: pol }));
   const sess = created.session;
   sessionsByPolicy.set(pol, sess);
   pluginFiles = created.pluginFiles || pluginFiles || [];
@@ -447,12 +1085,21 @@ async function ensurePolicySession(policy) {
   return sess;
 }
 
-async function ensureSessionFor(sessionId, policy, cwdForSession) {
+async function ensureSessionFor(sessionId, policy, cwdForSession, agentId, agentHomeDir) {
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
-  const wsKey = String(cwdForSession || workspaceRoot || '');
-  const key = String(sessionId || 'default') + '|' + pol + '|' + wsKey;
+  const ws = cwdForSession || workspaceRoot || '';
+  const key = String(sessionId || 'default') + '|' + pol + '|' + String(ws || '');
   if (chatSessions.has(key)) return chatSessions.get(key);
-  const created = await createArcanaSession({ cwd: cwdForSession || workspaceRoot, execPolicy: pol });
+
+  const effectiveAgentId = agentId || DEFAULT_AGENT_ID;
+  const ctx = {
+    sessionId: String(sessionId || 'default'),
+    agentId: effectiveAgentId,
+    agentHomeRoot: agentHomeDir || (findAgentMeta(effectiveAgentId)?.agentHomeDir || arcanaHomePath('agents', effectiveAgentId)),
+    workspaceRoot: ws,
+  };
+
+  const created = await runWithContext(ctx, () => createArcanaSession({ workspaceRoot: ws, agentHomeRoot: agentHomeDir, execPolicy: pol }));
   const sess = created.session;
   chatSessions.set(key, sess);
   try {
@@ -463,7 +1110,7 @@ async function ensureSessionFor(sessionId, policy, cwdForSession) {
     skillNames = created.skillNames || skillNames || [];
     if (created.skillToolMap) skillToolMapById.set(String(sessionId || 'default'), created.skillToolMap);
   } catch {}
-  ensureEventBridgeForId(sess, sessionId);
+  ensureEventBridgeForId(sess, sessionId, effectiveAgentId, ctx.agentHomeRoot, ws);
   return sess;
 }
 
@@ -478,13 +1125,13 @@ function seenRecentlyTtl(map, key, ttlMs){
   } catch { return false }
 }
 
-async function ensureReflectionSession(ws){
+async function ensureReflectionSession(ws, agentHomeDir){
   try {
     const key = String(ws || workspaceRoot || '');
     if (reflectionSessionsByWs.has(key)) return reflectionSessionsByWs.get(key);
-    const created = await createArcanaSession({ cwd: key, execPolicy: 'restricted' });
+    const created = await createArcanaSession({ workspaceRoot: key, agentHomeRoot: agentHomeDir, execPolicy: 'restricted' });
     const sess = created.session;
-    try { sess.setActiveToolsByName?.(['read','grep','find','ls','memory_search','memory_get','memory_append']); } catch {}
+    try { sess.setActiveToolsByName?.(['read','grep','find','ls','memory_search','memory_get']); } catch {}
     reflectionSessionsByWs.set(key, sess);
     return sess;
   } catch { return null }
@@ -492,19 +1139,51 @@ async function ensureReflectionSession(ws){
 
 function hash(s){ try { return createHash('sha1').update(String(s||'')).digest('hex'); } catch { return String(s||'') } }
 
-function scheduleSopExtraction({ ws, sessionId, toolName, safeArgs, errTextRaw }){
+function scheduleSopExtraction({ ws, sessionId, agentId, toolName, safeArgs, errTextRaw }){
   try {
+    if (!SOP_EXTRACTION_ENABLED) return;
+    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
     const w = String(ws || workspaceRoot || '');
-    const key = w + '|' + String(toolName || '?') + '|' + hash(String(safeArgs || '') + '|' + String(errTextRaw || ''));
+    const key = effectiveAgentId + '|' + w + '|' + String(toolName || '?') + '|' + hash(String(safeArgs || '') + '|' + String(errTextRaw || ''));
     if (seenRecentlyTtl(dedupeSop, key, DEDUPE_SOP_TTL_MS)) return; // dedupe within TTL
 
     const prev = reflectionQueueByWs.get(w) || Promise.resolve();
     let chain = prev.then(async () => {
       try {
-        const sess = await ensureReflectionSession(w);
-        if (!sess) return;
-        const prompt = buildSopExtractionPrompt({ toolName, argsJson: safeArgs, errorText: errTextRaw });
-        await runWithContext({ workspaceRoot: w, sessionId }, async () => { try { await sess.prompt(prompt); } catch {} });
+        await runWithContext({ sessionId, agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: w }, async () => {
+          const sess = await ensureReflectionSession(w, agentHomeDir);
+          if (!sess) return;
+          const prompt = buildSopExtractionPrompt({ toolName, argsJson: safeArgs, errorText: errTextRaw });
+          let sopText = '';
+          const unsub = sess.subscribe((ev) => {
+            try {
+              if (ev && ev.type === 'message_end' && ev.message && ev.message.role === 'assistant'){
+                const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
+                const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+                if (text) sopText = text;
+              }
+            } catch {}
+          });
+          try { await sess.prompt(prompt); } catch {}
+          try { unsub && unsub(); } catch {}
+          if (sopText) {
+            let normalized = '';
+            try {
+              const trimmed = String(sopText || '').trim();
+              if (trimmed) {
+                const parts = trimmed.split(/\r?\n/);
+                if (parts.length && /^sop:/i.test(parts[0].trim())) {
+                  parts.shift();
+                }
+                normalized = parts.join('\n').trim();
+              }
+            } catch {}
+            if (normalized) {
+              appendToAgentLongtermMemory({ agentHomeDir, heading: 'sop:' + String(toolName || '?'), content: normalized });
+            }
+          }
+        });
       } catch {}
       finally { try { broadcast({ type: 'memory_trigger', kind: 'sop_extract', toolName, sessionId }); } catch {} }
     });
@@ -528,7 +1207,70 @@ function activateToolsForSkill({ sess, sessionId, skillName, policy }){
 }
 
 
-function ensureEventBridgeForId(sess, sessionId) {
+function mimeForImageExt(ext){
+  const t = String(ext || '').toLowerCase();
+  if (t === '.png') return 'image/png';
+  if (t === '.jpg' || t === '.jpeg') return 'image/jpeg';
+  if (t === '.gif') return 'image/gif';
+  if (t === '.webp') return 'image/webp';
+  return '';
+}
+
+function normalizeMediaRef(raw){
+  if (!raw) return '';
+  let s = String(raw).trim();
+  if (!s) return '';
+  const mdMatch = s.match(/^\[[^\]]*]\(([^)]+)\)/);
+  if (mdMatch && mdMatch[1]) {
+    s = mdMatch[1].trim();
+  } else {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if (!(first && first === last && (first === '"' || first === '\'' || first === '`'))){
+      s = s.split(/\s+/)[0];
+    }
+  }
+  const strip = new Set(["'", '"', '`', '(', ')', '[', ']', '<', '>', ',', ';']);
+  while (s.length && strip.has(s[0])) {
+    s = s.slice(1).trimStart();
+  }
+  while (s.length && strip.has(s[s.length - 1])) {
+    s = s.slice(0, -1).trimEnd();
+  }
+  return s;
+}
+
+function extractMediaFromAssistantText(text){
+  const mediaRefs = [];
+  if (!text) return { text: '', mediaRefs };
+  const lines = String(text || '').split(/\r?\n/);
+  let inFence = false;
+  const outLines = [];
+  for (const line of lines){
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')){
+      const count = (line.match(/```/g) || []).length;
+      if (count % 2 === 1) inFence = !inFence;
+      outLines.push(line);
+      continue;
+    }
+    if (inFence){
+      outLines.push(line);
+      continue;
+    }
+    if (trimmed.startsWith('MEDIA:')){
+      const idx = line.indexOf('MEDIA:');
+      const raw = idx >= 0 ? line.slice(idx + 6) : '';
+      const ref = normalizeMediaRef(raw);
+      if (ref) mediaRefs.push(ref);
+      continue;
+    }
+    outLines.push(line);
+  }
+  return { text: outLines.join('\n'), mediaRefs };
+}
+
+function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
   if (!sess || bridgedById.has(sess)) return;
   bridgedById.add(sess);
   // Hook subagent event bus once so codex/subagent streaming logs also reach SSE listeners
@@ -540,10 +1282,13 @@ function ensureEventBridgeForId(sess, sessionId) {
       });
     } catch {}
   }
+  const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+  const effectiveAgentHome = agentHomeDir || arcanaHomePath('agents', effectiveAgentId);
+  const effectiveWorkspace = String(ws || workspaceRoot || '');
   const toolArgsByCallId = new Map(); // toolCallId -> args snapshot for SOP context
   sess.subscribe((ev) => {
     try {
-      // Tool repeat aggregation (per-session)
+          // Tool repeat aggregation (per-session)
       if (ev.type === 'tool_execution_start') {
         try {
           const key = ev.toolName + '|' + (function (o) {
@@ -559,10 +1304,10 @@ function ensureEventBridgeForId(sess, sessionId) {
         // If the agent is reading a SKILL.md, auto-activate that skill's tools for this session
         try {
           if (ev.toolName === 'read' && ev.args && ev.args.path && /\bSKILL\.md$/i.test(String(ev.args.path))) {
-            const obj = ssLoad(String(sessionId||'').trim());
-            const ws = (obj && obj.workspace) ? String(obj.workspace) : workspaceRoot;
-            const pRaw = String(ev.args.path||'');
-            const p = pRaw.startsWith('/') ? pRaw : join(ws || '', pRaw);
+            const obj = ssLoad(String(sessionId || '').trim(), { agentId: effectiveAgentId });
+            const wsForSkill = (obj && obj.workspace) ? String(obj.workspace) : effectiveWorkspace;
+            const pRaw = String(ev.args.path || '');
+            const p = pRaw.startsWith('/') ? pRaw : join(wsForSkill || '', pRaw);
             try { const text = readFileSync(p, 'utf-8'); const { frontmatter } = parseFrontmatter(text); const name = frontmatter && frontmatter.name; if (name) activateToolsForSkill({ sess, sessionId, skillName: String(name) }); } catch {}
           }
         } catch {}
@@ -575,13 +1320,10 @@ function ensureEventBridgeForId(sess, sessionId) {
       if (ev.type === 'tool_execution_end') {
         try { broadcast({ type: 'tool_execution_end', toolCallId: ev.toolCallId, toolName: ev.toolName, result: ev.result, isError: ev.isError, error: ev.error, sessionId }); } catch {}
         // Best-effort SOP extraction on tool failures (deduped + serialized per workspace)
+        if (String(ev.toolName||'') === "codex"){ const sidKey=String(sessionId||"default"); const t=Number((ev && ev.result && ev.result.details && ev.result.details.usage && (ev.result.details.usage.totalTokens || ev.result.details.usage.total_tokens)) || 0) || 0; if (t>0){ sessionUsageTotalsById.set(sidKey, (sessionUsageTotalsById.get(sidKey)||0)+t); } }
         try {
           const isErr = !!(ev?.isError || ev?.error || (ev?.result && ((ev.result.details && ev.result.details.ok===false) || ev.result.error)));
           if (isErr) {
-            // Resolve workspace for this session
-            let ws = workspaceRoot;
-            try { const obj = ssLoad(String(sessionId||'').trim()); if (obj && obj.workspace) ws = String(obj.workspace); } catch {}
-
             // Build safe args and raw error text
             const origArgs = (ev && ev.toolCallId && toolArgsByCallId.has(ev.toolCallId)) ? toolArgsByCallId.get(ev.toolCallId) : (ev?.args || {});
             try { if (ev && ev.toolCallId) toolArgsByCallId.delete(ev.toolCallId); } catch {}
@@ -611,31 +1353,36 @@ function ensureEventBridgeForId(sess, sessionId) {
 
             // Tier1: direct daily memory append of the failure (deduped), keep SOP extraction infra intact
             try {
-              if (memoryAppendTool) {
+              if (MEMORY_TRIGGERS_ENABLED) {
                 const dedupeKey = String(sessionId || 'default') + '|' + hash(String(ev?.toolName || '?') + '|' + safeArgs + '|' + errTextRaw);
                 if (!seenRecentlyTtl(dedupeToolFail, dedupeKey, DEDUPE_TRIGGER_TTL_MS)) {
                   const shortArgs = truncateText(safeArgs);
                   const shortErr = truncateText(errTextRaw);
                   const content = 'args: ' + shortArgs + '\n\nerror: ' + shortErr;
-                  runWithContext({ workspaceRoot: ws, sessionId }, async () => {
-                    try {
-                      const r = await memoryAppendTool.execute('srv-tool-fail', { target:'daily', heading: 'tool_fail:' + String(ev?.toolName || '?'), content });
-                      const ok = !!(r && r.details && r.details.ok);
-                      if (ok) { try { broadcast({ type: 'memory_trigger', kind: 'tool_fail', toolName: ev?.toolName || '?', sessionId, path: r.details && r.details.path }); } catch {} }
-                    } catch {}
-                  });
+                  const r = appendToAgentDailyMemory({ agentHomeDir: effectiveAgentHome, heading: 'tool_fail:' + String(ev?.toolName || '?'), content });
+                  if (r && r.path) {
+                    try { broadcast({ type: 'memory_trigger', kind: 'tool_fail', toolName: ev?.toolName || '?', sessionId, path: r.path }); } catch {}
+                  }
                 }
               }
             } catch {}
 
-            scheduleSopExtraction({ ws, sessionId, toolName: ev?.toolName || '?', safeArgs, errTextRaw });
+            if (SOP_EXTRACTION_ENABLED) {
+              scheduleSopExtraction({ ws: effectiveWorkspace, sessionId, agentId: effectiveAgentId, toolName: ev?.toolName || '?', safeArgs, errTextRaw });
+            }
           }
         } catch {}
       }
 
       // Turn lifecycle
-      if (ev.type === 'turn_start') broadcast({ type: 'turn_start', sessionId });
-      if (ev.type === 'turn_end') broadcast({ type: 'turn_end', sessionId });
+      if (ev.type === 'turn_start') {
+        try { mediaRefsByTurn.delete(String(sessionId || 'default')); } catch {}
+        broadcast({ type: 'turn_start', sessionId });
+      }
+      if (ev.type === 'turn_end') {
+        try { mediaRefsByTurn.delete(String(sessionId || 'default')); } catch {}
+        broadcast({ type: 'turn_end', sessionId, sessionTokens: (sessionUsageTotalsById.get(String(sessionId||'default')) || 0) });
+      }
 
       // Thinking lifecycle (per-session)
       if (ev.type === 'thinking_start') {
@@ -663,12 +1410,64 @@ function ensureEventBridgeForId(sess, sessionId) {
         }
       }
 
+      // LLM usage accounting (per assistant message_end)
+      if (ev && ev.type === 'message_end' && ev.message && ev.message.role === 'assistant') {
       // Assistant streaming (text/images)
+        try {
+          const u = ev && ev.message && ev.message.usage;
+          let ctx = 0, out = 0, tot = 0;
+          if (u && typeof u === 'object'){
+            ctx = Number(u.inputTokens ?? u.prompt_tokens ?? u.promptTokens ?? u.input_tokens ?? u.input ?? u.prompt ?? 0) || 0;
+            out = Number(u.outputTokens ?? u.completion_tokens ?? u.completionTokens ?? u.output_tokens ?? u.output ?? 0) || 0;
+            tot = Number(u.totalTokens ?? u.total_tokens ?? u.total ?? 0) || 0;
+          }
+          if (!tot) tot = ctx + out;
+          if (tot > 0 || ctx > 0 || out > 0){
+            const sidKey = String(sessionId || "default");
+            const prev = sessionUsageTotalsById.get(sidKey) || 0;
+            const next = prev + (tot||0);
+            sessionUsageTotalsById.set(sidKey, next);
+            try { broadcast({ type: 'llm_usage', sessionId, contextTokens: ctx, outputTokens: out, totalTokens: tot, sessionTokens: next }); } catch {}
+          }
+        } catch {}
+      }
       if (ev.type === 'message_update' && ev.message && ev.message.role === 'assistant') {
         try {
           const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-          const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-          if (text) broadcast({ type: 'assistant_text', text, sessionId });
+          const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+          const extracted = extractMediaFromAssistantText(rawText);
+          const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+          const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+          if (cleanText) broadcast({ type: 'assistant_text', text: cleanText, sessionId });
+          if (mediaRefs.length) {
+            const sidKey = String(sessionId || 'default');
+            let seen = mediaRefsByTurn.get(sidKey);
+            if (!seen) { seen = new Set(); mediaRefsByTurn.set(sidKey, seen); }
+	            for (const raw of mediaRefs){
+	              const ref = normalizeMediaRef(raw);
+	              if (!ref || seen.has(ref)) continue;
+	              seen.add(ref);
+	              const lower = ref.toLowerCase();
+	              if (lower.startsWith('http://') || lower.startsWith('https://')){
+	                try { broadcast({ type: 'assistant_image', url: ref, mime: 'image/*', sessionId }); } catch {}
+	                continue;
+	              }
+              try {
+                const meta = runWithContext({ sessionId, agentId: effectiveAgentId, agentHomeRoot: effectiveAgentHome, workspaceRoot: effectiveWorkspace }, () => {
+                  const filePath = ensureReadAllowed(ref);
+                  const mime = mimeForImageExt(extname(filePath));
+                  if (!mime) return null;
+                  return { mime };
+                });
+                if (meta && meta.mime){
+                  const encodedPath = encodeURIComponent(ref);
+                  const sidParam = sessionId ? '&sessionId=' + encodeURIComponent(String(sessionId)) : '';
+                  const url = '/api/local-file?path=' + encodedPath + sidParam;
+                  try { broadcast({ type: 'assistant_image', url, mime: meta.mime, sessionId }); } catch {}
+                }
+              } catch {}
+            }
+          }
           for (const c of blocks) {
             if (!c || c.type !== 'image') continue;
             const mime = c.mime || c.mimeType || c.MIMEType || 'image/png';
@@ -687,6 +1486,8 @@ function ensureEventBridge(sess) {
   bridgedSessions.add(sess);
   sess.subscribe((ev) => {
     try {
+      if (ev.type === 'turn_start') { try { legacyMediaRefsByTurn.clear(); } catch {} }
+      if (ev.type === 'turn_end') { try { legacyMediaRefsByTurn.clear(); } catch {} }
       if (ev.type === 'tool_execution_start') {
         const key = ev.toolName + '|' + (function (o) { try { return JSON.stringify(o, Object.keys(o).sort()); } catch { try { return JSON.stringify(o); } catch { return String(o); } } })(ev.args || {});
         const n = (toolRepeat.get(key) || 0) + 1; toolRepeat.set(key, n);
@@ -698,8 +1499,41 @@ function ensureEventBridge(sess) {
       if (ev.type === 'message_update' && ev.message && ev.message.role === 'assistant') {
         try {
           const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-          const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-          if (text) broadcast({ type: 'assistant_text', text });
+          const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+          const extracted = extractMediaFromAssistantText(rawText);
+          const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+          const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+          if (cleanText) broadcast({ type: 'assistant_text', text: cleanText });
+          if (mediaRefs.length) {
+	            for (const raw of mediaRefs){
+	              const ref = normalizeMediaRef(raw);
+	              if (!ref || legacyMediaRefsByTurn.has(ref)) continue;
+	              legacyMediaRefsByTurn.add(ref);
+	              const lower = ref.toLowerCase();
+	              if (lower.startsWith('http://') || lower.startsWith('https://')){
+	                try { broadcast({ type: 'assistant_image', url: ref, mime: 'image/*' }); } catch {}
+	                continue;
+	              }
+              try {
+                const meta = runWithContext({
+                  sessionId: undefined,
+                  agentId: DEFAULT_AGENT_ID,
+                  agentHomeRoot: arcanaHomePath('agents', DEFAULT_AGENT_ID),
+                  workspaceRoot: workspaceRoot || resolveWorkspaceRoot(),
+                }, () => {
+                  const filePath = ensureReadAllowed(ref);
+                  const mime = mimeForImageExt(extname(filePath));
+                  if (!mime) return null;
+                  return { mime };
+                });
+                if (meta && meta.mime){
+                  const encodedPath = encodeURIComponent(ref);
+                  const url = '/api/local-file?path=' + encodedPath;
+                  try { broadcast({ type: 'assistant_image', url, mime: meta.mime }); } catch {}
+                }
+              } catch {}
+            }
+          }
           for (const c of blocks) {
             if (!c || c.type !== 'image') continue;
             const mime = c.mime || c.mimeType || c.MIMEType || 'image/png';
@@ -749,12 +1583,22 @@ async function handleChat(req, res) {
     applyExecPolicyToSession(sess, policy);
     // Tier1: user_issue detection -> direct daily memory append (deduped)
     try {
-      if (memoryAppendTool && detectProblemMention(message)) {
+      if (MEMORY_TRIGGERS_ENABLED && detectProblemMention(message)) {
         const key = 'legacy' + '|' + hash(message);
         if (!seenRecentlyTtl(dedupeUserIssue, key, DEDUPE_TRIGGER_TTL_MS)) {
-          await runWithContext({ workspaceRoot }, async () => {
-            try { await memoryAppendTool.execute('srv-user-issue', { target:'daily', heading:'user_issue', content: message }); } catch {}
-          });
+          const effectiveAgentId = DEFAULT_AGENT_ID;
+          const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
+          const content = truncateText(message);
+          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_issue', content });
+        }
+      }
+      if (MEMORY_TRIGGERS_ENABLED && detectCorrectionMention(message)) {
+        const keyCorr = 'legacy' + '|corr|' + hash(message);
+        if (!seenRecentlyTtl(dedupeUserCorrection, keyCorr, DEDUPE_TRIGGER_TTL_MS)) {
+          const effectiveAgentId = DEFAULT_AGENT_ID;
+          const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
+          const content = truncateText(message);
+          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_correction', content });
         }
       }
     } catch {}
@@ -782,17 +1626,54 @@ async function handleChat2(req, res) {
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
     const message = String(body.message || '').trim();
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
+    let agentId = String(body.agentId || '').trim();
     let sessionId = String(body.sessionId || '').trim();
-    if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
-    if (!sessionId) { const created = ssCreate({ title: '新会话' }); sessionId = created.id; }
 
-    // Load session object and determine its workspace
-    const obj0 = ssLoad(sessionId);
-    const ws = (obj0 && obj0.workspace) ? String(obj0.workspace) : workspaceRoot;
-    if (obj0 && !obj0.workspace) { try { obj0.workspace = ws; ssSave(obj0); } catch {} }
+    if (!message) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' }));
+      return;
+    }
 
-    const sess = await ensureSessionFor(sessionId, policy, ws);
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
+
+    // Resolve agent meta (home + workspaceRoot) from ~/.arcana/agents/<agentId>/agent.json
+    const agent = findAgentMeta(agentId) || ensureDefaultAgentExists();
+    if (!agent || !agent.workspaceRoot) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_not_found' }));
+      return;
+    }
+    const ws = agent.workspaceRoot;
+    const agentHomeDir = agent.agentHomeDir || agent.agentDir || arcanaHomePath('agents', agentId);
+
+    let initialSession = null;
+    if (!sessionId) {
+      const created = ssCreate({ title: '新会话', agentId });
+      sessionId = created.id;
+      initialSession = created;
+    }
+
+    // Load session object and ensure it is bound to this agent
+    const obj0 = initialSession || ssLoad(sessionId, { agentId });
+    if (obj0) {
+      let changed = false;
+      const existingAgentRaw = obj0.agentId != null ? String(obj0.agentId) : '';
+      const existingAgent = existingAgentRaw.trim();
+      if (existingAgent && existingAgent !== agentId) {
+        res.writeHead(409, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_mismatch' }));
+        return;
+      }
+      if (!existingAgent) {
+        obj0.agentId = agentId;
+        changed = true;
+      }
+      if (changed) { try { ssSave(obj0, { agentId }); } catch {} }
+    }
+
+    const sess = await ensureSessionFor(sessionId, policy, ws, agentId, agentHomeDir);
     applyExecPolicyToSession(sess, policy);
+
+    const ctxBase = { sessionId, agentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws };
+
     // If user explicitly invoked a skill via a skill block (/skill:name), activate its tools
     try {
       const blk = parseSkillBlock(message);
@@ -801,21 +1682,32 @@ async function handleChat2(req, res) {
 
     // Tier1: user_issue detection -> direct daily memory append (deduped)
     try {
-      if (memoryAppendTool && detectProblemMention(message)) {
+      if (MEMORY_TRIGGERS_ENABLED && detectProblemMention(message)) {
         const key = String(sessionId || 'default') + '|' + hash(message);
         if (!seenRecentlyTtl(dedupeUserIssue, key, DEDUPE_TRIGGER_TTL_MS)) {
-          await runWithContext({ sessionId, workspaceRoot: ws }, async () => {
-            try { await memoryAppendTool.execute('srv-user-issue', { target:'daily', heading:'user_issue', content: message }); } catch {}
-          });
+          const content = truncateText(message);
+          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_issue', content });
+        }
+      }
+      if (MEMORY_TRIGGERS_ENABLED && detectCorrectionMention(message)) {
+        const keyCorr = String(sessionId || 'default') + '|corr|' + hash(message);
+        if (!seenRecentlyTtl(dedupeUserCorrection, keyCorr, DEDUPE_TRIGGER_TTL_MS)) {
+          const content = truncateText(message);
+          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_correction', content });
         }
       }
     } catch {}
+
     // Persist user message and build context prelude
-    ssAppend(sessionId, { role: 'user', text: message });
-    const obj = ssLoad(sessionId);
+    ssAppend(sessionId, { role: 'user', text: message, agentId });
+    const obj = ssLoad(sessionId, { agentId });
+    if (obj) {
+      let changed = false;
+      if (agentId && !obj.agentId) { obj.agentId = agentId; changed = true; }
+      if (changed) { try { ssSave(obj, { agentId }); } catch {} }
+    }
     const prelude = ssPrelude(obj);
     const payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
-
     let out = '';
     let lastAssistantText = '';
     let persistedCount = 0;
@@ -835,7 +1727,7 @@ async function handleChat2(req, res) {
           if (text) {
             lastAssistantText = text;
             if (!seenTexts.has(text)) {
-              ssAppend(sessionId, { role: 'assistant', text });
+              ssAppend(sessionId, { role: 'assistant', text, agentId });
               seenTexts.add(text);
               persistedCount++;
             }
@@ -848,7 +1740,7 @@ async function handleChat2(req, res) {
     // so it interrupts the remaining plan after the current tool finishes.
     if (sess && sess.isStreaming) {
       try {
-        await runWithContext({ sessionId, workspaceRoot: ws }, () =>
+        await runWithContext(ctxBase, () =>
           sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
         );
         try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
@@ -862,7 +1754,7 @@ async function handleChat2(req, res) {
     // Normal path: not streaming -> start a new agent turn
     let promptError = null;
     try {
-      await runWithContext({ sessionId, workspaceRoot: ws }, () => sess.prompt(payloadMsg));
+      await runWithContext(ctxBase, () => sess.prompt(payloadMsg));
     } catch (e) {
       promptError = e;
     }
@@ -884,11 +1776,11 @@ async function handleChat2(req, res) {
     // Fallback persistence
     if (lastAssistantText) {
       try {
-        const cur = ssLoad(sessionId);
+        const cur = ssLoad(sessionId, { agentId });
         const msgs = (cur && Array.isArray(cur.messages)) ? cur.messages : [];
         const last = msgs.length ? msgs[msgs.length - 1] : null;
         if (persistedCount === 0 || !last || last.role !== 'assistant' || String(last.text || '') !== String(lastAssistantText)) {
-          ssAppend(sessionId, { role: 'assistant', text: lastAssistantText });
+          ssAppend(sessionId, { role: 'assistant', text: lastAssistantText, agentId });
           persistedCount++;
         }
       } catch {}
@@ -907,15 +1799,22 @@ async function handleAbort(req, res) {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
     const sessionId = String(body.sessionId || '').trim();
+    let agentId = '';
+    try {
+      if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
+        agentId = String(body.agentId || '').trim();
+      }
+    } catch {}
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
     if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
 
-    const obj0 = ssLoad(sessionId);
-    const ws = (obj0 && obj0.workspace) ? String(obj0.workspace) : workspaceRoot;
+    const ctx = resolveSessionContext(sessionId, agentId);
+    const ws = ctx.workspaceRoot || workspaceRoot;
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
-    const sess = await ensureSessionFor(sessionId, policy, ws);
+    const sess = await ensureSessionFor(sessionId, policy, ws, ctx.agentId, ctx.agentHomeDir);
     applyExecPolicyToSession(sess, policy);
 
-    try { await runWithContext({ sessionId, workspaceRoot: ws }, () => sess.abort()); } catch {}
+    try { await runWithContext({ sessionId, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => sess.abort()); } catch {}
     try { broadcast({ type: 'abort_done', sessionId }); } catch {}
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
   } catch (e) {
@@ -931,20 +1830,27 @@ async function handleSteer(req, res) {
     const message = String(body.message || '').trim();
     const sessionId = String(body.sessionId || '').trim();
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
+    let agentId = '';
+    try {
+      if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
+        agentId = String(body.agentId || '').trim();
+      }
+    } catch {}
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
     if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
     if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
 
     // Persist user message and build prelude like chat2 for consistency
-    ssAppend(sessionId, { role: 'user', text: message });
-    const obj0 = ssLoad(sessionId);
-    const ws = (obj0 && obj0.workspace) ? String(obj0.workspace) : workspaceRoot;
-    const prelude = ssPrelude(obj0);
+    ssAppend(sessionId, { role: 'user', text: message, agentId });
+    const ctx = resolveSessionContext(sessionId, agentId);
+    const ws = ctx.workspaceRoot || workspaceRoot;
+    const prelude = ssPrelude(ctx.session);
     const payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
 
-    const sess = await ensureSessionFor(sessionId, policy, ws);
+    const sess = await ensureSessionFor(sessionId, policy, ws, ctx.agentId, ctx.agentHomeDir);
     applyExecPolicyToSession(sess, policy);
     try {
-      await runWithContext({ sessionId, workspaceRoot: ws }, () =>
+      await runWithContext({ sessionId, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () =>
         sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
       );
       try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
@@ -960,9 +1866,9 @@ async function handleLocalFile(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const p = url.searchParams.get('path') || '';
     const sid = String(url.searchParams.get('sessionId') || '').trim();
-    const obj = sid ? ssLoad(sid) : null;
-    const ws = (obj && obj.workspace) ? String(obj.workspace) : workspaceRoot;
-    const filePath = runWithContext({ sessionId: sid || undefined, workspaceRoot: ws }, () => ensureReadAllowed(p));
+    const ctx = resolveSessionContext(sid || undefined);
+    const ws = ctx.workspaceRoot || workspaceRoot;
+    const filePath = runWithContext({ sessionId: sid || undefined, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => ensureReadAllowed(p));
     const data = await readFile(filePath);
     const type = extname(filePath).toLowerCase();
     const ct = type === '.png' ? 'image/png' : type === '.jpg' || type === '.jpeg' ? 'image/jpeg' : type === '.webp' ? 'image/webp' : 'application/octet-stream';
@@ -987,9 +1893,9 @@ async function handleDoctor(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost');
     const sid = String(url.searchParams.get('sessionId') || '').trim();
-    const obj = sid ? ssLoad(sid) : null;
-    const ws = (obj && obj.workspace) ? String(obj.workspace) : workspaceRoot;
-    const result = await runWithContext({ sessionId: sid || undefined, workspaceRoot: ws }, () => runDoctor({ cwd: ws }));
+    const ctx = resolveSessionContext(sid || undefined);
+    const ws = ctx.workspaceRoot || workspaceRoot;
+    const result = await runWithContext({ sessionId: sid || undefined, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => runDoctor({ cwd: ws }));
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(result));
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'doctor_failed', message: e?.message || String(e) }));
@@ -1001,15 +1907,15 @@ async function handleSupportBundle(req, res) {
     const bufs = []; for await (const c of req) bufs.push(c);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf-8')) : {};
     const sid = String(body.sessionId || '').trim();
-    const obj = sid ? ssLoad(sid) : null;
-    const ws = (obj && obj.workspace) ? String(obj.workspace) : workspaceRoot;
+    const ctx = resolveSessionContext(sid || undefined);
+    const ws = ctx.workspaceRoot || workspaceRoot;
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const outDirRaw = join(ws, 'artifacts', 'support-' + stamp);
-    const outDir = runWithContext({ sessionId: sid || undefined, workspaceRoot: ws }, () => ensureWriteAllowed(outDirRaw));
+    const outDir = runWithContext({ sessionId: sid || undefined, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => ensureWriteAllowed(outDirRaw));
     const { dir, tarPath } = await createSupportBundle({ outDir, cwd: ws });
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, dir, tarPath: tarPath || '' }));
   } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'support_bundle_failed', message: e?.message || String(e) }));
+    res.writeHead(500, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ error: 'support_bundle_failed', message: e?.message || String(e) }));
   }
 }
 
@@ -1047,10 +1953,29 @@ async function handlePostConfig(req, res) {
   }
 }
 
+async function handleListAgents(req, res) {
+  try {
+    // Ensure at least a default agent exists.
+    ensureDefaultAgentExists();
+    const snap = loadAgentsSnapshot();
+    const list = Array.isArray(snap && snap.agents) ? snap.agents : [];
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ agents: list }));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agents_list_failed', message: e?.message || String(e) }));
+  }
+}
+
 // Sessions CRUD
 async function handleListSessions(req, res) {
-  try { const items = ssList(); res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ sessions: items })); }
-  catch (e) { res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'list_failed', message: e?.message || String(e) })); }
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
+    const agentId = agentIdParam || DEFAULT_AGENT_ID;
+    const sessions = ssList(agentId);
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ sessions }));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'list_failed', message: e?.message || String(e) }));
+  }
 }
 
 async function handleCreateSession(req, res) {
@@ -1058,14 +1983,23 @@ async function handleCreateSession(req, res) {
     const bufs = []; for await (const c of req) bufs.push(c);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf-8')) : {};
     const title = String(body.title || '新会话').trim();
-    const workspace = String(body.workspace || '').trim();
-    if (!workspace) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'workspace_required' })); return; }
-    // Validate directory exists and canonicalize
-    if (!existsSync(workspace)) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'workspace_invalid' })); return; }
-    let canonical = '';
-    try { canonical = realpathSync(workspace); } catch { canonical = workspace; }
-    try { const st = statSync(canonical); if (!st.isDirectory()) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'workspace_invalid' })); return; } } catch { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'workspace_invalid' })); return; }
-    const obj = ssCreate({ title, workspace: canonical });
+
+    let agentId = '';
+    try {
+      if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
+        agentId = String(body.agentId || '').trim();
+      }
+    } catch {}
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
+
+    // Ensure the target agent exists and has a workspaceRoot configured.
+    const agent = findAgentMeta(agentId) || ensureDefaultAgentExists();
+    if (!agent || !agent.workspaceRoot) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_not_found' }));
+      return;
+    }
+
+    const obj = ssCreate({ title, agentId });
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(obj));
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'create_failed', message: e?.message || String(e) }));
@@ -1073,16 +2007,32 @@ async function handleCreateSession(req, res) {
 }
 
 async function handleGetSession(req, res, id) {
-  try { const obj = ssLoad(String(id || '').trim()); if (!obj) { res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'not_found' })); return; } res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(obj)); }
-  catch (e) { res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'get_failed', message: e?.message || String(e) })); }
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
+    const agentId = agentIdParam || DEFAULT_AGENT_ID;
+    const obj = ssLoad(String(id || '').trim(), { agentId });
+    if (!obj) {
+      res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'not_found' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(obj));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'get_failed', message: e?.message || String(e) }));
+  }
 }
+
+
 
 // DELETE /api/sessions/:id
 async function handleDeleteSession(req, res, id) {
   try {
+    const url = new URL(req.url, 'http://localhost');
+    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
+    const agentId = agentIdParam || DEFAULT_AGENT_ID;
     let decoded = '';
     try { decoded = decodeURIComponent(String(id || '').trim()); } catch { decoded = String(id || '').trim(); }
-    const ok = ssDelete(decoded);
+    const ok = ssDelete(decoded, { agentId });
     if (!ok) { res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'not_found' })); return; }
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
   } catch (e) {
@@ -1134,6 +2084,8 @@ function createRequestHandler() {
     if (req.method === 'POST' && url.pathname === '/api/abort') { await handleAbort(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/steer') { await handleSteer(req, res); return; }
 
+    if (req.method === 'GET' && url.pathname === '/api/agents') { await handleListAgents(req, res); return; }
+
     // Sessions CRUD
     if (req.method === 'GET' && url.pathname === '/api/sessions') { await handleListSessions(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/sessions') { await handleCreateSession(req, res); return; }
@@ -1158,6 +2110,7 @@ export async function startArcanaWebServer({ port, workspaceRoot: wsRoot } = {})
   if (wsRoot) { process.env.ARCANA_WORKSPACE = String(wsRoot); try { resetWorkspaceRootCache(); } catch {} }
   workspaceRoot = resolveWorkspaceRoot();
   try { ensureArcanaHomeDir(); await loadVaultFromDisk(); } catch {}
+  try { ensureDefaultAgentExists(); } catch {}
 
   const server = http.createServer(createRequestHandler());
   const desiredPort = typeof port === 'number' ? port : (process.env.PORT ? Number(process.env.PORT) : 5678);

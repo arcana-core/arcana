@@ -109,8 +109,36 @@ export function createCodexSubagentTool() {
         stderrTail || "(empty)",
       ].join("\n");
 
+      const usage = (function(){
+        try{
+          const parse = (text)=>{
+            const lines = String(text||'').split(/\r?\n/);
+            let u=null;
+            for (const ln of lines){
+              const t=ln.trim(); if(!t) continue;
+              try {
+                const obj = JSON.parse(t);
+                const src = (obj && typeof obj === 'object' && obj.usage && typeof obj.usage === 'object') ? obj.usage : obj;
+                if (src && typeof src === 'object'){
+                  const input = Number(src.inputTokens ?? src.input_tokens ?? src.prompt_tokens ?? src.promptTokens ?? src.input ?? src.prompt ?? 0) || 0;
+                  const output = Number(src.outputTokens ?? src.output_tokens ?? src.completion_tokens ?? src.completionTokens ?? src.output ?? 0) || 0;
+                  const cacheRead = Number(src.cacheRead ?? src.cache_read_tokens ?? src.cache_read ?? 0) || 0;
+                  const cacheWrite = Number(src.cacheWrite ?? src.cache_write_tokens ?? src.cache_write ?? 0) || 0;
+                  const total = Number(src.totalTokens ?? src.total_tokens ?? src.total ?? 0) || (input+output) || 0;
+                  if (input || output || total || cacheRead || cacheWrite){
+                    u = { input: input||undefined, output: output||undefined, cacheRead: cacheRead||undefined, cacheWrite: cacheWrite||undefined, totalTokens: total||undefined };
+                  }
+                }
+              } catch {}
+            }
+            return u;
+          };
+          return parse(run.stdout) || parse(run.stderr) || null;
+        } catch { return null }
+      })();
       const details = { ok: code === 0, sessionId, tookMs, code };
       const content = [{ type: "text", text }];
+      if (usage) details.usage = usage;
       return { content, details };
     },
   };

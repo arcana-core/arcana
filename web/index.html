@@ -7,13 +7,19 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-    <!-- Two-column layout: left chat, right tabbed display -->
+    <!-- Layout: left agents/sessions/chat, right tabbed display -->
   <div class="layout" style="display:flex;height:100vh;">
     <div class="left" style="flex:0 0 42%;min-width:360px;max-width:640px;border-right:1px solid #e7e7e7;background:#f5f5f5;display:flex;position:relative;">
-    <div id="sidebar" class="sidebar" style="width:240px">
-      <div style="padding:8px"><button id="new-session">新会话</button></div>
-      <div id="session-list" ></div>
-    </div>
+      <div class="sidebar-group">
+        <div id="agents-panel" class="agents-panel">
+          <div class="agents-header">Agents</div>
+          <div id="agents-list"></div>
+        </div>
+        <div id="sidebar" class="sidebar" style="width:240px">
+          <div style="padding:8px"><button id="new-session">新会话</button></div>
+          <div id="session-list"></div>
+        </div>
+      </div>
       <div class="wechat">
     <header class="chat-header">
       <div class="title">Arcana</div>
@@ -81,7 +87,8 @@
           <div class="li-item"><span class="li-label">可见工具</span><span id="li-tools" class="li-value">—</span></div>
           <div class="li-item"><span class="li-label">本轮使用</span><span id="li-tools-used" class="li-value">—</span></div>
           <div class="li-item"><span class="li-label">技能</span><span id="li-skills" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">思考/耗时</span><span id="li-thinking" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">会话token</span><span id="li-session-tokens" class="li-value">—</span></div>
+          <div class="li-item"><span class="li-label">上下文长度</span><span id="li-context" class="li-value">—</span></div>
         </div>
       </div>
     </div>

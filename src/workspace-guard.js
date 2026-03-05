@@ -107,7 +107,7 @@ export function ensureWithinAllowedPaths(p, allowed) {
   const target = canon(resolve(root, p));
   for (const a of candidates) {
     const base = withTrailingSep(a);
-    if (target.startsWith(base)) return true;
+    if (target === a || target.startsWith(base)) return true;
   }
   try { emitEvent({ type: "workspace_guard", action: "write_blocked_allowed_list", root, path: String(p), allowed: candidates }); } catch {}
   return false;

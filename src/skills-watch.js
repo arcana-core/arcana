@@ -64,9 +64,9 @@ function computeSnapshot(roots) {
   return { signature: sig, map };
 }
 
-export function ensureArcanaSkillsWatcher({ cwd, cfg, pkgRoot, repoRoot, intervalMs = 1000, debounceMs = 300, onChange } = {}) {
+export function ensureArcanaSkillsWatcher({ workspaceRoot, agentHomeRoot, cwd, cfg, pkgRoot, repoRoot, intervalMs = 1000, debounceMs = 300, onChange } = {}) {
   // Compute roots and key for idempotence across calls
-  const roots = resolveArcanaSkillsDirs({ cwd, cfg, pkgRoot, repoRoot }) || [];
+  const roots = resolveArcanaSkillsDirs({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd }) || [];
   const key = `${roots.join('|')}|${intervalMs}|${debounceMs}`;
 
   // If a watcher already exists, reuse it if the config matches; otherwise stop and recreate

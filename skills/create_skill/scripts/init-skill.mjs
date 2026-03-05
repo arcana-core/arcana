@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// init-skill.mjs — Create a new skill folder under ./skills with minimal boilerplate.
-// Usage: node skills/create_skill/scripts/init-skill.mjs <name> [--resources scripts,references,assets] [--examples]
+// init-skill.mjs - Create a new skill folder under the active agent home (~/.arcana/agents/<agentId>/skills) by default.
+// Use --shared or --workspace to create under ./skills instead.
+// Usage: node skills/create_skill/scripts/init-skill.mjs <name> [--resources scripts,references,assets] [--examples] [--shared]
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { resolveAgentHomeRoot } from '../../../src/agent-guard.js';
 
 function toHyphenCase(s){
   return String(s||'').trim()
@@ -13,16 +15,17 @@ function toHyphenCase(s){
 }
 
 function parseArgs(argv){
-  const out = { name: '', resources: [], examples:false };
+  const out = { name: '', resources: [], examples:false, shared:false };
   const a = argv.slice(2);
   if (!a[0] || a[0].startsWith('--')){
-    console.error('Usage: init-skill.mjs <name> [--resources scripts,references,assets] [--examples]');
+    console.error('Usage: init-skill.mjs <name> [--resources scripts,references,assets] [--examples] [--shared]');
     process.exit(2);
   }
   out.name = toHyphenCase(a[0]);
   for (let i=1;i<a.length;i++){
     const t = a[i];
     if (t === '--examples') { out.examples = true; continue; }
+    if (t === '--shared' || t === '--workspace') { out.shared = true; continue; }
     if (t === '--resources'){
       const val = a[i+1] || '';
       i++;
@@ -36,9 +39,21 @@ function parseArgs(argv){
 function write(p, s){ writeFileSync(p, s, { encoding: 'utf8', flag: 'wx' }); }
 
 function main(){
-  const { name, resources, examples } = parseArgs(process.argv);
-  const root = process.cwd();
-  const skillsDir = join(root, 'skills');
+  const { name, resources, examples, shared } = parseArgs(process.argv);
+  const workspaceRoot = process.cwd();
+
+  let skillsBase = workspaceRoot;
+  if (!shared){
+    try {
+      const agentHomeRoot = resolveAgentHomeRoot();
+      if (agentHomeRoot) skillsBase = agentHomeRoot;
+    } catch {
+      // Fallback: keep workspaceRoot when agent home cannot be resolved
+      skillsBase = workspaceRoot;
+    }
+  }
+
+  const skillsDir = join(skillsBase, 'skills');
   const dir = join(skillsDir, name);
   if (existsSync(dir)) { console.error('Skill already exists:', dir); process.exit(1); }
   mkdirSync(dir, { recursive: true });

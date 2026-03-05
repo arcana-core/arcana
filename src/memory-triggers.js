@@ -24,5 +24,16 @@ export function detectProblemMention(text) {
   return en || zh;
 }
 
-export default { detectProblemMention, truncateText };
+export function detectCorrectionMention(text) {
+  const t = String(text || "");
+  if (!t) return false;
+  const tLower = t.toLowerCase();
+  // English tokens: corrections/negative feedback about prior answer.
+  const en = /\b(?:correction|correct answer is|that's wrong|that is wrong|is wrong|not correct|you (?:are|were) wrong|you got (?:it )?wrong|should be [^.\n]*\bnot\b)\b/.test(tLower);
+  // Chinese tokens: common ways to say the assistant was wrong or needs correction.
+  const zh = /不对|错了|不是这样|纠正|更正|修正/.test(t);
+  return en || zh;
+}
+
+export default { detectProblemMention, detectCorrectionMention, truncateText };
 

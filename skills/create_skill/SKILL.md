@@ -1,17 +1,18 @@
 ---
 name: create_skill
-description: "在 ./arcana/skills 或项目 ./skills 下初始化一个 Skill（含 SKILL.md）。如该 Skill 需要工具，请将工具放在 arcana/skills/<skill>/tools 下并通过 frontmatter 声明可见性。"
+description: "默认在当前 Agent 的 ~/.arcana/agents/<agentId>/skills 下初始化一个 Skill（含 SKILL.md）；仅在显式使用 --shared 时写入项目 ./skills。工具代码应放在 <skill>/tools 下并通过 frontmatter 声明可见性。"
 ---
 
 # Create Skill
 
-This skill scaffolds a new skill in either `arcana/skills` (推荐：随 Arcana 一起维护) or repository root `./skills` (项目级 Skill). Arcana discovers both via arcana/src/skills.js. Keep the skill lean and follow progressive disclosure.
+This skill scaffolds a new skill for the active agent under `~/.arcana/agents/<agentId>/skills` by default, with an opt-in shared mode that writes into the current workspace `./skills` directory. Arcana discovers skills from agent home, workspace, and package layers via `src/skills.js`. Keep the skill lean and follow progressive disclosure.
 
 ## Quick Steps
 
 1. Pick a short, hyphen-case name (letters, digits, hyphens).
-2. Run the init script:
-   - `node arcana/skills/create_skill/scripts/init-skill.mjs <skill-name> [--resources scripts,references,assets] [--examples]`
+2. Run the init script (from your workspace root):
+   - `node skills/create_skill/scripts/init-skill.mjs <skill-name> [--resources scripts,references,assets] [--examples]`
+   - Add `--shared` (or `--workspace`) to create a cross-agent shared skill under `./skills/<skill-name>`.
 3. Edit the generated `SKILL.md` and add any needed `scripts/`, `references/`, or `assets/` files.
 4. (Optional) If the skill bundles runnable scripts, prefer invoking them rather than pasting large code into chat.
 
@@ -23,7 +24,7 @@ This skill scaffolds a new skill in either `arcana/skills` (推荐：随 Arcana 
 
 ## When This Skill Owns Tools（与工具绑定）
 
-- 工具位置：`arcana/skills/<skill>/tools/<tool>/`（in‑process；非 CLI）。
+- 工具位置：`<skill>/tools/<tool>/`（无论该 Skill 位于 Agent Home 还是工作区 ./skills，下游加载器都会自动发现）。
 - 可见性：在本 Skill 的 `SKILL.md` 顶部使用 `arcana.tools` 声明（示例）：
 
 ```yaml
@@ -48,4 +49,4 @@ arcana:
 
 ## Script
 
-See `arcana/skills/create_skill/scripts/init-skill.mjs` for the deterministic scaffolder used by this skill.
+See `skills/create_skill/scripts/init-skill.mjs` for the deterministic scaffolder used by this skill.

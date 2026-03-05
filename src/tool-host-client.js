@@ -45,6 +45,7 @@ export class ToolHostClient {
       // Reject all pending requests tied to the current child.
       const reason = this.killReason;
       const err = new Error(reason || 'tool_host_exited');
+      if (reason) { console.warn('[ToolHostClient] host exited: reason=' + reason + ' code=' + ((code !== null && code !== undefined) ? code : '') + ' signal=' + (sig || '')); }
       for (const [,p] of this.pending){
         try { if (p?.timeoutHandle) clearTimeout(p.timeoutHandle); } catch {}
         try { p.reject(err); } catch {}
@@ -117,10 +118,14 @@ export class ToolHostClient {
           if (!this.pending.has(id)) return;
           // Remove from pending first to avoid double rejection from exit.
           this.pending.delete(id);
+          // Capture start time before clearing active for accurate elapsed.
+          const activeStartedAt = (this.active && this.active.id === id) ? this.active.startedAt : undefined;
           // Clear active so status reflects idle; new ensure() will respawn.
           if (this.active && this.active.id === id) this.active = null;
           try { reject(new Error('timeout')); } catch {}
           // Kill the host and let the next call lazily respawn it.
+          const elapsed = (activeStartedAt != null) ? (Date.now() - activeStartedAt) : undefined;
+          console.warn('[ToolHostClient] kill host (timeout): method=' + method + ' elapsedMs=' + (elapsed != null ? elapsed : 'n/a') + ' timeoutMs=' + timeoutMs);
           this._killHost('timeout');
         }, timeoutMs);
       }
@@ -140,6 +145,9 @@ export class ToolHostClient {
     // Kill the current child process group. Immediately detach our reference so
     // subsequent ensure() calls will spawn a fresh host instead of waiting
     // for the dying child to emit 'exit' (child.killed may remain false until exit).
+    const elapsed = this.active ? (Date.now() - this.active.startedAt) : undefined;
+    const method = (this.active && this.active.method) ? this.active.method : 'unknown';
+    console.warn('[ToolHostClient] kill host (cancelled): method=' + method + ' elapsedMs=' + (elapsed != null ? elapsed : 'n/a'));
     this._killHost('cancelled');
     this.child = null;
     this.buffer = '';

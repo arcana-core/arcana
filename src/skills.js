@@ -1,14 +1,13 @@
 // Arcana skills prompt integration
-// - Resolve skill directories from config, env, and sensible defaults
+// - Resolve skill directories from config, env, agent home, and workspace
 // - Load skills via pi-coding-agent helpers
-// - Dedupe by name+filePath
+// - Dedupe by skill name (higher-priority dirs override lower)
 // - Compact file paths by replacing the home directory prefix with ~/ 
-// - Export buildArcanaSkillsPrompt({ cwd, cfg, pkgRoot, repoRoot }) -> string
+// - Export buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot }) -> string
 //   (empty string when there are no visible skills)
 
 import { formatSkillsForPrompt, loadSkillsFromDir, parseFrontmatter } from '@mariozechner/pi-coding-agent';
-import { existsSync } from 'node:fs';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
@@ -27,9 +26,9 @@ function expandHome(p) {
   return p;
 }
 
-function resolvePathLike(p, cwd) {
+function resolvePathLike(p, base) {
   const expanded = expandHome(String(p).trim());
-  return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+  return isAbsolute(expanded) ? expanded : resolve(base || process.cwd(), expanded);
 }
 
 function compactPath(p) {
@@ -47,51 +46,6 @@ function compactPath(p) {
   }
 }
 
-export function resolveArcanaSkillsDirs({ cwd, cfg, pkgRoot, repoRoot } = {}) {
-  const dirs = [];
-  const cwdUse = cwd || process.cwd();
-
-  // 1) Config: cfg.skills.dirs or cfg.skills_dirs (array or single string)
-  const cfgDirs = [
-    ...(cfg?.skills?.dirs ? toArray(cfg.skills.dirs) : []),
-    ...(cfg?.skills_dirs ? toArray(cfg.skills_dirs) : []),
-  ]
-    .map((p) => resolvePathLike(p, cwdUse))
-    .filter(Boolean);
-
-  // 2) Env: ARCANA_SKILLS_DIRS (path list)
-  const envList = (process.env.ARCANA_SKILLS_DIRS || '')
-    .split(delimiter)
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => resolvePathLike(p, cwdUse));
-
-  // 3) Defaults: <cwd>/skills, <cwd>/.agents/skills
-  const defaults = [
-    resolve(cwdUse, 'skills'),
-    resolve(cwdUse, '.agents', 'skills'),
-  ];
-
-  // plus <pkgRoot>/skills if present
-  if (pkgRoot) {
-    const pkgSkills = resolve(pkgRoot, 'skills');
-    if (existsSync(pkgSkills)) defaults.push(pkgSkills);
-  }
-
-  // Merge in priority order, dedupe by absolute path
-  const seen = new Set();
-  const merged = [];
-  for (const arr of [cfgDirs, envList, defaults]) {
-    for (const p of arr) {
-      const abs = resolve(p);
-      if (seen.has(abs)) continue;
-      seen.add(abs);
-      merged.push(abs);
-    }
-  }
-  return merged;
-}
-
 function expandHomePath(p){
   try{
     if (!p) return p;
@@ -101,7 +55,7 @@ function expandHomePath(p){
     if (s.startsWith('~/')) return join(home, s.slice(2));
     if (s.startsWith('~')) return join(home, s.slice(1));
     return p;
-  } catch { return p }
+  } catch { return p; }
 }
 
 function readSkillToolsFromFrontmatter(skillFile){
@@ -122,7 +76,7 @@ function readSkillToolsFromFrontmatter(skillFile){
       });
     }
     return out;
-  } catch { return [] }
+  } catch { return []; }
 }
 
 function unwrapLoadedSkills(loaded){
@@ -135,33 +89,98 @@ function unwrapLoadedSkills(loaded){
   return [];
 }
 
-export function loadArcanaSkills({ cwd, cfg, pkgRoot, repoRoot } = {}) {
-  const dirs = resolveArcanaSkillsDirs({ cwd, cfg, pkgRoot, repoRoot });
-  const seen = new Set(); // de-dupe by name|filePath
-  const all = [];
+// Resolve skills directories in low-to-high priority order:
+// package skills < workspace skills < agent-home skills < config/env overrides.
+export function resolveArcanaSkillsDirs({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd } = {}) {
+  const wsRoot = workspaceRoot || cwd || process.cwd();
+  const dirsPkg = [];
+  const dirsWorkspace = [];
+  const dirsAgent = [];
+  const dirsCfgEnv = [];
+
+  // Package skills (lowest priority)
+  if (pkgRoot) {
+    const pkgSkills = resolve(pkgRoot, 'skills');
+    if (existsSync(pkgSkills)) dirsPkg.push(pkgSkills);
+  }
+
+  // Workspace-local skills
+  if (wsRoot) {
+    dirsWorkspace.push(
+      resolve(wsRoot, 'skills'),
+      resolve(wsRoot, '.agents', 'skills'),
+    );
+  }
+
+  // Agent-home skills
+  if (agentHomeRoot) {
+    dirsAgent.push(
+      resolve(agentHomeRoot, 'skills'),
+      resolve(agentHomeRoot, '.agents', 'skills'),
+    );
+  }
+
+  // Config/env skills (highest priority)
+  const baseForConfig = wsRoot || process.cwd();
+  const cfgDirsRaw = [
+    ...(cfg?.skills?.dirs ? toArray(cfg.skills.dirs) : []),
+    ...(cfg?.skills_dirs ? toArray(cfg.skills_dirs) : []),
+  ];
+
+  for (const p of cfgDirsRaw) {
+    if (!p) continue;
+    dirsCfgEnv.push(resolvePathLike(p, baseForConfig));
+  }
+
+  const envListRaw = String(process.env.ARCANA_SKILLS_DIRS || '')
+    .split(delimiter)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  for (const p of envListRaw) {
+    dirsCfgEnv.push(resolvePathLike(p, baseForConfig));
+  }
+
+  const seen = new Set();
+  const merged = [];
+  for (const group of [dirsPkg, dirsWorkspace, dirsAgent, dirsCfgEnv]) {
+    for (const p of group) {
+      const abs = resolve(p);
+      if (seen.has(abs)) continue;
+      seen.add(abs);
+      merged.push(abs);
+    }
+  }
+  return merged;
+}
+
+export function loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd } = {}) {
+  const dirs = resolveArcanaSkillsDirs({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd });
+  const byName = new Map(); // de-dupe by skill name, higher-priority dirs override lower
   for (const dir of dirs) {
     if (!existsSync(dir)) continue;
     try {
       const loaded = loadSkillsFromDir({ dir, source: 'path' });
       const skills = unwrapLoadedSkills(loaded);
       for (const s of skills || []) {
-        const key = String(s?.name||'') + '|' + String(s?.filePath||'');
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const filePathCompact = compactPath(s.filePath);
+        const name = String(s?.name || '').trim();
+        if (!name) continue;
         const filePathReal = expandHomePath(s.filePath);
+        const filePathCompact = compactPath(s.filePath);
         const tools = readSkillToolsFromFrontmatter(filePathReal);
-        all.push({ ...s, filePath: filePathCompact, tools });
+        const merged = { ...s, name, filePath: filePathCompact, tools };
+        byName.set(name, merged);
       }
     } catch {
       continue;
     }
   }
-  return all;
+  return Array.from(byName.values());
 }
-export function buildArcanaSkillsPrompt({ cwd, cfg, pkgRoot, repoRoot } = {}) {
+
+export function buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd } = {}) {
   try {
-    const skills = loadArcanaSkills({ cwd, cfg, pkgRoot, repoRoot });
+    const skills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd });
     const prompt = formatSkillsForPrompt(skills);
     return prompt && prompt.trim().length > 0 ? prompt : '';
   } catch {

@@ -18,6 +18,10 @@ Configure a provider (example: OpenAI)
 - Optional: set ARCANA_MODEL=openai:gpt-4o-mini
 - Or create arcana/arcana.config.json with provider and model fields
 
+Optional behavior flags
+- Enable automatic Tier1 memory triggers (tool_fail + user_issue): set ARCANA_MEMORY_TRIGGERS=true
+- SOP extraction after tool failures is enabled by default; disable with ARCANA_SOP_EXTRACTION=false
+
 Quickstart
 - Health check: node ./arcana/bin/arcana.js doctor
 - JSON report: node ./arcana/bin/arcana.js doctor --json

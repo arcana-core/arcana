@@ -1,13 +1,14 @@
 import { Type } from '@sinclair/typebox';
-import { existsSync, mkdirSync, readdirSync, readFileSync, appendFileSync } from 'node:fs';
-import { join, resolve, relative } from 'node:path';
-import { ensureReadAllowed, ensureWriteAllowed, resolveWorkspaceRoot } from '../workspace-guard.js';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { resolve, relative } from 'node:path';
+import { ensureAgentReadAllowed, resolveAgentHomeRoot } from '../agent-guard.js';
 
-// Minimal deterministic memory tools (append-only).
-// Files: <workspace>/MEMORY.md, optional <workspace>/memory.md, and <workspace>/memory/YYYY-MM-DD.md
+// Minimal deterministic memory tools (read/search only).
+// Files live under <agent home> (e.g. ~/.arcana/agents/<agentId>/MEMORY.md,
+// optional memory.md, and memory/*.md).
 
 function listAllowedMemoryFiles() {
-  const root = resolveWorkspaceRoot();
+  const root = resolveAgentHomeRoot();
   const out = [];
   const rootLongA = resolve(root, 'MEMORY.md');
   const rootLongB = resolve(root, 'memory.md');
@@ -40,9 +41,9 @@ function isAllowedMemoryRelPath(rel) {
 
 
 function normalizeToAllowedRelPath(p) {
-  // Accept relative or absolute under workspace; return clean relative forward-slash path.
-  const root = resolveWorkspaceRoot();
-  const abs = ensureReadAllowed(p);
+  // Accept relative or absolute under agent home; return clean relative forward-slash path.
+  const root = resolveAgentHomeRoot();
+  const abs = ensureAgentReadAllowed(p);
   const rel = relative(root, abs).replace(/\\/g, '/');
   if (!isAllowedMemoryRelPath(rel)) {
     const err = new Error('Path not allowed: only MEMORY.md, memory.md, or memory/*.md');
@@ -52,38 +53,6 @@ function normalizeToAllowedRelPath(p) {
   return rel;
 }
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
-function pad2(n){ return String(n).padStart(2, '0'); }
-function localParts(d = new Date()) {
-  return {
-    Y: d.getFullYear(),
-    M: pad2(d.getMonth() + 1),
-    D: pad2(d.getDate()),
-    h: pad2(d.getHours()),
-    m: pad2(d.getMinutes()),
-    s: pad2(d.getSeconds()),
-  };
-}
-
-function pickDailyFilename(dateStr) {
-  // dateStr YYYY-MM-DD in local time (optional)
-  let Y, M, D;
-  if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(String(dateStr))) {
-    const [y, m, d] = String(dateStr).split('-');
-    Y = y; M = m; D = d;
-  } else {
-    const p = localParts();
-    Y = String(p.Y); M = p.M; D = p.D;
-  }
-  return 'memory/' + Y + '-' + M + '-' + D + '.md';
-}
-
-function buildAppendBlock(target, heading, content) {
-  const p = localParts();
-  const stamp = p.Y + '-' + p.M + '-' + p.D + ' ' + p.h + ':' + p.m;
-  const head = heading ? (' - ' + heading) : '';
-  // Keep very small structure; always separate with blank lines.
-  return '\n\n## ' + (target === 'daily' ? (p.h + ':' + p.m) : stamp) + head + '\n\n' + String(content || '').replace(/\s+$/, '') + '\n';
-}
 export function createMemoryTools(){
   // memory_search
   const SearchParams = Type.Object({
@@ -107,7 +76,7 @@ export function createMemoryTools(){
       for (const rel of files) {
         if (matches.length >= max) break;
         let txt = '';
-        try { txt = readFileSync(ensureReadAllowed(rel), 'utf-8'); } catch { continue; }
+        try { txt = readFileSync(ensureAgentReadAllowed(rel), 'utf-8'); } catch { continue; }
         const lines = String(txt).split(/\r?\n/);
         let lastEnd = -1;
         for (let i = 0; i < lines.length && matches.length < max; i++) {
@@ -143,7 +112,7 @@ export function createMemoryTools(){
         return { content:[{ type:'text', text: e.message || 'path not allowed' }], details:{ ok:false, error:'path_forbidden' } };
       }
       let text = '';
-      try { text = readFileSync(ensureReadAllowed(rel), 'utf-8'); } catch {
+      try { text = readFileSync(ensureAgentReadAllowed(rel), 'utf-8'); } catch {
         return { content:[{ type:'text', text: 'file not found' }], details:{ ok:false, error:'not_found', path: rel } };
       }
       const lines = String(text).split(/\r?\n/);
@@ -156,45 +125,8 @@ export function createMemoryTools(){
       return { content:[{ type:'text', text: snippet }], details: info };
     }
   };
-  // memory_append
-  const AppendParams = Type.Object({
-    target: Type.Union([Type.Literal('daily'), Type.Literal('longterm')]),
-    content: Type.String({ description: 'Text to append (required).' }),
-    date: Type.Optional(Type.String({ description: 'YYYY-MM-DD for daily target (optional).' })),
-    heading: Type.Optional(Type.String({ description: 'Optional short heading.' })),
-  });
 
-  const memoryAppend = {
-    label: 'Memory Append',
-    name: 'memory_append',
-    description: 'Append timestamped content to MEMORY.md or memory/YYYY-MM-DD.md.',
-    parameters: AppendParams,
-    async execute(_id, args){
-      const target = String(args.target||'').toLowerCase();
-      const raw = String(args.content||'');
-      const content = raw.trim();
-      if (!target || !content) {
-        return { content:[{ type:'text', text: 'target and content are required.' }], details:{ ok:false, error:'missing_params' } };
-      }
-      let relPath;
-      if (target === 'daily') {
-        relPath = pickDailyFilename(args.date);
-        // Ensure memory/ directory exists before appending.
-        try { mkdirSync(resolve(resolveWorkspaceRoot(), 'memory'), { recursive: true }); } catch {}
-      } else if (target === 'longterm') {
-        relPath = 'MEMORY.md';
-      } else {
-        return { content:[{ type:'text', text: 'target must be daily or longterm' }], details:{ ok:false, error:'bad_target' } };
-      }
-      const block = buildAppendBlock(target, args.heading, content);
-      try { appendFileSync(ensureWriteAllowed(relPath), block, { encoding:'utf-8' }); } catch (e) {
-        return { content:[{ type:'text', text: 'append failed' }], details:{ ok:false, error:'append_failed', message: String(e&&e.message||e) } };
-      }
-      return { content:[{ type:'text', text: 'memory_append: wrote ' + relPath }], details:{ ok:true, path: relPath, bytes: Buffer.byteLength(block, 'utf-8') } };
-    }
-  };
-
-  return [memorySearch, memoryGet, memoryAppend];
+  return [memorySearch, memoryGet];
 }
 
 export default createMemoryTools;

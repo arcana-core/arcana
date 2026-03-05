@@ -28,7 +28,9 @@ arcana:
 - 通过密码箱设置的变量立刻生效，会广播 `env_refresh`，并刷新可见工具/技能等信息。
 
 存储与加密：
-- 持久化文件默认保存在 `~/.arcana/vault.json`；如果设置了 `ARCANA_HOME`，则使用 `$ARCANA_HOME/vault.json`（由 Arcana Home 解析器统一解析）。
+- 全局保险箱文件默认保存在 `~/.arcana/vault.json`；如果设置了 `ARCANA_HOME`，则使用 `$ARCANA_HOME/vault.json`（由 Arcana Home 解析器统一解析）。该文件中的变量会在服务启动时解密并写入 `process.env`，对所有代理生效。
+- 每个代理还有自己的保险箱文件：`~/.arcana/agents/<agentId>/vault.json`（由 Arcana Home 解析器统一解析到代理 Home 目录下的 `vault.json`）。该文件只在该代理执行工具时临时叠加到环境变量中，不会长期修改全局 `process.env`。
+- 代理保险箱中包含一个 `inheritGlobal` 标记，对应前端的“继承全局密码”复选框：开启时，工具执行前会同时看到全局 + 代理级变量；关闭时，工具执行前会临时屏蔽全局保险箱中的变量，只保留代理级变量。
 - 在“密码箱”界面填写“保险箱口令”后保存时，vault 文件会使用 AES-256-GCM 加密；不填写口令则以明文 JSON 形式保存。
 - 当 vault 文件已加密时，后续保存必须提供正确口令，或通过环境变量 `ARCANA_VAULT_PASSPHRASE` 预先注入口令；否则服务会返回 423（已加密且锁定，需要口令）或 403（口令不正确），前端日志会分别提示“已加密且锁定：请输入口令再保存/解锁”和“口令不正确”。
 - 建议在常用环境中设置 `ARCANA_VAULT_PASSPHRASE`，以便重启 Arcana 后自动解锁保险箱并加载其中的环境变量。

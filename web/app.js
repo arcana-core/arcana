@@ -7,6 +7,7 @@ let activeAssistant = null; // current assistant bubble to stream text into
 // --- Session-bound, layered Logs ---
 const LOG_CAP = 400; // per session per tab
 const logStore = new Map(); // sessionId -> { main:[], tools:[], subagents:[] }
+const DEFAULT_AGENT_ID = 'default';
 let activeLogTab = (localStorage.getItem('arcana.logs.activeTab') || 'main');
 // Cache last logged workspace per session AND per label to avoid duplicates.
 // Structure: Map<sessionId, Map<label, workspacePath>> so that
@@ -266,9 +267,14 @@ try { qs('cfg-support-bundle').addEventListener('click', ()=>{ createSupportBund
 
 // --- Sessions state ---
 const CKEY = 'arcana.currentSessionId';
+const AKEY = 'arcana.currentAgentId';
 let currentId = localStorage.getItem(CKEY) || '';
 let streamingId = '';
 const typing = new Map(); // sessionId -> boolean
+let agents = [];
+let currentAgentId = localStorage.getItem(AKEY) || '';
+let hasAgents = false;
+let currentWorkspace = '';
 
 function nowIso(){ return new Date().toISOString() }
 function setCurrent(id){ currentId = id; localStorage.setItem(CKEY, id); try { window.__arcana_currentSessionId = id } catch {} }
@@ -293,12 +299,14 @@ async function _fetchJsonExpectOk(url, opts, label){
   } catch(e){ appendLog('[sessions] ' + (label||url) + ' fetch failed: ' + (((e && e.message) || e))); throw e }
 }
 
-async function listSessions(){ const j = await _fetchJsonExpectOk('/api/sessions', undefined, 'list'); return Array.isArray(j && j.sessions) ? j.sessions : [] }
-async function createSession(title, workspace){ const payload = { title: title||'新会话', workspace: String(workspace||'') }; return await _fetchJsonExpectOk('/api/sessions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'create') }
-async function deleteSession(id){ if (!id) return { ok:false }; return await _fetchJsonExpectOk('/api/sessions/' + encodeURIComponent(id), { method:'DELETE' }, 'delete') }
-async function loadSession(id){
+async function listSessions(agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const url = '/api/sessions?agentId=' + encodeURIComponent(id); const j = await _fetchJsonExpectOk(url, undefined, 'list'); return Array.isArray(j && j.sessions) ? j.sessions : [] }
+async function createSession(title, workspace, agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const payload = { title: title||'新会话', agentId: id }; if (workspace){ payload.workspace = String(workspace||''); } return await _fetchJsonExpectOk('/api/sessions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'create') }
+async function deleteSession(id, agentId){ if (!id) return { ok:false }; const aid = String(agentId || DEFAULT_AGENT_ID); const url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid); return await _fetchJsonExpectOk(url, { method:'DELETE' }, 'delete') }
+async function listAgents(){ const j = await _fetchJsonExpectOk('/api/agents', undefined, 'agents'); return Array.isArray(j && j.agents) ? j.agents : [] }
+async function loadSession(id, agentId){
   try{
-    const url = '/api/sessions/' + encodeURIComponent(id);
+    const aid = String(agentId || DEFAULT_AGENT_ID);
+    const url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid);
     const r = await fetch(url);
     if (r.status === 404) return null;
     const ct = (r.headers && r.headers.get) ? (r.headers.get('content-type') || '') : '';
@@ -306,6 +314,104 @@ async function loadSession(id){
     if (!ct.includes('application/json')){ let preview = ''; try { preview = await r.clone().text() } catch {}; appendLog('[sessions] load non-JSON response ' + r.status + (preview ? (': ' + _collapse(preview)) : '')) }
     try { return await r.json() } catch(e){ let preview = ''; try { preview = await r.clone().text() } catch {}; appendLog('[sessions] load JSON parse error' + (preview ? (': ' + _collapse(preview)) : '')); throw e }
   } catch(e){ appendLog('[sessions] load failed: ' + (((e && e.message) || e))); throw e }
+}
+
+function renderAgentsList(){
+  const panel = qs('agents-panel');
+  const box = qs('agents-list');
+  if (!panel || !box) return;
+  panel.style.display = '';
+  box.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  const current = String(currentAgentId || '');
+  for (const a of (agents||[])){
+    const id = a && a.agentId ? String(a.agentId) : '';
+    if (!id) continue;
+    const div = document.createElement('div');
+    div.className = (id===current) ? 'agent-item active' : 'agent-item';
+    div.dataset.agentId = id;
+    const dot = document.createElement('span'); dot.className = 'agent-dot';
+    const label = document.createElement('span'); label.className = 'agent-id'; label.textContent = id;
+    div.appendChild(dot);
+    div.appendChild(label);
+    div.addEventListener('click', ()=>{ setCurrentAgent(id).catch(()=>{}); });
+    frag.appendChild(div);
+  }
+  if (!frag.childNodes.length){
+    const empty = document.createElement('div');
+    empty.className = 'agent-empty';
+    empty.textContent = 'No agents yet. Use the create_agent tool to create one.';
+    box.appendChild(empty);
+  } else {
+    box.appendChild(frag);
+  }
+}
+
+async function setCurrentAgent(id){
+  const nextId = String(id || '');
+  if (nextId === String(currentAgentId || '')) return;
+  currentAgentId = nextId;
+  try { localStorage.setItem(AKEY, currentAgentId); } catch {}
+  renderAgentsList();
+
+  if (!hasAgents){
+    refreshList().catch(()=>{});
+    return;
+  }
+
+  setCurrent('');
+  try { renderMessages([]); } catch {}
+
+  let items = [];
+  try {
+    items = await refreshList();
+  } catch (e) {
+    appendLog('[sessions] 切换代理刷新失败: ' + (((e && e.message) || e)));
+  }
+
+  if (Array.isArray(items) && items.length){
+    try {
+      await openSession(items[0].id);
+    } catch (e) {
+      appendLog('[sessions] 打开会话失败: ' + (((e && e.message) || e)));
+    }
+    return;
+  }
+
+  try {
+    const created = await createSession('新会话', '', currentAgentId);
+    await openSession(created.id);
+  } catch (e) {
+    appendLog('[sessions] 创建新会话失败: ' + (((e && e.message) || e)));
+  }
+}
+
+async function loadAgents(){
+  try{
+    const list = await listAgents();
+    agents = Array.isArray(list) ? list : [];
+    hasAgents = agents.length > 0;
+    if (!hasAgents){
+      currentAgentId = '';
+      try { localStorage.removeItem(AKEY); } catch {}
+    } else {
+      let desired = currentAgentId;
+      if (!desired || !agents.some((a)=>a && a.agentId === desired)){
+        desired = agents[0].agentId || '';
+      }
+      currentAgentId = String(desired || '');
+      try { localStorage.setItem(AKEY, currentAgentId); } catch {}
+    }
+    renderAgentsList();
+  } catch(e){
+    hasAgents = false;
+    agents = [];
+    currentAgentId = '';
+    try { localStorage.removeItem(AKEY); } catch {}
+    const panel = qs('agents-panel');
+    if (panel) panel.style.display = 'none';
+    appendLog('[agents] 加载失败');
+  }
 }
 
 function renderSessionList(items){
@@ -326,14 +432,29 @@ function renderSessionList(items){
       try{
         ev.stopPropagation && ev.stopPropagation(); ev.preventDefault && ev.preventDefault();
         const ok = confirm('确定删除该会话？此操作不可恢复。'); if (!ok) return;
-        const resp = await deleteSession(it.id);
+        const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+        const resp = await deleteSession(it.id, aid);
         if (!resp || resp.ok !== true){ appendLog('[sessions] delete failed: server rejected'); return }
         const deletedCurrent = (it.id === currentId);
         if (deletedCurrent) setCurrent('');
         try { await refreshList() } catch {}
         if (deletedCurrent){
-          try { const remain = await listSessions(); if (Array.isArray(remain) && remain.length){ await openSession(remain[0].id) } else { const obj = await createSession('新会话', await pickWorkspace() || ''); await openSession(obj.id) } }
-          catch(e){ appendLog('[sessions] delete fallback failed: ' + (((e && e.message) || e))) }
+          try {
+            const remain = await listSessions(hasAgents && currentAgentId ? currentAgentId : undefined);
+            if (Array.isArray(remain) && remain.length){
+              await openSession(remain[0].id);
+            } else {
+              let obj;
+              if (hasAgents && currentAgentId){
+                obj = await createSession('新会话', '', currentAgentId);
+              } else {
+                const ws = await pickWorkspace() || '';
+                if (!ws){ appendLog('[sessions] 未选择工作区'); return; }
+                obj = await createSession('新会话', ws);
+              }
+              await openSession(obj.id);
+            }
+          } catch(e){ appendLog('[sessions] delete fallback failed: ' + (((e && e.message) || e))) }
         }
       } catch(e){ appendLog('[sessions] delete failed: ' + (((e && e.message) || e))) }
     });
@@ -346,7 +467,13 @@ function renderSessionList(items){
 async function openSession(id){
   setCurrent(id);
   renderMessages([]); // clear
-  const obj = await loadSession(id);
+  const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+  const obj = await loadSession(id, aid);
+  if (obj && obj.workspace) {
+    currentWorkspace = String(obj.workspace || '');
+  } else {
+    currentWorkspace = '';
+  }
   renderMessages((obj && Array.isArray(obj.messages)) ? obj.messages : []);
   // Log session workspace only when it changes to avoid duplicate lines when switching
   try { if (obj && obj.workspace) { logWorkspaceIfChanged(id, 'workspace:', obj.workspace); } } catch {}
@@ -356,14 +483,22 @@ async function openSession(id){
 
 function renderMessages(msgs){ messages.innerHTML = ''; for (const m of (msgs||[])) appendMessage(m.role, m.text); messages.scrollTop = messages.scrollHeight; }
 
-async function refreshList(){ const items = await listSessions(); items.sort((a,b)=> String(b.updatedAt||'').localeCompare(String(a.updatedAt||''))); renderSessionList(items); }
+async function refreshList(){ const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID; const items = await listSessions(aid); items.sort((a,b)=> String(b.updatedAt||'').localeCompare(String(a.updatedAt||''))); renderSessionList(items); return items; }
 
 async function ensureSession(){
   if (currentId) return currentId;
+  if (hasAgents && currentAgentId){
+    const created = await createSession('新会话', '', currentAgentId);
+    setCurrent(created.id);
+    currentWorkspace = String(created.workspace || '');
+    await refreshList();
+    return currentId;
+  }
   const ws = await pickWorkspace();
   if (!ws){ appendLog('[sessions] 未选择工作区'); throw new Error('workspace_required') }
   const created = await createSession('新会话', ws);
   setCurrent(created.id);
+  currentWorkspace = String(created.workspace || ws || '');
   await refreshList();
   return currentId;
 }
@@ -372,13 +507,27 @@ async function sendWithSession(){
   const text = input.value.trim();
   if (!text) return;
   await ensureSession();
+  // For non-agent sessions, ensure we have a workspace so /api/chat2 accepts the request
+  if (!hasAgents || !currentAgentId){
+    if (!currentWorkspace && currentId){
+      try {
+        const obj = await loadSession(currentId, DEFAULT_AGENT_ID);
+        if (obj && obj.workspace) currentWorkspace = String(obj.workspace || '');
+      } catch {}
+    }
+  }
   appendMessage('user', text);
   input.value = ''; autoResize();
   activeAssistant = appendMessage('assistant','');
   setTyping(activeAssistant, true);
   streamingId = currentId;
   try{
-    const r = await fetch('/api/chat2', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: currentId, message: text, policy: (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted' }) });
+    const payload = { sessionId: currentId, message: text, policy: (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted', agentId: currentAgentId || DEFAULT_AGENT_ID };
+    if (!hasAgents || !currentAgentId){
+      const ws = String(currentWorkspace || '').trim();
+      if (ws) payload.workspace = ws;
+    }
+    const r = await fetch('/api/chat2', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
     const j = await r.json();
     if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = j.text || '[无响应]'; }
     await openSession(currentId);
@@ -397,7 +546,8 @@ try {
   if (stopBtn) stopBtn.addEventListener('click', async ()=>{
     try{
       const sid = getCurrentSessionId(); if (!sid) return;
-      await fetch('/api/abort', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid }) });
+      const aid = currentAgentId || DEFAULT_AGENT_ID;
+      await fetch('/api/abort', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid, agentId: aid }) });
     } catch {}
   });
 } catch {}
@@ -435,14 +585,12 @@ try {
       if (data.type === 'turn_start'){
         try {
           LI.usedThisTurn = new Set();
-          LI.thinkingChars = 0;
-          LI.thinkingMs = 0;
           LI.turns += 1;
         } catch {}
         logMain(sid, 'turn start');
         return;
       }
-      if (data.type === 'turn_end'){ try { renderLiveInfo(); } catch {} logMain(sid, 'turn end'); activeAssistant = null; return }
+      if (data.type === 'turn_end'){ try { if (typeof data.sessionTokens === 'number') LI.sessionTokens = Number(data.sessionTokens)||0; renderLiveInfo(); } catch {} logMain(sid, 'turn end'); activeAssistant = null; return }
       if (data.type === 'tool_execution_start'){
         try { if (data.toolName) LI.usedThisTurn.add(String(data.toolName)); renderLiveInfo(); } catch {}
         logTools(sid, 'tool start: ' + data.toolName + (data.args ? (' ' + JSON.stringify(data.args)) : ''));
@@ -488,6 +636,7 @@ try {
       if (data.type === 'thinking_end'){ if (activeAssistant) setTyping(activeAssistant, false); try { if (typeof data.chars !== 'undefined') LI.thinkingChars = Number(data.chars)||0; if (typeof data.tookMs !== 'undefined') LI.thinkingMs = Number(data.tookMs)||0; renderLiveInfo(); } catch {} if (typeof data.chars !== 'undefined' || typeof data.tookMs !== 'undefined') logMain(sid, 'thinking end: ' + (data.chars || 0) + ' chars, ' + (data.tookMs || 0) + ' ms'); return }
 
       if (data.type === 'skills_refresh'){ try { LI.skillsHint = '技能已刷新'; renderLiveInfo(); } catch {} return }
+      if (data.type === 'llm_usage'){ try { if (typeof data.contextTokens === 'number') LI.contextTokens = Number(data.contextTokens)||0; if (typeof data.sessionTokens === 'number') LI.sessionTokens = Number(data.sessionTokens)||0; renderLiveInfo(); } catch {} return }
       if (data.type === 'assistant_text'){
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
         if (!activeAssistant) activeAssistant = appendMessage('assistant','');
@@ -519,11 +668,33 @@ try {
 const newBtn = qs('new-session');
 if (newBtn && typeof newBtn.addEventListener === 'function'){
   newBtn.addEventListener('click', async ()=>{
-    const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
-    const obj = await createSession('新会话', ws); await openSession(obj.id);
+    try{
+      let obj;
+      if (hasAgents && currentAgentId){
+        obj = await createSession('新会话', '', currentAgentId);
+      } else {
+        const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
+        obj = await createSession('新会话', ws);
+      }
+      await openSession(obj.id);
+    } catch(e){ appendLog('[sessions] new session failed: ' + (((e && e.message) || e))); }
   });
 } else {
-  try { document.addEventListener('click', async (ev)=>{ const t = ev.target; if (t && t.id === 'new-session'){ const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return } const obj = await createSession('新会话', ws); await openSession(obj.id); } }); } catch {}
+  try { document.addEventListener('click', async (ev)=>{
+    const t = ev.target;
+    if (t && t.id === 'new-session'){
+      try{
+        let obj;
+        if (hasAgents && currentAgentId){
+          obj = await createSession('新会话', '', currentAgentId);
+        } else {
+          const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
+          obj = await createSession('新会话', ws);
+        }
+        await openSession(obj.id);
+      } catch(e){ appendLog('[sessions] new session failed: ' + (((e && e.message) || e))); }
+    }
+  }); } catch {}
 }
 
 // Initial with small retry/backoff
@@ -532,8 +703,13 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
   const attempts = 3; let delay = 300;
   for (let i=1; i<=attempts; i++){
     try{
+      try { await loadAgents(); } catch {}
       await refreshList();
-      if (!currentId){ const items = await listSessions(); if (items && items[0]) setCurrent(items[0].id) }
+      if (!currentId){
+        const aid = (hasAgents && currentAgentId) ? currentAgentId : undefined;
+        const items = await listSessions(aid);
+        if (items && items[0]) setCurrent(items[0].id);
+      }
       if (currentId) await openSession(currentId);
       return;
     } catch(e){ appendLog('[sessions] 初始加载失败(' + i + '/' + attempts + '): ' + (((e && e.message) || e))); if (i < attempts) { await sleep(delay); delay = Math.min(2000, delay * 2) } }
@@ -549,9 +725,9 @@ const LI = {
   skills: [],
   usedThisTurn: new Set(),
   turns: 0,
-  thinkingChars: 0,
-  thinkingMs: 0,
-  skillsHint: '',
+  sessionTokens: 0,
+  contextTokens: 0,
+skillsHint: '',
 };
 function liSet(id, text){ const el=document.getElementById(id); if (el) el.textContent=String((text===undefined||text===null)? '—' : text); }
 function renderLiveInfo(){
@@ -560,21 +736,29 @@ function renderLiveInfo(){
   liSet('li-tools', (LI.tools && LI.tools.length) ? LI.tools.join(', ') : '—');
   liSet('li-tools-used', (LI.usedThisTurn && LI.usedThisTurn.size) ? Array.from(LI.usedThisTurn).join(', ') : '—');
   liSet('li-skills', (LI.skills && LI.skills.length) ? LI.skills.join(', ') : '—');
-  liSet('li-thinking', String((LI.thinkingChars||0)) + ' chars / ' + String((LI.thinkingMs||0)) + ' ms');
+  liSet('li-session-tokens', (typeof LI.sessionTokens === 'number' && LI.sessionTokens >= 0) ? String(LI.sessionTokens) : '—');
+  liSet('li-context', (typeof LI.contextTokens === 'number' && LI.contextTokens >= 0) ? String(LI.contextTokens) : '—');
 }
 
 // --- Vault (Env) UI ---
 let VAULT_PASSPHRASE_CACHE = '';
 
-function buildVaultRow(v, vault){
+function buildVaultRow(v, globalVault, agentVault, section){
   const tr = document.createElement('div');
   tr.className = 'vault-row';
-  tr.style.cssText = 'display:grid;grid-template-columns: 180px 1fr 80px;gap:8px;align-items:center;margin:4px 0;';
+  tr.style.cssText = 'display:grid;grid-template-columns: 180px 1fr 90px;gap:8px;align-items:center;margin:4px 0;';
   const name = String(v && v.name || '');
   const has = !!(v && v.hasValue);
-  const stored = !!(v && v.stored);
-  const encrypted = !!(vault && vault.encrypted);
-  const locked = !!(vault && vault.locked);
+  const storedGlobal = !!(v && v.storedGlobal);
+  const storedAgent = !!(v && v.storedAgent);
+  const gEncrypted = !!(globalVault && globalVault.encrypted);
+  const gLocked = !!(globalVault && globalVault.locked);
+  const aEncrypted = !!(agentVault && agentVault.encrypted);
+  const aLocked = !!(agentVault && agentVault.locked);
+  const isGlobalRow = section === 'global';
+  const storedHere = isGlobalRow ? storedGlobal : storedAgent;
+  const encryptedHere = isGlobalRow ? gEncrypted : aEncrypted;
+  const lockedHere = isGlobalRow ? gLocked : aLocked;
 
   const nameEl = document.createElement('div');
   nameEl.textContent = name || '(未命名)';
@@ -588,7 +772,7 @@ function buildVaultRow(v, vault){
 
   const extra = document.createElement('div');
   extra.style.cssText = 'display:flex;gap:6px;align-items:center;';
-  const clear = document.createElement('input'); clear.type = 'checkbox'; clear.id = 'clear-' + name;
+  const clear = document.createElement('input'); clear.type = 'checkbox'; clear.id = 'clear-' + name + '-' + (isGlobalRow ? 'global' : 'agent'); clear.dataset.kind = 'clear';
   const clearLbl = document.createElement('label'); clearLbl.htmlFor = clear.id; clearLbl.textContent = '清除'; clearLbl.style.fontSize = '12px';
   clear.addEventListener('change', ()=>{ input.disabled = clear.checked; if (clear.checked) input.value = ''; });
   extra.appendChild(clear); extra.appendChild(clearLbl);
@@ -596,18 +780,18 @@ function buildVaultRow(v, vault){
   valWrap.appendChild(input);
   valWrap.appendChild(extra);
 
-  tr.appendChild(nameEl);
-  tr.appendChild(valWrap);
   const status = document.createElement('div');
   let statusText = '';
   let statusColor = '';
-  if (has){
+  const storedAny = storedHere;
+  const lockedSome = storedHere && encryptedHere && lockedHere;
+  if (has && storedHere){
     statusText = '已设置';
     statusColor = '#0a0';
-  } else if (stored && encrypted && locked){
+  } else if (storedAny && lockedSome){
     statusText = '已保存(需解锁)';
     statusColor = '#b58900';
-  } else if (stored){
+  } else if (storedAny){
     statusText = '已保存';
     statusColor = '#666';
   } else {
@@ -616,142 +800,376 @@ function buildVaultRow(v, vault){
   }
   status.textContent = statusText;
   status.style.cssText='font-size:12px;color:' + statusColor;
+
+  tr.appendChild(nameEl);
+  tr.appendChild(valWrap);
   tr.appendChild(status);
 
   tr.dataset.varName = name;
+  tr.dataset.storedGlobal = storedGlobal ? '1' : '0';
+  tr.dataset.storedAgent = storedAgent ? '1' : '0';
+  tr.dataset.section = isGlobalRow ? 'global' : 'agent';
   tr.querySelector = tr.querySelector.bind(tr);
   return tr;
 }
 
 async function openVault(){
-  // Create overlay
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:10000;';
   const dialog = document.createElement('div');
   dialog.style.cssText = 'width:720px;max-width:95vw;max-height:90vh;overflow:auto;background:#fff;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.25);padding:14px;';
-  dialog.innerHTML = 
-    "<div style=\"display:flex;align-items:center;gap:8px;\">" +
-    "<div style=\"font-weight:600;font-size:15px;\">密码箱（环境变量）</div>" +
-    "<div id=\"vault-sub\" style=\"font-size:12px;color:#666;\">加载中…</div>" +
-    "<div style=\"margin-left:auto;\"><button id=\"vault-close\">×</button></div>" +
-    "</div>" +
-    "<div id=\"vault-body\" style=\"margin-top:8px;\"></div>" +
-    "<div style=\"display:flex;gap:8px;justify-content:flex-end;margin-top:10px;\">" +
-    "  <button id=\"vault-cancel\">取消</button>" +
-    "  <button id=\"vault-save\">保存</button>" +
-    "</div>";
+  dialog.innerHTML =
+    '<div style="display:flex;align-items:center;gap:8px;">' +
+    '<div style="font-weight:600;font-size:15px;">密码箱（环境变量）</div>' +
+    '<div id="vault-sub" style="font-size:12px;color:#666;">加载中…</div>' +
+    '<div style="margin-left:auto;"><button id="vault-close">×</button></div>' +
+    '</div>' +
+    '<div id="vault-body" style="margin-top:8px;"></div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">' +
+    '  <button id="vault-cancel">取消</button>' +
+    '  <button id="vault-save">保存</button>' +
+    '</div>';
   overlay.appendChild(dialog); document.body.appendChild(overlay);
 
   function close(){ try { document.body.removeChild(overlay); } catch {} }
+
+  async function postVaultEnv(payload){
+    const resp = await fetch('/api/env', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify(payload) });
+    if (!resp.ok){
+      if (resp.status === 423){ appendLog('[vault] 已加密且锁定：请输入口令再保存/解锁'); return false; }
+      if (resp.status === 403){ appendLog('[vault] 口令不正确'); return false; }
+      appendLog('[vault] 保存失败'); return false; }
+    const j = await resp.json();
+    if (!j || j.ok !== true){ appendLog('[vault] 保存失败'); return false; }
+    return true;
+  }
+
   try { dialog.querySelector('#vault-close').addEventListener('click', close) } catch {}
   try { dialog.querySelector('#vault-cancel').addEventListener('click', close) } catch {}
 
   const bodyEl = dialog.querySelector('#vault-body');
-  bodyEl.innerHTML = "<div style=\"font-size:12px;color:#666;\">加载中…</div>";
+  bodyEl.innerHTML = '<div style="font-size:12px;color:#666;">加载中…</div>';
   let vars = [];
-  let vaultMeta = {};
+  let vaultGlobal = {};
+  let vaultAgent = {};
+  let inheritEffective = true;
+  let legacyMode = false;
+  const agentId = currentAgentId || DEFAULT_AGENT_ID;
   try {
-    const r = await fetch('/api/env');
+    const r = await fetch('/api/env?agentId=' + encodeURIComponent(agentId));
     const j = await r.json();
-    vars = Array.isArray(j && j.vars) ? j.vars : [];
-    vaultMeta = j && typeof j.vault === 'object' && j.vault ? j.vault : {};
-  } catch { bodyEl.innerHTML = "<div style=\"color:#a00;font-size:12px;\">读取失败</div>"; return }
+    const rawVars = Array.isArray(j && j.vars) ? j.vars : [];
+    const vMetaRaw = j && typeof j.vault === 'object' && j.vault ? j.vault : {};
+    const hasLayered = !!(vMetaRaw && typeof vMetaRaw.global === 'object' && vMetaRaw.global);
+    if (hasLayered){
+      legacyMode = false;
+      vars = rawVars;
+      const vMeta = vMetaRaw;
+      vaultGlobal = vMeta && typeof vMeta.global === 'object' && vMeta.global ? vMeta.global : {};
+      vaultAgent = vMeta && typeof vMeta.agent === 'object' && vMeta.agent ? vMeta.agent : {};
+      if (typeof vMeta.inheritGlobal === 'boolean') inheritEffective = vMeta.inheritGlobal;
+      else if (typeof vaultAgent.inheritGlobal === 'boolean') inheritEffective = vaultAgent.inheritGlobal;
+      else inheritEffective = true;
+    } else {
+      legacyMode = true;
+      vars = rawVars.map((v)=>({
+        name: v && v.name ? String(v.name) : '',
+        hasValue: !!(v && v.hasValue),
+        storedGlobal: !!(v && (v.storedGlobal || v.stored)),
+        storedAgent: false,
+      }));
+      vaultGlobal = (vMetaRaw && typeof vMetaRaw === 'object') ? vMetaRaw : {};
+      vaultAgent = {
+        path: '',
+        hasFile: false,
+        encrypted: false,
+        locked: false,
+        names: [],
+        inheritGlobal: true,
+      };
+      inheritEffective = true;
+    }
+  } catch {
+    bodyEl.innerHTML = '<div style="color:#a00;font-size:12px;">读取失败</div>';
+    return;
+  }
 
   try {
     const subEl = dialog.querySelector('#vault-sub');
     if (subEl){
-      const vm = vaultMeta || {};
-      const hasFile = !!vm.hasFile;
-      const encrypted = !!vm.encrypted;
-      const locked = !!vm.locked;
+      function metaText(vm){
+        if (!vm || !vm.hasFile) return '未创建';
+        const encrypted = !!vm.encrypted;
+        const locked = !!vm.locked;
+        if (encrypted && locked) return '已加密·已锁定';
+        if (encrypted) return '已加密';
+        return '未加密';
+      }
       let text = '';
-      if (!hasFile){
-        text = '落盘：未创建';
-      } else if (encrypted && locked){
-        text = '落盘：已加密·已锁定（需口令解锁）';
-      } else if (encrypted){
-        text = '落盘：已加密';
-      } else {
-        text = '落盘：未加密';
+      if (legacyMode){
+        text += '后端: legacy(仅全局) · ';
       }
-      if (vm.path){
-        text += ' · ' + String(vm.path);
-      }
+      text += '全局：' + metaText(vaultGlobal) + ' · 代理(' + (agentId || DEFAULT_AGENT_ID) + ')：' + metaText(vaultAgent);
+      if (vaultGlobal && vaultGlobal.path){ text += ' · 全局文件: ' + String(vaultGlobal.path); }
+      if (vaultAgent && vaultAgent.path){ text += ' · 代理文件: ' + String(vaultAgent.path); }
       subEl.textContent = text;
     }
   } catch {}
 
-  // Build list
-  bodyEl.innerHTML = "";
-  const list = document.createElement('div');
-  for (const v of vars) list.appendChild(buildVaultRow(v, vaultMeta));
+  bodyEl.innerHTML = '';
+  const container = document.createElement('div');
+  container.style.cssText = 'display:flex;flex-direction:column;gap:12px;';
 
-  // Add custom row helper
-  const addWrap = document.createElement('div');
-  addWrap.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px;';
-  addWrap.innerHTML = 
-    "<span style=\"font-size:12px;color:#666;\">新增变量</span>" +
-    "<input id=\"vault-new-name\" placeholder=\"名称（仅限 ARCANA_* 或 *_API_KEY）\" style=\"flex:0 0 280px;padding:6px;border:1px solid #ddd;border-radius:6px;\" />" +
-    "<input id=\"vault-new-value\" placeholder=\"值\" type=\"password\" style=\"flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;\" />" +
-    "<button id=\"vault-add\">添加</button>";
-  addWrap.querySelector('#vault-add').addEventListener('click', ()=>{
-    const n = String((addWrap.querySelector('#vault-new-name')||{}).value || '').trim();
-    const v = String((addWrap.querySelector('#vault-new-value')||{}).value || '');
+  const globalSection = document.createElement('div');
+  const globalHeader = document.createElement('div');
+  globalHeader.style.cssText = 'font-size:13px;font-weight:600;color:#333;margin-bottom:4px;';
+  globalHeader.textContent = '全局';
+  const globalList = document.createElement('div');
+  globalList.id = 'vault-list-global';
+  for (const v of vars){
+    if (v && v.storedGlobal){
+      globalList.appendChild(buildVaultRow(v, vaultGlobal, vaultAgent, 'global'));
+    }
+  }
+  if (vaultGlobal && vaultGlobal.hasFile && !globalList.querySelector('.vault-row')){
+    const warn = document.createElement('div');
+    warn.style.cssText = 'font-size:12px;color:#b58900;background:#fff7e0;border-radius:6px;padding:6px 8px;margin-top:4px;display:flex;align-items:center;justify-content:space-between;gap:8px;';
+    const msg = document.createElement('span');
+    msg.textContent = '检测到全局保险箱文件，但当前未显示任何变量，可能是已加密且锁定或旧版创建的文件。';
+    const btn = document.createElement('button');
+    btn.textContent = '解锁并加载已保存变量';
+    btn.addEventListener('click', async ()=>{
+      try {
+        const passEl = dialog.querySelector('#vault-passphrase');
+        const pass = String((passEl && passEl.value) || '').trim();
+        if (!pass){
+          appendLog('[vault] 请输入保险箱口令后再解锁');
+          if (passEl && typeof passEl.focus === 'function'){ try { passEl.focus(); } catch {} }
+          return;
+        }
+        const ok = await postVaultEnv({ scope:'global', set:{}, unset:[], passphrase: pass });
+        if (!ok) return;
+        appendLog('[vault] 已解锁全局变量');
+        close();
+        try { openVault().catch(()=>{}) } catch {}
+      } catch {
+        appendLog('[vault] 解锁失败');
+      }
+    });
+    warn.appendChild(msg);
+    warn.appendChild(btn);
+    globalList.appendChild(warn);
+  }
+
+  const addGlobal = document.createElement('div');
+  addGlobal.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px;';
+  addGlobal.innerHTML = 
+    '<span style="font-size:12px;color:#666;">新增全局变量</span>' +
+    '<input id="vault-new-global-name" placeholder="名称（仅限 ARCANA_* 或 *_API_KEY）" style="flex:0 0 280px;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
+    '<input id="vault-new-global-value" placeholder="值" type="password" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
+    '<button id="vault-add-global">添加</button>';
+  addGlobal.querySelector('#vault-add-global').addEventListener('click', ()=>{
+    const nInput = addGlobal.querySelector('#vault-new-global-name');
+    const vInput = addGlobal.querySelector('#vault-new-global-value');
+    const n = String((nInput||{}).value || '').trim();
+    const v = String((vInput||{}).value || '');
     if (!n) return;
-    const row = buildVaultRow({ name:n, hasValue:false }, vaultMeta);
-    row.querySelector('input[type=password]').value = v;
-    list.appendChild(row);
-    (addWrap.querySelector('#vault-new-name')||{}).value = '';
-    (addWrap.querySelector('#vault-new-value')||{}).value = '';
+    const row = buildVaultRow({ name:n, hasValue:false, storedGlobal:false, storedAgent:false }, vaultGlobal, vaultAgent, 'global');
+    const pwd = row.querySelector('input[type=password]');
+    if (pwd){ pwd.value = v; }
+    globalList.appendChild(row);
+    if (nInput) nInput.value = '';
+    if (vInput) vInput.value = '';
   });
 
-  bodyEl.appendChild(list);
-  bodyEl.appendChild(addWrap);
+  globalSection.appendChild(globalHeader);
+  globalSection.appendChild(globalList);
+  globalSection.appendChild(addGlobal);
+
+  const agentSection = document.createElement('div');
+  const agentHeader = document.createElement('div');
+  agentHeader.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:4px;';
+  const agentTitle = document.createElement('div');
+  agentTitle.style.cssText = 'font-size:13px;font-weight:600;color:#333;';
+  agentTitle.textContent = '代理';
+  const inheritWrap = document.createElement('div');
+  inheritWrap.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:12px;color:#666;';
+  inheritWrap.innerHTML = 
+    '<label style="display:flex;align-items:center;gap:4px;">' +
+    '  <input id="vault-inherit-global" type="checkbox" />' +
+    '  <span>继承全局密码</span>' +
+    '</label>' +
+    '<span style="margin-left:8px;color:#999;">仅作用于代理：' + String(agentId || DEFAULT_AGENT_ID) + '</span>';
+  const inheritBox = inheritWrap.querySelector('#vault-inherit-global');
+  if (inheritBox){ inheritBox.checked = !!inheritEffective; }
+  if (legacyMode){
+    inheritWrap.style.display = 'none';
+    inheritWrap.style.pointerEvents = 'none';
+    inheritWrap.style.opacity = '0.6';
+  }
+  agentHeader.appendChild(agentTitle);
+  agentHeader.appendChild(inheritWrap);
+
+  const agentList = document.createElement('div');
+  agentList.id = 'vault-list-agent';
+  if (legacyMode){
+    const info = document.createElement('div');
+    info.style.cssText = 'font-size:12px;color:#666;background:#f5f5f5;border-radius:6px;padding:6px 8px;margin-top:4px;';
+    info.textContent = '当前服务端不支持代理级密码箱；请重启/升级后端以启用。';
+    agentList.appendChild(info);
+  } else {
+    for (const v of vars){
+      if (v && v.storedAgent){
+        agentList.appendChild(buildVaultRow(v, vaultGlobal, vaultAgent, 'agent'));
+      }
+    }
+    if (vaultAgent && vaultAgent.hasFile && !agentList.querySelector('.vault-row')){
+      const warn = document.createElement('div');
+      warn.style.cssText = 'font-size:12px;color:#b58900;background:#fff7e0;border-radius:6px;padding:6px 8px;margin-top:4px;display:flex;align-items:center;justify-content:space-between;gap:8px;';
+      const msg = document.createElement('span');
+      msg.textContent = '检测到代理保险箱文件，但当前未显示任何变量，可能是已加密且锁定或旧版创建的文件。';
+      const btn = document.createElement('button');
+      btn.textContent = '解锁并加载已保存变量';
+      btn.addEventListener('click', async ()=>{
+        try {
+          const passEl = dialog.querySelector('#vault-passphrase');
+          const pass = String((passEl && passEl.value) || '').trim();
+          if (!pass){
+            appendLog('[vault] 请输入保险箱口令后再解锁');
+            if (passEl && typeof passEl.focus === 'function'){ try { passEl.focus(); } catch {} }
+            return;
+          }
+          const payload = { scope:'agent', agentId, set:{}, unset:[], passphrase: pass };
+          const ok = await postVaultEnv(payload);
+          if (!ok) return;
+          appendLog('[vault] 已解锁代理变量');
+          close();
+          try { openVault().catch(()=>{}) } catch {}
+        } catch {
+          appendLog('[vault] 解锁失败');
+        }
+      });
+      warn.appendChild(msg);
+      warn.appendChild(btn);
+      agentList.appendChild(warn);
+    }
+  }
+
+  const addAgent = document.createElement('div');
+  addAgent.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px;';
+  if (!legacyMode){
+    addAgent.innerHTML = 
+      '<span style="font-size:12px;color:#666;">新增代理变量</span>' +
+      '<input id="vault-new-agent-name" placeholder="名称（仅限 ARCANA_* 或 *_API_KEY）" style="flex:0 0 280px;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
+      '<input id="vault-new-agent-value" placeholder="值" type="password" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
+      '<button id="vault-add-agent">添加</button>';
+    addAgent.querySelector('#vault-add-agent').addEventListener('click', ()=>{
+      const nInput = addAgent.querySelector('#vault-new-agent-name');
+      const vInput = addAgent.querySelector('#vault-new-agent-value');
+      const n = String((nInput||{}).value || '').trim();
+      const v = String((vInput||{}).value || '');
+      if (!n) return;
+      const row = buildVaultRow({ name:n, hasValue:false, storedGlobal:false, storedAgent:false }, vaultGlobal, vaultAgent, 'agent');
+      const pwd = row.querySelector('input[type=password]');
+      if (pwd){ pwd.value = v; }
+      agentList.appendChild(row);
+      if (nInput) nInput.value = '';
+      if (vInput) vInput.value = '';
+    });
+  } else {
+    addAgent.style.display = 'none';
+  }
+
+  agentSection.appendChild(agentHeader);
+  agentSection.appendChild(agentList);
+  if (!legacyMode) agentSection.appendChild(addAgent);
+
+  container.appendChild(globalSection);
+  container.appendChild(agentSection);
 
   const passWrap = document.createElement('div');
   passWrap.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:8px;font-size:12px;color:#666;';
   passWrap.innerHTML = 
-    "<span style=\"flex:0 0 auto;\">保险箱口令</span>" +
-    "<input id=\"vault-passphrase\" type=\"password\" placeholder=\"用于解锁/加密持久化文件\" style=\"flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;\" />" +
-    "<label style=\"display:flex;align-items:center;gap:4px;flex:0 0 auto;\">" +
-    "  <input id=\"vault-remember-pass\" type=\"checkbox\" />" +
-    "  <span>记住（本页会话）</span>" +
-    "</label>";
+    '<span style="flex:0 0 auto;">保险箱口令</span>' +
+    '<input id="vault-passphrase" type="password" placeholder="用于解锁/加密持久化文件" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
+    '<label style="display:flex;align-items:center;gap:4px;flex:0 0 auto;">' +
+    '  <input id="vault-remember-pass" type="checkbox" />' +
+    '  <span>记住（本页会话）</span>' +
+    '</label>';
   const passInput = passWrap.querySelector('#vault-passphrase');
   if (passInput){ passInput.value = VAULT_PASSPHRASE_CACHE || ''; }
-  bodyEl.appendChild(passWrap);
 
-  // Save
+  container.appendChild(passWrap);
+  bodyEl.appendChild(container);
+
   dialog.querySelector('#vault-save').addEventListener('click', async ()=>{
     try {
-      const rows = Array.from(list.querySelectorAll('.vault-row'));
-      const set = {}; const unset = [];
-      for (const r of rows){
+      const globalListEl = dialog.querySelector('#vault-list-global');
+      const agentListEl = dialog.querySelector('#vault-list-agent');
+      const globalRows = globalListEl ? Array.from(globalListEl.querySelectorAll('.vault-row')) : [];
+      const agentRows = agentListEl ? Array.from(agentListEl.querySelectorAll('.vault-row')) : [];
+      const allRows = globalRows.concat(agentRows);
+
+      const setGlobal = {}; const unsetGlobal = [];
+      const setAgent = {}; const unsetAgent = [];
+      const clearAll = new Set();
+
+      for (const r of allRows){
         const name = String(r.dataset.varName || '').trim(); if (!name) continue;
-        const clear = r.querySelector('input[type=checkbox]');
-        const val = r.querySelector('input[type=password]');
-        if (clear && clear.checked){ unset.push(name); continue; }
-        const v = String((val && val.value) || '');
-        if (v) set[name] = v;
+        const clear = r.querySelector('input[type=checkbox][data-kind=clear]');
+        if (clear && clear.checked){
+          clearAll.add(name);
+        }
       }
-      const payload = { set, unset };
+
+      for (const name of clearAll){
+        unsetGlobal.push(name);
+        unsetAgent.push(name);
+      }
+
+      for (const r of globalRows){
+        const name = String(r.dataset.varName || '').trim(); if (!name) continue;
+        if (clearAll.has(name)) continue;
+        const val = r.querySelector('input[type=password]');
+        const v = String((val && val.value) || '');
+        if (!v) continue;
+        setGlobal[name] = v;
+      }
+
+      for (const r of agentRows){
+        const name = String(r.dataset.varName || '').trim(); if (!name) continue;
+        if (clearAll.has(name)) continue;
+        const val = r.querySelector('input[type=password]');
+        const v = String((val && val.value) || '');
+        if (!v) continue;
+        setAgent[name] = v;
+      }
+
       const passEl = dialog.querySelector('#vault-passphrase');
       const rememberEl = dialog.querySelector('#vault-remember-pass');
       const pass = String((passEl && passEl.value) || '');
-      if (pass){ payload.passphrase = pass; }
       if (rememberEl && rememberEl.checked){
         VAULT_PASSPHRASE_CACHE = pass;
       } else {
         VAULT_PASSPHRASE_CACHE = '';
       }
-      const resp = await fetch('/api/env', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify(payload) });
-      if (!resp.ok){
-        if (resp.status === 423){ appendLog('[vault] 已加密且锁定：请输入口令再保存/解锁'); return; }
-        if (resp.status === 403){ appendLog('[vault] 口令不正确'); return; }
-        appendLog('[vault] 保存失败'); return;
+      const inheritEl = dialog.querySelector('#vault-inherit-global');
+      const inheritGlobal = inheritEl ? !!inheritEl.checked : true;
+
+      if (Object.keys(setGlobal).length || unsetGlobal.length){
+        const payloadGlobal = { scope:'global', set:setGlobal, unset:unsetGlobal };
+        if (pass) payloadGlobal.passphrase = pass;
+        const okGlobal = await postVaultEnv(payloadGlobal);
+        if (!okGlobal) return;
       }
-      const j = await resp.json();
-      if (!j || j.ok !== true){ appendLog('[vault] 保存失败'); return; }
+
+      if (!legacyMode){
+        const payloadAgent = { scope:'agent', agentId, set:setAgent, unset:unsetAgent, inheritGlobal };
+        if (pass) payloadAgent.passphrase = pass;
+        const okAgent = await postVaultEnv(payloadAgent);
+        if (!okAgent) return;
+      }
+
       appendLog('[vault] 已保存');
       close();
     } catch { appendLog('[vault] 保存失败'); }
