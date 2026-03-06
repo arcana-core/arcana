@@ -7,9 +7,18 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <div class="mac-window">
+    <div class="mac-titlebar">
+      <div class="mac-traffic-lights" aria-hidden="true">
+        <span class="mac-light mac-light-close"></span>
+        <span class="mac-light mac-light-minimize"></span>
+        <span class="mac-light mac-light-fullscreen"></span>
+      </div>
+      <div class="mac-title">Arcana</div>
+    </div>
     <!-- Layout: left agents/sessions/chat, right tabbed display -->
-  <div class="layout" style="display:flex;height:100vh;">
-    <div class="left" style="flex:0 0 42%;min-width:360px;max-width:640px;border-right:1px solid #e7e7e7;background:#f5f5f5;display:flex;position:relative;">
+    <div class="layout">
+      <div class="left" style="flex:0 0 42%;min-width:360px;max-width:640px;border-right:1px solid #e7e7e7;background:#f5f5f5;display:flex;position:relative;">
       <div class="sidebar-group">
         <div id="agents-panel" class="agents-panel">
           <div class="agents-header">Agents</div>
@@ -45,53 +54,108 @@
         <div style="color:#a00;font-size:12px;margin-top:6px;">高风险：仅在受信环境、确有需要时临时开启。关闭后恢复受限模式。</div>
         <hr style="margin:10px 0;border:none;border-top:1px dashed #eee;" />
         <div style="font-weight:600;margin-bottom:6px;">设置 / 诊断</div>
-        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;">
+
+        <div style="font-size:12px;color:#666;margin-bottom:4px;">全局默认配置</div>
+        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
           <div>Provider</div>
-          <input id="cfg-provider" placeholder="openai|anthropic|google|openrouter|xai" />
+          <input id="cfg-provider-global" placeholder="openai|anthropic|google|openrouter|xai" />
           <div>Model</div>
-          <input id="cfg-model" placeholder="provider:model-id 或仅 model-id" />
+          <input id="cfg-model-global" placeholder="provider:model-id 或仅 model-id" />
           <div>Base URL</div>
-          <input id="cfg-base-url" placeholder="可选，自定义网关" />
+          <input id="cfg-base-url-global" placeholder="可选，自定义网关" />
           <div>API Key</div>
           <div style="display:flex;gap:8px;align-items:center;">
-            <input id="cfg-key" type="password" placeholder="仅用于更新，不会回显" />
-            <span id="cfg-key-set" style="font-size:12px;color:#666;">未设置</span>
+            <input id="cfg-key-global" type="password" placeholder="仅用于更新，不会回显" />
+            <span id="cfg-key-set-global" style="font-size:12px;color:#666;">未设置</span>
           </div>
         </div>
+
+        <div style="font-size:12px;color:#666;margin-bottom:4px;">当前 Agent 覆盖</div>
+        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
+          <div>Provider</div>
+          <input id="cfg-provider-agent" placeholder="留空则使用全局默认" />
+          <div>Model</div>
+          <input id="cfg-model-agent" placeholder="留空则使用全局默认" />
+          <div>Base URL</div>
+          <input id="cfg-base-url-agent" placeholder="留空则使用全局默认" />
+          <div>API Key</div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input id="cfg-key-agent" type="password" placeholder="仅用于更新，不会回显" />
+            <span id="cfg-key-set-agent" style="font-size:12px;color:#666;">未设置</span>
+          </div>
+        </div>
+
+        <div style="font-size:12px;color:#666;margin-bottom:4px;">定时器设置（按 Agent 生效）</div>
+        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;">
+          <div>Timer tokens</div>
+          <input id="timer-threshold-tokens" placeholder="默认 200000，总 token 阈值" />
+          <div>Timer bytes</div>
+          <input id="timer-fallback-bytes" placeholder="默认 600000，回退字节阈值" />
+        </div>
+
         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center;">
-          <button id="cfg-save">保存设置</button>
+          <button id="cfg-save-global">保存全局</button>
+          <button id="cfg-save-agent">保存 Agent</button>
+          <button id="cfg-clear-agent">清除 Agent 覆盖</button>
           <button id="cfg-run-doctor">运行诊断</button>
           <button id="cfg-support-bundle">导出支持包</button>
           <button id="cfg-vault" title="在运行时设置/清除允许的环境变量">密码箱</button>
+          <button id="timer-save" title="保存定时器会话压缩阈值">保存定时器</button>
           <span id="support-link" style="margin-left:auto;font-size:12px;"></span>
         </div>
       </div>
-  </div>
+      </div>
     </div>
     <div class="right" style="flex:1;display:flex;flex-direction:column;min-width:0;background:#fff;">
       <div class="display" style="display:flex;flex-direction:column;flex:1;min-height:0;">
         <div class="tabs-bar" id="tabs-bar" style="display:flex;gap:4px;padding:8px;background:#fafafa;border-bottom:1px solid #e7e7e7;position:sticky;top:0;z-index:2;flex-wrap:wrap;">
           <button class="tab active" data-tab="main">主Agent</button>
           <button class="tab" data-tab="tools">工具</button>
+          <button class="tab" data-tab="details">详情</button>
           <button class="tab" data-tab="subagents">子Agent</button>
         </div>
-        <div class="tabs-views" id="tabs-views" style="flex:1;overflow:auto;background:#fff;">
-          <section id="logs-main" class="logs"></section>
-          <section id="logs-tools" class="logs" style="display:none"></section>
-          <section id="logs-subagents" class="logs" style="display:none"></section>
-        </div>
-        <!-- Live Info panel under logs -->
-        <div id="live-info" class="live-info" style="border-top:1px solid #e7e7e7;padding:8px 10px;background:#fafafa;display:grid;grid-template-columns: 1fr;gap:6px 12px;">
-          <div class="li-item"><span class="li-label">模型</span><span id="li-model" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">工作区</span><span id="li-workspace" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">可见工具</span><span id="li-tools" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">本轮使用</span><span id="li-tools-used" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">技能</span><span id="li-skills" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">会话token</span><span id="li-session-tokens" class="li-value">—</span></div>
-          <div class="li-item"><span class="li-label">上下文长度</span><span id="li-context" class="li-value">—</span></div>
-        </div>
+	        <div class="tabs-views" id="tabs-views" style="flex:1;overflow:auto;background:#fff;">
+	          <section id="logs-main" class="logs">
+	            <div class="logs-main">
+	              <section class="main-live-info live-info">
+	                <div class="li-item"><span class="li-label">模型</span><span id="li-model" class="li-value">—</span></div>
+	                <div class="li-item"><span class="li-label">工作区</span><span id="li-workspace" class="li-value">—</span></div>
+	                <div class="li-item"><span class="li-label">可见工具</span><span id="li-tools" class="li-value">—</span></div>
+	                <div class="li-item"><span class="li-label">本轮使用</span><span id="li-tools-used" class="li-value">—</span></div>
+	                <div class="li-item"><span class="li-label">技能</span><span id="li-skills" class="li-value">—</span></div>
+	                <div class="li-item"><span class="li-label">会话token</span><span id="li-session-tokens" class="li-value">—</span></div>
+	              </section>
+	              <section class="main-system">
+	                <div class="main-system-header">系统信息</div>
+	                <div id="logs-main-sys" class="main-system-logs"></div>
+	              </section>
+	            </div>
+	          </section>
+	          <section id="logs-tools" class="logs logs-tools" style="display:none">
+	            <div class="tools-actions">
+	              <div class="tools-actions-header">Actions</div>
+	              <div id="tools-actions-list" class="tools-actions-list"></div>
+	            </div>
+	          </section>
+	          <section id="logs-details" class="logs logs-details" style="display:none">
+	            <div class="tools-details">
+	              <div class="tools-details-header">
+	                <div id="tools-details-title" class="tools-details-title">No action selected</div>
+	                <div id="tools-details-meta" class="tools-details-meta"></div>
+	                <button id="toggle-tool-stream" type="button">实时工具输出: 关</button>
+	              </div>
+	              <details class="tools-details-args-wrap" open>
+	                <summary>参数</summary>
+	                <pre id="tools-details-args" class="tools-details-args"></pre>
+	              </details>
+	              <pre id="tools-details-body" class="tools-details-body">When tools run, their live output will appear here.</pre>
+	            </div>
+	          </section>
+	          <section id="logs-subagents" class="logs" style="display:none"></section>
+	        </div>
       </div>
     </div>
+  </div>
   </div>
   <!-- Live2D 已暂时下线：保留占位但不加载/渲染 -->
   <!-- <div id='live2d-stage' aria-hidden='true'></div> -->

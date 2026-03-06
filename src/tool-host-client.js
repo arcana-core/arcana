@@ -4,6 +4,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
+import { registerToolHostPid, unregisterToolHostPid } from './tool-host-registry.js';
 
 function here(){ return dirname(fileURLToPath(new URL(import.meta.url))); }
 const HOST_PATH = join(here(), 'tool-host.js');
@@ -39,6 +40,7 @@ export class ToolHostClient {
     // New child becomes the current one; reset kill flag for this generation.
     this.child = child;
     this.killReason = null;
+    try { registerToolHostPid(this.cwd, child.pid, process.pid); } catch {}
     child.on('exit', (code, sig)=>{
       // Ignore exit events from an older child after a new one has spawned.
       if (this.child !== child) return;
@@ -56,6 +58,7 @@ export class ToolHostClient {
         try { this.active.reject?.(err); } catch {}
         this.active = null;
       }
+      try { unregisterToolHostPid(this.cwd, child.pid); } catch {}
       this.child = null; this.buffer = '';
       this.killReason = null;
     });
@@ -172,6 +175,7 @@ export class ToolHostClient {
   _killHost(reason){
     const child = this.child;
     if (!child) return;
+    try { unregisterToolHostPid(this.cwd, child.pid); } catch {}
     this.killReason = reason || null;
     // We proactively reject and clear any pending requests here because we
     // drop this.child before the OS delivers the 'exit' event. Our exit

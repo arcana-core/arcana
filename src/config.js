@@ -26,6 +26,20 @@ export function loadArcanaConfig() {
   return null;
 }
 
+export function loadAgentConfig(agentHomeRoot) {
+  try {
+    const base = String(agentHomeRoot || '').trim();
+    if (!base) return null;
+    const p = join(base, 'config.json');
+    if (!existsSync(p)) return null;
+    const raw = readFileSync(p, 'utf-8');
+    const cfg = JSON.parse(raw);
+    return { path: p, ...cfg };
+  } catch {
+    return null;
+  }
+}
+
 export function applyProviderEnv(cfg) {
   if (!cfg) return;
   const provider = (cfg.provider || "openai").toLowerCase();

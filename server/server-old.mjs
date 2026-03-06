@@ -1,18 +1,18 @@
 import http from 'node:http';
-import { readFile, writeFile, chmod, unlink } from 'node:fs/promises';
+import { readFile, writeFile, chmod } from 'node:fs/promises';
 import { existsSync, statSync, realpathSync, readFileSync, readdirSync, mkdirSync, writeFileSync, copyFileSync, appendFileSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 
 import { createHash, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
-import { createArcanaSession, runWithAgentEnvOverlay } from '../src/session.js';
+import { createArcanaSession } from '../src/session.js';
 import { eventBus, runWithContext } from '../src/event-bus.js';
 import { parseFrontmatter, parseSkillBlock } from '@mariozechner/pi-coding-agent';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed, resetWorkspaceRootCache } from '../src/workspace-guard.js';
 import { runDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
-import { loadArcanaConfig, loadAgentConfig } from '../src/config.js';
+import { loadArcanaConfig } from '../src/config.js';
 import { loadArcanaSkills } from '../src/skills.js';
 import {
   createSession as ssCreate,
@@ -25,7 +25,6 @@ import {
 } from '../src/sessions-store.js';
 import { buildSopExtractionPrompt } from '../src/memory-reflection.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
-import { loadTimerSettings as timerLoadSettings, saveTimerSettings as timerSaveSettings } from '../src/timer/store.js';
 // Tier1 memory triggers (direct daily append)
 
 
@@ -55,118 +54,6 @@ function envFlagDefaultTrue(name){
   } catch { return true; }
 }
 const SOP_EXTRACTION_ENABLED = envFlagDefaultTrue('ARCANA_SOP_EXTRACTION');
-
-function mergeAgentConfig(globalCfg, agentCfg){
-  const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
-  const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
-  if (agent){
-    for (const [k, vRaw] of Object.entries(agent)){
-      if (k === 'path') continue;
-      const v = vRaw;
-      if (v == null) continue;
-      if (typeof v === 'string'){
-        if (v.trim() === '') continue;
-      }
-      base[k] = v;
-    }
-    if (agent.path) base.path = agent.path;
-  }
-  return base;
-}
-
-class AsyncMutex{
-  constructor(){
-    this._locked = false;
-    this._waiters = [];
-  }
-  async acquire(){
-    if (!this._locked){
-      this._locked = true;
-      return;
-    }
-    await new Promise((resolve) => { this._waiters.push(resolve); });
-  }
-  release(){
-    if (this._waiters.length){
-      const next = this._waiters.shift();
-      try { next(); } catch {}
-    } else {
-      this._locked = false;
-    }
-  }
-  async runExclusive(fn){
-    await this.acquire();
-    try { return await fn(); }
-    finally { this.release(); }
-  }
-}
-
-const providerEnvMutex = new AsyncMutex();
-const PROVIDER_ENV_KEYS = [
-  'OPENAI_API_KEY','OPENAI_BASE_URL','OPENAI_API_BASE',
-  'OPENROUTER_API_KEY','OPENROUTER_BASE_URL',
-  'XAI_API_KEY',
-  'ANTHROPIC_API_KEY',
-  'GOOGLE_API_KEY','GOOGLE_API_BASE',
-  'ARCANA_GENERIC_API_KEY','ARCANA_GENERIC_BASE_URL',
-];
-
-function overlayProviderEnv(cfg){
-  if (!cfg) return;
-  const provider = (cfg.provider || 'openai').toLowerCase();
-  const key = cfg.key && String(cfg.key).trim();
-  const base = cfg.base_url && String(cfg.base_url).trim();
-
-  if (provider === 'openai'){
-    if (key) process.env.OPENAI_API_KEY = key;
-    if (base){
-      process.env.OPENAI_BASE_URL = base;
-      process.env.OPENAI_API_BASE = base;
-    }
-  } else if (provider === 'openrouter'){
-    if (key) process.env.OPENROUTER_API_KEY = key;
-    if (base) process.env.OPENROUTER_BASE_URL = base;
-  } else if (provider === 'xai'){
-    if (key) process.env.XAI_API_KEY = key;
-  } else if (provider === 'anthropic'){
-    if (key) process.env.ANTHROPIC_API_KEY = key;
-  } else if (provider === 'google'){
-    if (key) process.env.GOOGLE_API_KEY = key;
-    if (base) process.env.GOOGLE_API_BASE = base;
-  } else {
-    if (key) process.env.ARCANA_GENERIC_API_KEY = key;
-    if (base) process.env.ARCANA_GENERIC_BASE_URL = base;
-  }
-}
-
-async function runWithProviderAndAgentEnv(agentHomeDir, fn){
-  const baseCfg = loadArcanaConfig();
-  let agentCfg = null;
-  try { agentCfg = agentHomeDir ? loadAgentConfig(agentHomeDir) : null; } catch { agentCfg = null; }
-  const cfg = mergeAgentConfig(baseCfg, agentCfg);
-
-  return providerEnvMutex.runExclusive(async () => {
-    const previous = new Map();
-    try {
-      for (const name of PROVIDER_ENV_KEYS){
-        if (!name) continue;
-        const has = Object.prototype.hasOwnProperty.call(process.env, name);
-        previous.set(name, has ? process.env[name] : undefined);
-      }
-      overlayProviderEnv(cfg);
-      return await runWithAgentEnvOverlay(agentHomeDir, fn);
-    } finally {
-      for (const [name, value] of previous.entries()){
-        if (!name) continue;
-        if (value === undefined) {
-          try { delete process.env[name]; } catch {}
-        } else {
-          process.env[name] = value;
-        }
-      }
-    }
-  });
-}
 
 function expandHomeDirPath(input){
   if (!input) return input;
@@ -497,234 +384,6 @@ const toolRepeatById = new Map(); // sessionId -> Map(key -> count)
 const thinkStatsById = new Map(); // sessionId -> { startedAt, chars }
 
 const sessionUsageTotalsById = new Map(); // sessionId -> totalTokens
-const sessionTokensPendingByKey = new Map(); // key(agentId|sessionId) -> tokens
-const sessionTokensPersistTimers = new Map(); // key -> timeout id
-const SESSION_TOKENS_PERSIST_DEBOUNCE_MS = 500;
-function keyForSession(agentId, sessionId){
-  try {
-    const sid = String(sessionId || 'default');
-    const aid = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-    return aid + '|' + sid;
-  } catch { return String(sessionId || 'default'); }
-}
-function schedulePersistSessionTokens({ agentId, sessionId, tokens }){
-  try {
-    const sid = String(sessionId || '').trim();
-    if (!sid) return;
-    const tNum = Number(tokens);
-    if (!Number.isFinite(tNum) || tNum < 0) return;
-    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-    const key = keyForSession(effectiveAgentId, sid);
-    sessionTokensPendingByKey.set(key, tNum);
-    const existing = sessionTokensPersistTimers.get(key);
-    if (existing){ try { clearTimeout(existing); } catch {} }
-    const handle = setTimeout(()=>{
-      try {
-        sessionTokensPersistTimers.delete(key);
-        const latest = sessionTokensPendingByKey.get(key);
-        sessionTokensPendingByKey.delete(key);
-        const latestNum = Number(latest);
-        if (!Number.isFinite(latestNum) || latestNum < 0) return;
-        const obj = ssLoad(sid, { agentId: effectiveAgentId }) || null;
-        if (!obj || typeof obj !== 'object') return;
-        obj.sessionTokens = latestNum;
-        try { ssSave(obj, { agentId: effectiveAgentId }); } catch {}
-      } catch {}
-    }, SESSION_TOKENS_PERSIST_DEBOUNCE_MS);
-    try { if (handle && typeof handle.unref === 'function') handle.unref(); } catch {}
-    sessionTokensPersistTimers.set(key, handle);
-  } catch {}
-}
-function initSessionUsageFromStore({ agentId, sessionId }){
-  try {
-    const sid = String(sessionId || '').trim();
-    if (!sid) return;
-    const sidKey = String(sessionId || 'default');
-    if (sessionUsageTotalsById.has(sidKey)) return;
-    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-    const obj = ssLoad(sid, { agentId: effectiveAgentId }) || null;
-    if (!obj || typeof obj !== 'object') return;
-    const raw = obj.sessionTokens;
-    const num = Number(raw);
-    if (!Number.isFinite(num) || num < 0) return;
-    sessionUsageTotalsById.set(sidKey, num);
-  } catch {}
-}
-// Context overflow detection (similar to pi-ai patterns)
-const CONTEXT_OVERFLOW_PATTERNS = [
-  /prompt is too long/i,
-  /input is too long for requested model/i,
-  /exceeds the context window/i,
-  /input token count.*exceeds the maximum/i,
-  /maximum prompt length is \d+/i,
-  /reduce the length of the messages/i,
-  /maximum context length is \d+ tokens/i,
-  /exceeds the limit of \d+/i,
-  /exceeds the available context size/i,
-  /greater than the context length/i,
-  /context window exceeds limit/i,
-  /exceeded model token limit/i,
-  /context[_ ]length[_ ]exceeded/i,
-  /too many tokens/i,
-  /token limit exceeded/i,
-  /^4(00|13)\s*(status code)?\s*\(no body\)/i,
-];
-
-function isContextOverflowErrorMessage(msg){
-  try {
-    const s = String(msg || '').trim();
-    if (!s) return false;
-    for (const p of CONTEXT_OVERFLOW_PATTERNS){
-      if (p.test(s)) return true;
-    }
-    return false;
-  } catch { return false; }
-}
-
-// History compaction state (per workspace + agent)
-const historyCompressionSessionsByKey = new Map(); // key: agentId|ws -> session
-const HISTORY_COMPACT_KEEP_RECENT_MESSAGES = 40;
-const HISTORY_COMPACT_SUMMARY_CHAR_BUDGET = 20000;
-
-async function ensureHistoryCompressionSession(ws, agentId, agentHomeDir){
-  try {
-    const w = String(ws || workspaceRoot || '');
-    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-    const key = effectiveAgentId + '|' + w;
-    if (historyCompressionSessionsByKey.has(key)) return historyCompressionSessionsByKey.get(key);
-    const created = await createArcanaSession({ workspaceRoot: w, agentHomeRoot: agentHomeDir, execPolicy: 'restricted' });
-    const sess = created.session;
-    try { sess.setActiveToolsByName?.([]); } catch {}
-    historyCompressionSessionsByKey.set(key, sess);
-    return sess;
-  } catch { return null; }
-}
-
-async function summarizeOlderMessagesForCompaction({ ws, agentId, agentHomeDir, sessionId, olderMessages }){
-  try {
-    const w = String(ws || workspaceRoot || '');
-    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-    let finalSummaryText = '';
-    await runWithContext({ sessionId, agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: w }, async () => {
-      const sess = await ensureHistoryCompressionSession(w, effectiveAgentId, agentHomeDir);
-      if (!sess) return;
-      const allMessages = Array.isArray(olderMessages) ? olderMessages : [];
-      if (!allMessages.length) return;
-
-      const maxSegmentChars = HISTORY_COMPACT_SUMMARY_CHAR_BUDGET > 0 ? HISTORY_COMPACT_SUMMARY_CHAR_BUDGET : 20000;
-      const segments = [];
-      let currentSegment = [];
-      for (const m of allMessages){
-        const tentative = currentSegment.concat(m);
-        let text = '';
-        try {
-          const obj = { messages: tentative };
-          text = ssPrelude(obj) || '';
-        } catch {
-          text = '';
-        }
-        if (text && text.length > maxSegmentChars && currentSegment.length){
-          segments.push(currentSegment);
-          currentSegment = [m];
-        } else {
-          currentSegment = tentative;
-        }
-      }
-      if (currentSegment.length) segments.push(currentSegment);
-      if (!segments.length) return;
-
-      const segmentSummaries = [];
-      let latestSummaryText = '';
-      const unsub = sess.subscribe((ev) => {
-        try {
-          if (ev && ev.type === 'message_end' && ev.message && ev.message.role === 'assistant'){
-            const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-            const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-            if (text) latestSummaryText = text;
-          }
-        } catch {}
-      });
-
-      try {
-        for (const segment of segments){
-          try { await sess.newSession?.(); } catch {}
-          const historyObj = { messages: segment };
-          const historyText = ssPrelude(historyObj) || '';
-          if (!historyText) continue;
-          let prompt = 'You are compressing earlier chat messages to save tokens.\n';
-          prompt += 'Produce a concise summary capturing important context, decisions, and facts.\n';
-          prompt += 'Do not include instructions for the assistant, only what happened.\n';
-          prompt += 'Write the summary as plain text paragraphs.\n\n';
-          prompt += 'Messages to summarize:\n';
-          prompt += historyText + '\n\n';
-          try { await runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(prompt)); } catch {}
-          const segSummary = String(latestSummaryText || '').trim();
-          if (segSummary) segmentSummaries.push(segSummary);
-          latestSummaryText = '';
-        }
-
-        if (!segmentSummaries.length) return;
-
-        if (segmentSummaries.length === 1){
-          finalSummaryText = segmentSummaries[0];
-        } else {
-          try { await sess.newSession?.(); } catch {}
-          let mergePrompt = 'You are compressing earlier chat messages to save tokens.\n';
-          mergePrompt += 'You will be given summaries of several segments of a longer conversation.\n';
-          mergePrompt += 'Merge them into a single concise summary capturing important context, decisions, and facts.\n';
-          mergePrompt += 'Do not include instructions for the assistant, only what happened.\n';
-          mergePrompt += 'Write the summary as plain text paragraphs.\n\n';
-          mergePrompt += 'Segment summaries:\n';
-          mergePrompt += segmentSummaries.map((s, idx) => 'Segment ' + String(idx + 1) + ':\n' + s + '\n').join('\n');
-          try { await runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(mergePrompt)); } catch {}
-          const mergedSummary = String(latestSummaryText || '').trim();
-          finalSummaryText = mergedSummary || segmentSummaries.join('\n\n');
-        }
-      } finally {
-        try { unsub && unsub(); } catch {}
-      }
-    });
-    const final = String(finalSummaryText || '').trim();
-    return final;
-  } catch {
-    return '';
-  }
-}
-
-async function compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir }){
-  const sid = String(sessionId || '').trim();
-  const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-  if (!sid) return { compacted: false };
-  try {
-    let obj = ssLoad(sid, { agentId: effectiveAgentId });
-    const msgs = (obj && Array.isArray(obj.messages)) ? obj.messages : [];
-    if (!msgs.length) return { compacted: false };
-    const keep = HISTORY_COMPACT_KEEP_RECENT_MESSAGES > 0 ? HISTORY_COMPACT_KEEP_RECENT_MESSAGES : 40;
-    if (msgs.length <= keep) return { compacted: false };
-    const splitIndex = msgs.length - keep;
-    const older = msgs.slice(0, splitIndex);
-    const recent = msgs.slice(splitIndex);
-    try { broadcast({ type: 'history_compact_start', sessionId: sid, agentId: effectiveAgentId, keepRecentMessages: keep }); } catch {}
-    const summary = await summarizeOlderMessagesForCompaction({ ws, agentId: effectiveAgentId, agentHomeDir, sessionId: sid, olderMessages: older });
-    const text = String(summary || '').trim();
-    if (!text) {
-      try { broadcast({ type: 'history_compact_end', sessionId: sid, agentId: effectiveAgentId, keepRecentMessages: keep, compacted: false }); } catch {}
-      return { compacted: false };
-    }
-    const summaryMessage = { role: 'assistant', text: '[Conversation Summary] ' + text, ts: nowIso() };
-    obj = ssLoad(sid, { agentId: effectiveAgentId }) || obj || { id: sid, agentId: effectiveAgentId, messages: [] };
-    const curMsgs = Array.isArray(obj.messages) ? obj.messages : [];
-    const nextMsgs = [summaryMessage, ...recent];
-    obj.messages = nextMsgs;
-    try { ssSave(obj, { agentId: effectiveAgentId }); } catch {}
-    try { broadcast({ type: 'history_compact_end', sessionId: sid, agentId: effectiveAgentId, keepRecentMessages: keep, compacted: true }); } catch {}
-    return { compacted: true };
-  } catch {
-    try { broadcast({ type: 'history_compact_end', sessionId: sid, agentId: effectiveAgentId, keepRecentMessages: HISTORY_COMPACT_KEEP_RECENT_MESSAGES, compacted: false }); } catch {}
-    return { compacted: false };
-  }
-}
-
 // Legacy global state (used by /api/chat)
 const legacyMediaRefsByTurn = new Set();
 const bridgedSessions = new WeakSet();
@@ -733,77 +392,7 @@ let thinkStats = null;
 
 // SSE clients
 const clients = new Set(); // Response objects
-const sseClientMeta = new WeakMap(); // res -> { paused, drainHooked, queue, queuedBytes, includeToolStream, toolStreamSessionId }
 let subagentHooked = false;
-
-const SSE_SKIP_RAW_TYPES = new Set([
-  'tool_execution_start',
-  'tool_execution_update',
-  'tool_execution_end',
-  'turn_start',
-  'turn_end',
-  'thinking_start',
-  'thinking_delta',
-  'thinking_end',
-]);
-
-function readIntEnv(name, fallback){
-  try {
-    const raw = process.env[name];
-    if (!raw) return fallback;
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n <= 0) return fallback;
-    return Math.floor(n);
-  } catch { return fallback; }
-}
-
-const SSE_MAX_QUEUE_EVENTS = readIntEnv('ARCANA_SSE_MAX_QUEUE_EVENTS', 500);
-const SSE_MAX_QUEUE_BYTES = readIntEnv('ARCANA_SSE_MAX_QUEUE_BYTES', 1000000);
-
-function getSseMeta(res){
-  let meta = sseClientMeta.get(res);
-  if (!meta){
-    meta = { paused: false, drainHooked: false, queue: [], queuedBytes: 0, includeToolStream: false, toolStreamSessionId: '' };
-    sseClientMeta.set(res, meta);
-  }
-  return meta;
-}
-
-function enqueueSseChunk(meta, chunk){
-  try {
-    const size = Buffer.byteLength(chunk);
-    meta.queue.push(chunk);
-    meta.queuedBytes += size;
-    while (meta.queue.length > SSE_MAX_QUEUE_EVENTS || meta.queuedBytes > SSE_MAX_QUEUE_BYTES){
-      const dropped = meta.queue.shift();
-      if (dropped != null) meta.queuedBytes -= Buffer.byteLength(dropped);
-    }
-  } catch {}
-}
-
-function hookSseDrain(res, meta){
-  if (meta.drainHooked) return;
-  meta.drainHooked = true;
-  try {
-    res.on('drain', () => {
-      const curMeta = sseClientMeta.get(res);
-      if (!curMeta) return;
-      curMeta.paused = false;
-      try {
-        while (curMeta.queue.length){
-          const chunk = curMeta.queue.shift();
-          if (chunk == null) continue;
-          curMeta.queuedBytes -= Buffer.byteLength(chunk);
-          const ok = res.write(chunk);
-          if (!ok){
-            curMeta.paused = true;
-            break;
-          }
-        }
-      } catch {}
-    });
-  } catch {}
-}
 
 // Env vault: runtime env setter + on-disk vault
 function isValidEnvName(n){
@@ -1576,7 +1165,7 @@ function scheduleSopExtraction({ ws, sessionId, agentId, toolName, safeArgs, err
               }
             } catch {}
           });
-          try { await runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(prompt)); } catch {}
+          try { await sess.prompt(prompt); } catch {}
           try { unsub && unsub(); } catch {}
           if (sopText) {
             let normalized = '';
@@ -1696,13 +1285,11 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
   const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
   const effectiveAgentHome = agentHomeDir || arcanaHomePath('agents', effectiveAgentId);
   const effectiveWorkspace = String(ws || workspaceRoot || '');
-  try { initSessionUsageFromStore({ agentId: effectiveAgentId, sessionId }); } catch {}
   const toolArgsByCallId = new Map(); // toolCallId -> args snapshot for SOP context
   sess.subscribe((ev) => {
     try {
-      const t = ev && ev.type ? String(ev.type) : '';
           // Tool repeat aggregation (per-session)
-      if (t === 'tool_execution_start') {
+      if (ev.type === 'tool_execution_start') {
         try {
           const key = ev.toolName + '|' + (function (o) {
             try { return JSON.stringify(o, Object.keys(o).sort()); } catch { try { return JSON.stringify(o); } catch { return String(o); } }
@@ -1727,22 +1314,13 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
       }
 
       // Forward updates/ends tagged with sessionId
-      if (t === 'tool_execution_update') {
+      if (ev.type === 'tool_execution_update') {
         try { broadcast({ type: 'tool_execution_update', toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {}, partialResult: ev.partialResult, sessionId }); } catch {}
       }
-      if (t === 'tool_execution_end') {
+      if (ev.type === 'tool_execution_end') {
         try { broadcast({ type: 'tool_execution_end', toolCallId: ev.toolCallId, toolName: ev.toolName, result: ev.result, isError: ev.isError, error: ev.error, sessionId }); } catch {}
         // Best-effort SOP extraction on tool failures (deduped + serialized per workspace)
-        if (String(ev.toolName||'') === "codex"){
-          const sidKey = String(sessionId||"default");
-          const t = Number((ev && ev.result && ev.result.details && ev.result.details.usage && (ev.result.details.usage.totalTokens || ev.result.details.usage.total_tokens)) || 0) || 0;
-          if (t>0){
-            const prevTotal = sessionUsageTotalsById.get(sidKey) || 0;
-            const nextTotal = prevTotal + t;
-            sessionUsageTotalsById.set(sidKey, nextTotal);
-            try { schedulePersistSessionTokens({ agentId: effectiveAgentId, sessionId, tokens: nextTotal }); } catch {}
-          }
-        }
+        if (String(ev.toolName||'') === "codex"){ const sidKey=String(sessionId||"default"); const t=Number((ev && ev.result && ev.result.details && ev.result.details.usage && (ev.result.details.usage.totalTokens || ev.result.details.usage.total_tokens)) || 0) || 0; if (t>0){ sessionUsageTotalsById.set(sidKey, (sessionUsageTotalsById.get(sidKey)||0)+t); } }
         try {
           const isErr = !!(ev?.isError || ev?.error || (ev?.result && ((ev.result.details && ev.result.details.ok===false) || ev.result.error)));
           if (isErr) {
@@ -1797,21 +1375,21 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
       }
 
       // Turn lifecycle
-      if (t === 'turn_start') {
+      if (ev.type === 'turn_start') {
         try { mediaRefsByTurn.delete(String(sessionId || 'default')); } catch {}
         broadcast({ type: 'turn_start', sessionId });
       }
-      if (t === 'turn_end') {
+      if (ev.type === 'turn_end') {
         try { mediaRefsByTurn.delete(String(sessionId || 'default')); } catch {}
         broadcast({ type: 'turn_end', sessionId, sessionTokens: (sessionUsageTotalsById.get(String(sessionId||'default')) || 0) });
       }
 
       // Thinking lifecycle (per-session)
-      if (t === 'thinking_start') {
+      if (ev.type === 'thinking_start') {
         thinkStatsById.set(sessionId, { startedAt: Date.now(), chars: 0 });
         broadcast({ type: 'thinking_start', sessionId });
       }
-      if (t === 'thinking_delta') {
+      if (ev.type === 'thinking_delta') {
         const st = thinkStatsById.get(sessionId);
         if (st) {
           try {
@@ -1821,7 +1399,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
           } catch {}
         }
       }
-      if (t === 'thinking_end') {
+      if (ev.type === 'thinking_end') {
         const st = thinkStatsById.get(sessionId);
         if (st) {
           const tookMs = Date.now() - st.startedAt;
@@ -1833,7 +1411,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
       }
 
       // LLM usage accounting (per assistant message_end)
-      if (ev && t === 'message_end' && ev.message && ev.message.role === 'assistant') {
+      if (ev && ev.type === 'message_end' && ev.message && ev.message.role === 'assistant') {
       // Assistant streaming (text/images)
         try {
           const u = ev && ev.message && ev.message.usage;
@@ -1849,12 +1427,11 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
             const prev = sessionUsageTotalsById.get(sidKey) || 0;
             const next = prev + (tot||0);
             sessionUsageTotalsById.set(sidKey, next);
-            try { schedulePersistSessionTokens({ agentId: effectiveAgentId, sessionId, tokens: next }); } catch {}
             try { broadcast({ type: 'llm_usage', sessionId, contextTokens: ctx, outputTokens: out, totalTokens: tot, sessionTokens: next }); } catch {}
           }
         } catch {}
       }
-      if (t === 'message_update' && ev.message && ev.message.role === 'assistant') {
+      if (ev.type === 'message_update' && ev.message && ev.message.role === 'assistant') {
         try {
           const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
           const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
@@ -1899,9 +1476,6 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
             if (url) broadcast({ type: 'assistant_image', url, mime, sessionId });
           }
         } catch {}
-      }
-      if (!SSE_SKIP_RAW_TYPES.has(t)) {
-        try { broadcast(ev); } catch {}
       }
     } catch {}
   });
@@ -1985,79 +1559,16 @@ function sseHeaders() {
     'X-Accel-Buffering': 'no',
   };
 }
-function send(res, payload) {
-  let chunk = '';
-  try {
-    chunk = 'data: ' + JSON.stringify(payload) + '\n\n';
-  } catch {
-    return;
-  }
-  const meta = getSseMeta(res);
-  if (meta.paused){
-    enqueueSseChunk(meta, chunk);
-    return;
-  }
-  let ok = true;
-  try { ok = res.write(chunk); } catch { ok = false; }
-  if (!ok){
-    meta.paused = true;
-    hookSseDrain(res, meta);
-    enqueueSseChunk(meta, chunk);
-  }
-}
-
-function isToolStreamChunk(ev){
-  try {
-    if (!ev || ev.type !== 'tool_execution_update') return false;
-    const raw = (typeof ev.partialResult !== 'undefined') ? ev.partialResult : ev.update;
-    if (!raw || typeof raw !== 'object') return false;
-    const stream = String(raw.stream || '').toLowerCase();
-    if (stream !== 'stdout' && stream !== 'stderr') return false;
-    const chunkVal = raw.chunk;
-    if (typeof chunkVal !== 'string') return false;
-    return true;
-  } catch { return false; }
-}
-
-function broadcast(ev) {
-  for (const res of clients){
-    const meta = getSseMeta(res);
-    if (isToolStreamChunk(ev)){
-      if (!meta.includeToolStream) continue;
-      const sidFilter = String(meta.toolStreamSessionId || '').trim();
-      if (sidFilter){
-        const evSid = ev && ev.sessionId ? String(ev.sessionId || '') : '';
-        if (!evSid || evSid !== sidFilter) continue;
-      }
-    }
-    send(res, ev);
-  }
-}
+function send(res, payload) { try { res.write('data: ' + JSON.stringify(payload) + '\n\n'); } catch {} }
+function broadcast(ev) { for (const res of clients) send(res, ev); }
 
 async function handleEvents(req, res) {
   await ensurePolicySession('restricted');
-  let includeToolStream = false;
-  let toolStreamSessionId = '';
-  try {
-    const url = new URL(req.url, 'http://localhost');
-    const v = (url.searchParams.get('toolStream') || '').toLowerCase();
-    if (v === '1' || v === 'true'){
-      includeToolStream = true;
-    }
-    const sid = String(url.searchParams.get('toolStreamSessionId') || '').trim();
-    if (sid) toolStreamSessionId = sid;
-  } catch {}
-  const meta = getSseMeta(res);
-  meta.includeToolStream = includeToolStream;
-  meta.toolStreamSessionId = toolStreamSessionId;
   res.writeHead(200, sseHeaders());
   clients.add(res);
   const modelLabel = model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '<auto>';
   send(res, { type: 'server_info', model: modelLabel, tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
-  req.on('close', () => {
-    try { clients.delete(res); } catch {}
-    try { sseClientMeta.delete(res); } catch {}
-  });
+  req.on('close', () => { try { clients.delete(res); } catch {} });
 }
 
 // Legacy single-session endpoint
@@ -2100,7 +1611,7 @@ async function handleChat(req, res) {
         } catch {}
       }
     });
-    try { await runWithProviderAndAgentEnv(arcanaHomePath('agents', DEFAULT_AGENT_ID), () => sess.prompt(message)); } catch {}
+    try { await sess.prompt(message); } catch {}
     try { unsub && unsub(); } catch {}
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: out }));
   } catch (e) {
@@ -2187,18 +1698,16 @@ async function handleChat2(req, res) {
       }
     } catch {}
 
-    // Build context prelude from existing session state before the current user message
-    const historyObj = obj0 || ssLoad(sessionId, { agentId });
-    if (historyObj) {
-      let changed = false;
-      if (agentId && !historyObj.agentId) { historyObj.agentId = agentId; changed = true; }
-      if (changed) { try { ssSave(historyObj, { agentId }); } catch {} }
-    }
-    const prelude = ssPrelude(historyObj);
-
-    // Persist user message after prelude so it is not duplicated in the prompt
+    // Persist user message and build context prelude
     ssAppend(sessionId, { role: 'user', text: message, agentId });
-    let payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
+    const obj = ssLoad(sessionId, { agentId });
+    if (obj) {
+      let changed = false;
+      if (agentId && !obj.agentId) { obj.agentId = agentId; changed = true; }
+      if (changed) { try { ssSave(obj, { agentId }); } catch {} }
+    }
+    const prelude = ssPrelude(obj);
+    const payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
     let out = '';
     let lastAssistantText = '';
     let persistedCount = 0;
@@ -2232,40 +1741,10 @@ async function handleChat2(req, res) {
     if (sess && sess.isStreaming) {
       try {
         await runWithContext(ctxBase, () =>
-          runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true }))
+          sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
         );
         try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
-      } catch (e) {
-        let msg = '';
-        try { msg = String(e && (e.message || e)) || ''; } catch { msg = ''; }
-        if (msg && isContextOverflowErrorMessage(msg)) {
-          try {
-            await compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir });
-            const updated = ssLoad(sessionId, { agentId });
-            let preludeAfter = '';
-            if (updated && Array.isArray(updated.messages) && updated.messages.length){
-              const msgsAfter = updated.messages;
-              const last = msgsAfter[msgsAfter.length - 1];
-              let historyAfter = updated;
-              if (last && last.role === 'user') {
-                historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
-              }
-              preludeAfter = ssPrelude(historyAfter);
-            }
-            const retryPayload = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
-            try {
-              await runWithContext(ctxBase, () =>
-                runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(retryPayload, { streamingBehavior: 'steer', expandPromptTemplates: true }))
-              );
-              try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
-            } catch {
-              // best-effort for steer overflow retry
-            }
-          } catch {
-            // ignore compaction failures for steer path
-          }
-        }
-      }
+      } catch {}
       try { unsub && unsub(); } catch {}
       // For steer, we reply immediately; front-end will continue via SSE.
       res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: '' }));
@@ -2274,47 +1753,10 @@ async function handleChat2(req, res) {
 
     // Normal path: not streaming -> start a new agent turn
     let promptError = null;
-    let attemptedCompaction = false;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      promptError = null;
-      try {
-        await runWithContext(ctxBase, () => runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(payloadMsg)));
-      } catch (e) {
-        promptError = e;
-      }
-      if (!promptError) break;
-
-      let msg = '';
-      try {
-        msg = String(promptError && (promptError.message || promptError)) || 'agent_prompt_failed';
-      } catch {
-        msg = 'agent_prompt_failed';
-      }
-
-      if (!attemptedCompaction && isContextOverflowErrorMessage(msg)) {
-        attemptedCompaction = true;
-        try {
-          await compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir });
-          const updated = ssLoad(sessionId, { agentId });
-          let preludeAfter = '';
-          if (updated && Array.isArray(updated.messages) && updated.messages.length){
-            const msgsAfter = updated.messages;
-            const last = msgsAfter[msgsAfter.length - 1];
-            let historyAfter = updated;
-            if (last && last.role === 'user') {
-              historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
-            }
-            preludeAfter = ssPrelude(historyAfter);
-          }
-          payloadMsg = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
-          continue;
-        } catch {
-          // fall through to error handling below
-        }
-      }
-
-      // Non-overflow error or compaction failed -> stop retrying
-      break;
+    try {
+      await runWithContext(ctxBase, () => sess.prompt(payloadMsg));
+    } catch (e) {
+      promptError = e;
     }
     try { unsub && unsub(); } catch {}
 
@@ -2398,20 +1840,18 @@ async function handleSteer(req, res) {
     if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
     if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
 
-    // Build prelude from existing session before appending the current user message
+    // Persist user message and build prelude like chat2 for consistency
+    ssAppend(sessionId, { role: 'user', text: message, agentId });
     const ctx = resolveSessionContext(sessionId, agentId);
     const ws = ctx.workspaceRoot || workspaceRoot;
     const prelude = ssPrelude(ctx.session);
-
-    // Persist user message after prelude so it is not duplicated
-    ssAppend(sessionId, { role: 'user', text: message, agentId });
     const payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
 
     const sess = await ensureSessionFor(sessionId, policy, ws, ctx.agentId, ctx.agentHomeDir);
     applyExecPolicyToSession(sess, policy);
     try {
       await runWithContext({ sessionId, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () =>
-        runWithProviderAndAgentEnv(ctx.agentHomeDir, () => sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true }))
+        sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
       );
       try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
     } catch {}
@@ -2482,103 +1922,6 @@ async function handleSupportBundle(req, res) {
 async function handleGetConfig(req, res) {
   try { const cfg = loadArcanaConfig(); const out = sanitizeConfig(cfg || {}); res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(out || {})); }
   catch { res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({})); }
-}
-
-async function handleGetAgentConfig(req, res) {
-  try {
-    const url = new URL(req.url, 'http://localhost');
-    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
-    const agentId = agentIdParam || DEFAULT_AGENT_ID;
-    const meta = findAgentMeta(agentId) || (agentId === DEFAULT_AGENT_ID ? ensureDefaultAgentExists() : null);
-    const baseHome = (meta && (meta.agentHomeDir || meta.agentDir)) ? (meta.agentHomeDir || meta.agentDir) : arcanaHomePath('agents', agentId);
-    const agentHomeDir = baseHome || arcanaHomePath('agents', agentId);
-    const rawCfg = loadAgentConfig(agentHomeDir);
-    const cfgPath = join(agentHomeDir, 'config.json');
-    const merged = rawCfg ? { ...rawCfg } : { path: cfgPath };
-    if (!merged.path) merged.path = cfgPath;
-    const out = sanitizeConfig(merged) || { provider: '', base_url: '', model: '', path: cfgPath, has_key: false };
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(out));
-  } catch {
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({}));
-  }
-}
-
-async function handlePostAgentConfig(req, res) {
-  try {
-    const bufs = []; for await (const chunk of req) bufs.push(chunk);
-    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    let agentId = '';
-    try {
-      if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
-        agentId = String(body.agentId || '').trim();
-      }
-    } catch {}
-    if (!agentId) agentId = DEFAULT_AGENT_ID;
-    const meta = findAgentMeta(agentId) || (agentId === DEFAULT_AGENT_ID ? ensureDefaultAgentExists() : null);
-    const baseHome = (meta && (meta.agentHomeDir || meta.agentDir)) ? (meta.agentHomeDir || meta.agentDir) : arcanaHomePath('agents', agentId);
-    const agentHomeDir = baseHome || arcanaHomePath('agents', agentId);
-    const cfgPath = join(agentHomeDir, 'config.json');
-
-    const shouldClear = !!(body && body.clear === true);
-    if (shouldClear) {
-      try {
-        if (cfgPath && existsSync(cfgPath)) await unlink(cfgPath);
-      } catch {}
-    } else {
-      const provider = String(body.provider || '').trim();
-      const modelId = String(body.model || '').trim();
-      const baseUrl = String(body.base_url || '').trim();
-      const key = String(body.key || '').trim();
-      const cfgObj = { provider, model: modelId, base_url: baseUrl };
-      if (key) cfgObj.key = key;
-      const baseDir = String(agentHomeDir || '').trim();
-      if (baseDir) {
-        try { mkdirSync(baseDir, { recursive: true }); } catch {}
-        await writeFile(cfgPath, JSON.stringify(cfgObj, null, 2), 'utf-8');
-      }
-    }
-
-    resetSessions();
-    try { broadcast({ type: 'server_info', model: '', tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames }); } catch {}
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
-  } catch (e) {
-    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_config_write_failed', message: e?.message || String(e) }));
-  }
-}
-
-async function handleGetTimerSettings(req, res) {
-  try {
-    const url = new URL(req.url, 'http://localhost');
-    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
-    const agentId = agentIdParam || DEFAULT_AGENT_ID;
-    const meta = findAgentMeta(agentId) || ensureDefaultAgentExists();
-    const ws = (meta && meta.workspaceRoot) ? meta.workspaceRoot : workspaceRoot;
-    const settings = timerLoadSettings({ agentId, workspaceRoot: ws });
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, settings }));
-  } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'timer_settings_read_failed', message: e?.message || String(e) }));
-  }
-}
-
-async function handlePostTimerSettings(req, res) {
-  try {
-    const bufs = []; for await (const chunk of req) bufs.push(chunk);
-    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    let agentId = '';
-    try {
-      if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
-        agentId = String(body.agentId || '').trim();
-      }
-    } catch {}
-    if (!agentId) agentId = DEFAULT_AGENT_ID;
-    const meta = findAgentMeta(agentId) || ensureDefaultAgentExists();
-    const ws = (meta && meta.workspaceRoot) ? meta.workspaceRoot : workspaceRoot;
-    const settingsRaw = body && body.settings && typeof body.settings === 'object' ? body.settings : {};
-    const settings = timerSaveSettings(settingsRaw, { agentId, workspaceRoot: ws });
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, settings }));
-  } catch (e) {
-    res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'timer_settings_write_failed', message: e?.message || String(e) }));
-  }
 }
 
 async function handlePostConfig(req, res) {
@@ -2764,10 +2107,6 @@ function createRequestHandler() {
     if (req.method === 'POST' && url.pathname === '/api/support-bundle') { await handleSupportBundle(req, res); return; }
     if (req.method === 'GET' && url.pathname === '/api/config') { await handleGetConfig(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/config') { await handlePostConfig(req, res); return; }
-    if (req.method === 'GET' && url.pathname === '/api/agent-config') { await handleGetAgentConfig(req, res); return; }
-    if (req.method === 'POST' && url.pathname === '/api/agent-config') { await handlePostAgentConfig(req, res); return; }
-    if (req.method === 'GET' && url.pathname === '/api/timer-settings') { await handleGetTimerSettings(req, res); return; }
-    if (req.method === 'POST' && url.pathname === '/api/timer-settings') { await handlePostTimerSettings(req, res); return; }
 
     await serveStatic(req, res);
   };

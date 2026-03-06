@@ -5,13 +5,14 @@ import { startServicesOnce } from './services/manager.js';
 // Scheme C: tool-host isolation. Use proxy tools that delegate to a
 // persistent child process which can be killed to cancel hangs.
 import { ToolHostClient } from './tool-host-client.js';
+import { sweepOrphanedToolHostsOnce } from './tool-host-registry.js';
 import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractTool, createProxyWebSearchTool } from './tools/toolhost-proxies.js';
 import createCodexSubagentTool from './tools/codex-subagent.js';
 import createNotebookTool from './tools/notebook.js';
 import createMemoryTools from './tools/memory.js';
 import createSubagentsTool from './tools/subagents.js';
 import { createTimerTool } from './tools/timer.js';
-import { loadArcanaConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
+import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname } from 'node:path';
 import { scryptSync, createDecipheriv } from 'node:crypto';
 import { resolveArcanaHome, arcanaHomePath } from './arcana-home.js';
@@ -47,6 +48,24 @@ function pickFallbackModel(provider){
 }
 
 function normalizeOpenAIBase(base){ return String(base||'').trim(); }
+
+function mergeAgentConfig(globalCfg, agentCfg){
+  const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
+  const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
+  if (agent){
+    for (const [k, vRaw] of Object.entries(agent)){
+      if (k === 'path') continue;
+      const v = vRaw;
+      if (v == null) continue;
+      if (typeof v === 'string'){
+        if (v.trim() === '') continue;
+      }
+      base[k] = v;
+    }
+    if (agent.path) base.path = agent.path;
+  }
+  return base;
+}
 
 // --- Env vault overlay (global + per-agent) ---
 
@@ -217,6 +236,7 @@ class AsyncMutex{
 }
 
 const envOverlayMutex = new AsyncMutex();
+const sweptToolHostWorkspaces = new Set();
 
 async function runWithEnvOverlay(agentHomeRoot, fn){
   const globalMeta = readGlobalVaultMeta();
@@ -273,8 +293,17 @@ function wrapToolWithEnvOverlay(tool, agentHomeRoot){
   };
 }
 
+export async function runWithAgentEnvOverlay(agentHomeRoot, fn){
+  return runWithEnvOverlay(agentHomeRoot, fn);
+}
+
 export async function createArcanaSession(opts={}){
   const workspaceRoot = opts.workspaceRoot || opts.cwd || process.cwd();
+  const sweepKey = String(workspaceRoot || '').trim();
+  if (sweepKey && !sweptToolHostWorkspaces.has(sweepKey)){
+    sweptToolHostWorkspaces.add(sweepKey);
+    try { sweepOrphanedToolHostsOnce(workspaceRoot); } catch {}
+  }
   let agentHomeRoot = opts.agentHomeRoot;
   if (!agentHomeRoot){
     try {
@@ -283,8 +312,11 @@ export async function createArcanaSession(opts={}){
       agentHomeRoot = workspaceRoot;
     }
   }
-  const cfg = loadArcanaConfig();
-  applyProviderEnv(cfg);
+  const globalCfg = loadArcanaConfig();
+  applyProviderEnv(globalCfg);
+
+  const agentCfg = loadAgentConfig(agentHomeRoot);
+  const cfg = mergeAgentConfig(globalCfg, agentCfg);
 
   let model;
   const sel = resolveModelFromConfig(cfg) || resolveModelFromEnv();

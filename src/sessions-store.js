@@ -4,7 +4,7 @@ import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
 
 // Simple JSON-backed chat session store.
-// Schema: { id, title, workspace, agentId, createdAt, updatedAt, messages: [{ role: 'user'|'assistant', text, ts }] }
+// Schema: { id, title, workspace, agentId, createdAt, updatedAt, messages: [{ role: 'user'|'assistant', text, ts }], sessionTokens?: number }
 
 const DEFAULT_AGENT_ID = 'default';
 
@@ -71,6 +71,24 @@ function sessionsDir(agentIdRaw){
 }
 
 function nowIso(){ return new Date().toISOString(); }
+
+const MAX_AUTO_TITLE_LENGTH = 32;
+
+function deriveSessionTitleFromText(text){
+  try {
+    const raw = String(text || '');
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    const firstLine = trimmed.split(/\r?\n/, 1)[0];
+    const collapsed = firstLine.replace(/\s+/g, ' ').trim();
+    if (!collapsed) return '';
+    const asArray = Array.from(collapsed);
+    if (asArray.length <= MAX_AUTO_TITLE_LENGTH) return collapsed;
+    return asArray.slice(0, MAX_AUTO_TITLE_LENGTH).join('');
+  } catch {
+    return '';
+  }
+}
 
 function slug(s){
   return String(s || '').toLowerCase().trim()
@@ -168,7 +186,18 @@ export function appendMessage(sessionId, { role, text, agentId } = {}){
   };
   obj.agentId = normalizeAgentId(obj.agentId || normAgentId);
   obj.messages = Array.isArray(obj.messages) ? obj.messages : [];
-  obj.messages.push({ role: String(role || 'user'), text: String(text || ''), ts: nowIso() });
+  const hadNoMessages = obj.messages.length === 0;
+  const roleStr = String(role || 'user');
+  const textStr = String(text || '');
+  obj.messages.push({ role: roleStr, text: textStr, ts: nowIso() });
+
+  if (hadNoMessages && String(roleStr || '').toLowerCase() === 'user'){
+    const currentTitle = String(obj.title || '').trim();
+    if (!currentTitle || currentTitle === '新会话'){
+      const autoTitle = deriveSessionTitleFromText(textStr);
+      if (autoTitle) obj.title = autoTitle;
+    }
+  }
   saveSession(obj, { agentId: obj.agentId });
   return obj;
 }

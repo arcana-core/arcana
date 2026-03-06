@@ -97,8 +97,23 @@ export function ensureWriteAllowed(p) {
 }
 
 export function normalizeAllowedPaths(paths) {
-  if (!Array.isArray(paths) || paths.length === 0) return [resolveWorkspaceRoot()];
-  return paths.map((p) => canon(resolve(resolveWorkspaceRoot(), p)));
+  const root = resolveWorkspaceRoot();
+  // Default: when no explicit list is provided, treat the workspace root
+  // as the sole allowed base (preserves existing semantics for callers
+  // that pass an empty/undefined list to mean "workspace root").
+  if (!Array.isArray(paths) || paths.length === 0) return [root];
+
+  const out = [];
+  for (const p of paths) {
+    if (!p) continue;
+    const cand = canon(resolve(root, p));
+    // Only keep candidates that remain within the workspace root to
+    // avoid accidentally granting access outside the workspace tree.
+    if (isUnder(root, cand)) out.push(cand);
+  }
+  // If nothing survived filtering (e.g., all paths were outside root),
+  // fall back to the workspace root to avoid returning an empty list.
+  return out.length ? out : [root];
 }
 
 export function ensureWithinAllowedPaths(p, allowed) {

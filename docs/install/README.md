@@ -16,20 +16,21 @@ Install (Windows PowerShell)
 Configure a provider (example: OpenAI)
 - Export OPENAI_API_KEY in your shell
 - Optional: set ARCANA_MODEL=openai:gpt-4o-mini
-- Or create arcana/arcana.config.json with provider and model fields
+- Or create arcana.config.json in the repo root (or set ARCANA_CONFIG to a custom config path) with provider and model fields
 
 Optional behavior flags
 - Enable automatic Tier1 memory triggers (tool_fail + user_issue): set ARCANA_MEMORY_TRIGGERS=true
 - SOP extraction after tool failures is enabled by default; disable with ARCANA_SOP_EXTRACTION=false
 
 Quickstart
-- Health check: node ./arcana/bin/arcana.js doctor
-- JSON report: node ./arcana/bin/arcana.js doctor --json
-- Chat: node ./arcana/bin/arcana.js chat
-- Web navigate: node ./arcana/bin/arcana.js web navigate https://example.com
-- Web extract: node ./arcana/bin/arcana.js web extract
-- Web serve UI: node ./arcana/bin/arcana.js web serve --port 5678
+- Health check: node ./bin/arcana.js doctor
+- JSON report: node ./bin/arcana.js doctor --json
+- Chat: node ./bin/arcana.js chat
+- Web navigate: node ./bin/arcana.js web navigate https://example.com
+- Web extract: node ./bin/arcana.js web extract
+- Web serve UI: node ./bin/arcana.js web serve --port 5678
 
 Notes
 - If Playwright launch fails, run npx playwright install then retry.
 - Force engine via ARCANA_PW_ENGINE=chromium|firefox|webkit.
+- Long-term memory for the default agent lives at $ARCANA_HOME/agents/default/MEMORY.md (ARCANA_HOME defaults to ~/.arcana).

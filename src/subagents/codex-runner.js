@@ -30,18 +30,129 @@ export class CodexRunner {
   spawnCollect(cmd, args, opts={}, meta={}){
     return new Promise((resolveP)=>{
       const child = spawn(cmd, args, { cwd: this.cwd, env: this.env, stdio: ["ignore","pipe","pipe"] });
+      const captureMax = (function(){
+        try {
+          const raw = process.env.ARCANA_CODEX_CAPTURE_MAX;
+          if (!raw) return 200000;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n <= 0) return 200000;
+          return Math.floor(n);
+        } catch { return 200000; }
+      })();
       let stdout = ""; let stderr = "";
-      const id = meta.id || `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-      emitEvent({ type: "subagent_start", id, agent: "codex", args });
-      child.stdout.on("data", (d)=> { const s=String(d); stdout+=s; emitEvent({ type: "subagent_stream", id, stream: "stdout", chunk: s }); });
-      child.stderr.on("data", (d)=> { const s=String(d); stderr+=s; emitEvent({ type: "subagent_stream", id, stream: "stderr", chunk: s }); });
-      child.on("close", (code)=> {
-        if (code !== 0) {
-          try { emitEvent({ type: "subagent_error", id, code, stderr: String(stderr||"").slice(-2000) }); } catch (e) {}
+      const id = meta.id || (Date.now() + "-" + Math.random().toString(36).slice(2,8));
+      const toolCallId = meta.toolCallId || null;
+      const toolName = meta.toolName || "codex";
+      const useToolEvents = !!toolCallId;
+      const throttleMs = 50;
+      const maxStreamChunk = 16000;
+      let stdoutBuf = "";
+      let stderrBuf = "";
+      let stdoutTimer = null;
+      let stderrTimer = null;
+
+      const flushStdoutNow = () => {
+        if (!useToolEvents) return;
+        if (stdoutTimer){ try { clearTimeout(stdoutTimer); } catch {} stdoutTimer = null; }
+        if (!stdoutBuf) return;
+        let chunk = stdoutBuf;
+        stdoutBuf = "";
+        if (chunk.length > maxStreamChunk) chunk = chunk.slice(-maxStreamChunk);
+        emitEvent({
+          type: "tool_execution_update",
+          toolCallId,
+          toolName,
+          partialResult: { stream: "stdout", chunk },
+        });
+      };
+
+      const flushStderrNow = () => {
+        if (!useToolEvents) return;
+        if (stderrTimer){ try { clearTimeout(stderrTimer); } catch {} stderrTimer = null; }
+        if (!stderrBuf) return;
+        let chunk = stderrBuf;
+        stderrBuf = "";
+        if (chunk.length > maxStreamChunk) chunk = chunk.slice(-maxStreamChunk);
+        emitEvent({
+          type: "tool_execution_update",
+          toolCallId,
+          toolName,
+          partialResult: { stream: "stderr", chunk },
+        });
+      };
+
+      const scheduleStdoutFlush = () => {
+        if (!useToolEvents) return;
+        if (stdoutTimer) return;
+        stdoutTimer = setTimeout(() => { stdoutTimer = null; flushStdoutNow(); }, throttleMs);
+        try { stdoutTimer.unref && stdoutTimer.unref(); } catch {}
+      };
+
+      const scheduleStderrFlush = () => {
+        if (!useToolEvents) return;
+        if (stderrTimer) return;
+        stderrTimer = setTimeout(() => { stderrTimer = null; flushStderrNow(); }, throttleMs);
+        try { stderrTimer.unref && stderrTimer.unref(); } catch {}
+      };
+
+      let settled = false;
+      const finish = (code) => {
+        if (settled) return;
+        settled = true;
+        if (useToolEvents){
+          flushStdoutNow();
+          flushStderrNow();
+        } else {
+          if (code !== 0) {
+            try {
+              emitEvent({ type: "subagent_error", id, code, stderr: String(stderr||"").slice(-2000) });
+            } catch (e) {}
+          }
+          emitEvent({ type: "subagent_end", id, code, ok: code===0 });
         }
-        emitEvent({ type: "subagent_end", id, code, ok: code===0 });
         resolveP({ code, stdout, stderr, id });
+      };
+
+      if (!useToolEvents){
+        emitEvent({ type: "subagent_start", id, agent: "codex", args });
+      }
+
+      child.stdout.on("data", (d)=>{
+        const s = String(d);
+        stdout += s;
+        if (stdout.length > captureMax) stdout = stdout.slice(-captureMax);
+        if (useToolEvents){
+          stdoutBuf += s;
+          scheduleStdoutFlush();
+        } else {
+          emitEvent({ type: "subagent_stream", id, stream: "stdout", chunk: s });
+        }
       });
+
+      child.stderr.on("data", (d)=>{
+        const s = String(d);
+        stderr += s;
+        if (stderr.length > captureMax) stderr = stderr.slice(-captureMax);
+        if (useToolEvents){
+          stderrBuf += s;
+          scheduleStderrFlush();
+        } else {
+          emitEvent({ type: "subagent_stream", id, stream: "stderr", chunk: s });
+        }
+      });
+
+      child.on("error", (err)=>{
+        try {
+          const msg = String((err && err.message) || err || "");
+          if (msg) {
+            stderr += (stderr ? "\n" : "") + msg;
+            if (stderr.length > captureMax) stderr = stderr.slice(-captureMax);
+          }
+        } catch {}
+        finish(null);
+      });
+
+      child.on("close", (code)=>{ finish(code); });
     });
   }
 
@@ -56,27 +167,36 @@ export class CodexRunner {
     return args;
   }
 
-  async runNewSession({ prompt, allowedPaths }){
+  async runNewSession({ prompt, allowedPaths, toolCallId, toolName }){
     const args = this.buildExecArgs({ prompt, allowedPaths, fullAuto: true });
-    const res = await this.spawnCollect("codex", args, {}, { id: `codex-run-${Date.now()}` });
+    const meta = { id: `codex-run-${Date.now()}` };
+    if (toolCallId) meta.toolCallId = toolCallId;
+    if (toolName) meta.toolName = toolName;
+    const res = await this.spawnCollect("codex", args, {}, meta);
     const id = this.extractSessionId(res.stdout) || this.extractSessionId(res.stderr);
     return { id, ...res };
   }
 
-  async resumeSession(sessionId, { prompt, allowedPaths }){
+  async resumeSession(sessionId, { prompt, allowedPaths, toolCallId, toolName }){
     const base = ["exec", "resume", sessionId, "--json", "--skip-git-repo-check", "--cd", this.cwd];
     const policy2 = String(process.env.ARCANA_CODEX_POLICY||'').toLowerCase();
     if (policy2 === 'open') base.push('--dangerously-bypass-approvals-and-sandbox');
     for (const p of (allowedPaths||[])){ const abs=resolve(this.cwd,p); base.push("--add-dir", abs); }
     if (prompt && prompt!=="-") base.push(prompt);
-    const res = await this.spawnCollect("codex", base, {}, { id: `codex-resume-${Date.now()}` });
+    const meta = { id: `codex-resume-${Date.now()}` };
+    if (toolCallId) meta.toolCallId = toolCallId;
+    if (toolName) meta.toolName = toolName;
+    const res = await this.spawnCollect("codex", base, {}, meta);
     const id = sessionId || this.extractSessionId(res.stdout) || this.extractSessionId(res.stderr);
     return { id, ...res };
   }
 
-  async applyLatest(){
+  async applyLatest({ toolCallId, toolName } = {}){
     emitEvent({ type: "subagent_apply_start", agent: "codex" });
-    const out = await this.spawnCollect("codex", ["apply"], {}, { id: `codex-apply-${Date.now()}` });
+    const meta = { id: `codex-apply-${Date.now()}` };
+    if (toolCallId) meta.toolCallId = toolCallId;
+    if (toolName) meta.toolName = toolName;
+    const out = await this.spawnCollect("codex", ["apply"], {}, meta);
     emitEvent({ type: "subagent_apply_end", agent: "codex", code: out.code });
     return out;
   }

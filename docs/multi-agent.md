@@ -11,7 +11,7 @@ Arcana now separates **agent home** from **workspace root**.
 
 - **Agent home**
   - One directory per agent under Arcana home:
-    - `~/.arcana/agents/<agentId>/`
+    - `$ARCANA_HOME/agents/<agentId>/`
   - Contents (convention, not strict schema):
     - `agent.json` – metadata:
       ```jsonc
@@ -36,10 +36,10 @@ Arcana now separates **agent home** from **workspace root**.
   - Stored in `agent.json.workspaceRoot` and **never inferred from the agent home path**.
   - All tool I/O, search/read/ls/find, and project‑level operations are rooted here and enforced by the workspace guard.
 
-A typical layout looks like:
+A typical layout looks like (ARCANA_HOME defaults to `~/.arcana`):
 
 ```text
-~/.arcana/
+$ARCANA_HOME/
   agents/
     default/
       agent.json               # { agentId: "default", workspaceRoot: "/projects/foo" }
@@ -59,6 +59,7 @@ A typical layout looks like:
 ```
 
 The **workspace root** in this example is `/projects/foo` or `/projects/bar`, not under `~/.arcana`.
+The **agent home** paths above are all resolved under `$ARCANA_HOME`.
 
 ## Agent Isolation
 
@@ -76,14 +77,14 @@ Arcana treats each agent as an isolated unit along four axes:
 
 - **Memory**
   - Long‑term memory lives **under the agent home**, not the workspace:
-    - `~/.arcana/agents/<agentId>/MEMORY.md`
-    - `~/.arcana/agents/<agentId>/memory/YYYY-MM-DD.md`
+    - `$ARCANA_HOME/agents/default/MEMORY.md` (canonical long‑term memory for the default agent)
+    - `$ARCANA_HOME/agents/<agentId>/memory/YYYY-MM-DD.md`
   - Memory tools (`memory_search`, `memory_get`) are guarded by `agent-guard.js` and can only read inside the owning agent's home.
 
 - **Skills**
   - Skills are layered so agents can share package skills but still override them locally:
-    - Package skills (shared): `arcana/skills` in the repo/package.
-    - Agent skills (preferred): `~/.arcana/agents/<agentId>/skills` and `~/.arcana/agents/<agentId>/.agents/skills`.
+    - Package skills (shared): `skills/` in this repo (or `<pkgRoot>/skills` in general).
+    - Agent skills (preferred): `$ARCANA_HOME/agents/<agentId>/skills` and `$ARCANA_HOME/agents/<agentId>/.agents/skills`.
     - Workspace‑local skills (legacy/back‑compat): `<workspaceRoot>/skills`, `<workspaceRoot>/.agents/skills`.
   - Skill discovery runs with `cwd = agentHomeRoot` and merges package + agent + workspace layers, de‑duplicating by skill name.
 
@@ -93,6 +94,7 @@ Background services are configured **per agent** via `services.ini` in the agent
 
 - **services.ini (recommended)**
   - Preferred location: `~/.arcana/agents/<agentId>/services.ini`.
+  - Preferred location: `$ARCANA_HOME/agents/<agentId>/services.ini`.
   - For legacy setups, `services.ini` under the workspace root is also honored if no agent‑level file exists.
   - Format:
 
@@ -126,7 +128,7 @@ Sessions are stored **per agent** under the agent home.
 - Layout:
 
   ```text
-  ~/.arcana/agents/<agentId>/sessions/<sessionId>.json
+  $ARCANA_HOME/agents/<agentId>/sessions/<sessionId>.json
   ```
 
 - Schema (new):
@@ -150,12 +152,12 @@ Sessions are stored **per agent** under the agent home.
 - Behavior:
   - New sessions created via `/api/sessions` or `/api/chat2` set `agentId` and **do not** write `workspace`.
   - Legacy sessions that still contain `workspace` continue to load; the field is ignored by new callers.
-  - Sessions for the default `default` agent live in `~/.arcana/agents/default/sessions/`.
+  - Sessions for the default `default` agent live in `$ARCANA_HOME/agents/default/sessions/`.
 
 ## Agents Listing
 
 - `GET /api/agents`
-  - Scans `~/.arcana/agents/*/agent.json` and returns:
+  - Scans `$ARCANA_HOME/agents/*/agent.json` and returns:
 
     ```jsonc
     {
@@ -178,12 +180,12 @@ Sessions are stored **per agent** under the agent home.
     }
     ```
 
-- There is always at least a `default` agent:
+  - There is always at least a `default` agent:
   - On first use, the server calls `ensureDefaultAgentExists()` which:
     - Picks a `workspaceRoot` (from `ARCANA_WORKSPACE`, config workspace_root/workspaceRoot, or `process.cwd()`).
-    - Creates `~/.arcana/agents/default/agent.json` pointing at that workspace.
+    - Creates `$ARCANA_HOME/agents/default/agent.json` pointing at that workspace.
     - Seeds `AGENTS.md`, `MEMORY.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `memory/`, `skills/`, `.agents/skills/`, and a commented `services.ini` example.
-    - If `~/.arcana/agents/default/` does not exist but there are existing agents, copies the newest agent home (by `createdAt` in `agent.json`, with a fallback to the file's creation/modification time) into `~/.arcana/agents/default/` once and rewrites `agent.json.agentId` to "default" so existing persona, memory, and sessions carry over.
+    - If `$ARCANA_HOME/agents/default/` does not exist but there are existing agents, copies the newest agent home (by `createdAt` in `agent.json`, with a fallback to the file's creation/modification time) into `$ARCANA_HOME/agents/default/` once and rewrites `agent.json.agentId` to "default" so existing persona, memory, and sessions carry over.
 
 ## Sessions API
 
@@ -222,7 +224,7 @@ Sessions are stored **per agent** under the agent home.
 - Behavior:
   - Resolves the agent via `agentId`.
   - Fails with `400 agent_not_found` if the agent does not exist or has no `workspaceRoot`.
-  - Creates a new session JSON under `~/.arcana/agents/<agentId>/sessions/`.
+  - Creates a new session JSON under `$ARCANA_HOME/agents/<agentId>/sessions/`.
 
 ### `GET /api/sessions/:id?agentId=<id>`
 
@@ -231,7 +233,7 @@ Sessions are stored **per agent** under the agent home.
 
 ### `DELETE /api/sessions/:id?agentId=<id>`
 
-- Deletes one session JSON under `~/.arcana/agents/<agentId>/sessions/`.
+- Deletes one session JSON under `$ARCANA_HOME/agents/<agentId>/sessions/`.
 - If `agentId` is omitted, only sessions for the default agent are considered.
 
 ## `/api/chat2` – Agent-Aware Chat
@@ -258,7 +260,7 @@ The concurrent chat endpoint is now **agent-centric**.
     {
       sessionId,
       agentId,
-      agentHomeRoot: "~/.arcana/agents/<agentId>",
+      agentHomeRoot: "$ARCANA_HOME/agents/<agentId>",
       workspaceRoot: agent.workspaceRoot
     }
     ```
@@ -274,5 +276,5 @@ The concurrent chat endpoint is now **agent-centric**.
 
 This model lets you:
 
-- Keep **agent identity, memory, skills, and services** in a stable per‑agent home under `~/.arcana/agents/<agentId>/`.
+- Keep **agent identity, memory, skills, and services** in a stable per‑agent home under `$ARCANA_HOME/agents/<agentId>/`.
 - Point each agent at any **workspace root** on disk for project‑specific work.

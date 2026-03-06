@@ -1,59 +1,244 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, unlinkSync, appendFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, unlinkSync, appendFileSync, statSync, readdirSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed } from '../workspace-guard.js';
 import { computeNextRun } from './schedule.js';
+import { getContext, runWithContext } from '../event-bus.js';
 
-function baseDir() {
-  const root = resolveWorkspaceRoot();
-  const d = join(root, '.arcana', 'timer');
-  if (!existsSync(d)) mkdirSync(ensureWriteAllowed(d), { recursive: true });
-  return d;
-}
+const DEFAULT_AGENT_ID = 'default';
 
-function jobsPath(){ return join(baseDir(), 'jobs.json'); }
-function runsPath(){ return join(baseDir(), 'runs.jsonl'); }
-function logsDir(){ const d = join(baseDir(), 'logs'); if (!existsSync(d)) mkdirSync(ensureWriteAllowed(d), { recursive: true }); return d; }
-function locksDir(){ const d = join(baseDir(), 'locks'); if (!existsSync(d)) mkdirSync(ensureWriteAllowed(d), { recursive: true }); return d; }
+const DEFAULT_TIMER_COMPACTION = {
+  thresholdTokens: 200000,
+  fallbackBytes: 600000,
+  keepRecentMessages: 50,
+};
 
 function nowIso(){ return new Date().toISOString(); }
 function nowMs(){ return Date.now(); }
 
+function normalizeAgentId(raw){
+  try {
+    const s = String(raw || '').trim();
+    if (!s) return DEFAULT_AGENT_ID;
+    const safe = s.replace(/[^A-Za-z0-9_-]/g, '_');
+    return safe || DEFAULT_AGENT_ID;
+  } catch {
+    return DEFAULT_AGENT_ID;
+  }
+}
+
+function withWorkspaceRoot(workspaceRoot, fn){
+  if (typeof fn !== 'function') return undefined;
+  if (!workspaceRoot) return fn();
+  const cur = getContext?.() || {};
+  const ctx = { ...cur, workspaceRoot };
+  return runWithContext ? runWithContext(ctx, fn) : fn();
+}
+
+function resolveWorkspaceRootForOptions(options){
+  const optRoot = options && options.workspaceRoot;
+  if (!optRoot) return resolveWorkspaceRoot();
+  return withWorkspaceRoot(optRoot, () => resolveWorkspaceRoot());
+}
+
+function ensureReadInWorkspace(path, workspaceRoot){
+  return withWorkspaceRoot(workspaceRoot, () => ensureReadAllowed(path));
+}
+
+function ensureWriteInWorkspace(path, workspaceRoot){
+  return withWorkspaceRoot(workspaceRoot, () => ensureWriteAllowed(path));
+}
+
+function resolveAgentContext(options){
+  const ctx = getContext?.() || {};
+  const workspaceRoot = resolveWorkspaceRootForOptions(options || {});
+  const agentIdRaw = (options && options.agentId) || ctx.agentId || DEFAULT_AGENT_ID;
+  const agentId = normalizeAgentId(agentIdRaw);
+  return { workspaceRoot, agentId };
+}
+
+function ensureTimerBaseDir(workspaceRoot, agentId){
+  const base = join(workspaceRoot, '.arcana', 'agents', agentId, 'timer');
+  if (!existsSync(base)) mkdirSync(ensureWriteInWorkspace(base, workspaceRoot), { recursive: true });
+  return base;
+}
+
+function jobsPath(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  return join(baseDir, 'jobs.json');
+}
+
+function runsPath(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  return join(baseDir, 'runs.jsonl');
+}
+
+function logsDir(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  const d = join(baseDir, 'logs');
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, workspaceRoot), { recursive: true });
+  return d;
+}
+
+function locksDir(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  const d = join(baseDir, 'locks');
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, workspaceRoot), { recursive: true });
+  return d;
+}
+
+function lockFilePath(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  return join(baseDir, 'jobs.lock');
+}
+
+function settingsPath(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  return join(baseDir, 'settings.json');
+}
+
+// Best-effort migration from legacy .arcana/timer/* into
+// .arcana/agents/default/timer/*. Keeps legacy files intact.
+function maybeMigrateLegacyTimerFiles(env){
+  try {
+    const workspaceRoot = env && env.workspaceRoot;
+    const agentId = env && env.agentId;
+    if (!workspaceRoot) return;
+    if (normalizeAgentId(agentId) !== DEFAULT_AGENT_ID) return;
+
+    const legacyDir = join(workspaceRoot, '.arcana', 'timer');
+    const legacyJobs = join(legacyDir, 'jobs.json');
+    const legacyRuns = join(legacyDir, 'runs.jsonl');
+
+    const baseDir = ensureTimerBaseDir(workspaceRoot, DEFAULT_AGENT_ID);
+    const newJobs = join(baseDir, 'jobs.json');
+    const newRuns = join(baseDir, 'runs.jsonl');
+
+    if (!existsSync(newJobs) && existsSync(legacyJobs)){
+      try {
+        copyFileSync(ensureReadInWorkspace(legacyJobs, workspaceRoot), ensureWriteInWorkspace(newJobs, workspaceRoot));
+      } catch {}
+    }
+    if (!existsSync(newRuns) && existsSync(legacyRuns)){
+      try {
+        copyFileSync(ensureReadInWorkspace(legacyRuns, workspaceRoot), ensureWriteInWorkspace(newRuns, workspaceRoot));
+      } catch {}
+    }
+  } catch {}
+}
+
 // Basic lock around jobs.json writes to avoid corruption across concurrent processes.
 // We create .lock with O_EXCL and remove it after the write. If lock exists and is stale (>30s), steal it.
-function lockFilePath(){ return join(baseDir(), 'jobs.lock'); }
-
-function acquireLock(timeoutMs = 5000){
-  const path = lockFilePath();
+function acquireLock(timeoutMs = 5000, options){
+  const env = resolveAgentContext(options);
+  const path = lockFilePath(options);
   const start = Date.now();
   while (Date.now() - start < timeoutMs){
-    try { const fd = openSync(ensureWriteAllowed(path), 'wx'); closeSync(fd); return true; } catch {}
+    try {
+      const fd = openSync(ensureWriteInWorkspace(path, env.workspaceRoot), 'wx');
+      closeSync(fd);
+      return true;
+    } catch {}
     // check staleness
-    try { const st = statSync(ensureReadAllowed(path)); if (Date.now() - st.mtimeMs > 30000) { try { unlinkSync(ensureWriteAllowed(path)); } catch {} } } catch {}
+    try {
+      const st = statSync(ensureReadInWorkspace(path, env.workspaceRoot));
+      if (Date.now() - st.mtimeMs > 30000) {
+        try { unlinkSync(ensureWriteInWorkspace(path, env.workspaceRoot)); } catch {}
+      }
+    } catch {}
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
   return false;
 }
 
-function releaseLock(){ try { unlinkSync(ensureWriteAllowed(lockFilePath())); } catch {} }
+function releaseLock(options){
+  const env = resolveAgentContext(options);
+  try { unlinkSync(ensureWriteInWorkspace(lockFilePath(options), env.workspaceRoot)); } catch {}
+}
 
-export function listJobs(){
-  const p = jobsPath();
+export function listJobs(options){
+  const env = resolveAgentContext(options);
+  maybeMigrateLegacyTimerFiles(env);
+  const p = jobsPath(options);
   if (!existsSync(p)) return [];
   try {
-    const raw = JSON.parse(readFileSync(ensureReadAllowed(p), 'utf-8'));
+    const raw = JSON.parse(readFileSync(ensureReadInWorkspace(p, env.workspaceRoot), 'utf-8'));
     if (Array.isArray(raw)) return raw;
   } catch {}
   return [];
 }
 
-function saveJobsArray(arr){
-  const p = jobsPath();
-  const tmp = p + '.tmp';
-  if (!acquireLock()) throw new Error('timer_store_lock_timeout');
+export function loadTimerSettings(options){
+  const env = resolveAgentContext(options);
+  const p = settingsPath(options);
+  const base = { compaction: { ...DEFAULT_TIMER_COMPACTION } };
+  if (!existsSync(p)) return base;
   try {
-    writeFileSync(ensureWriteAllowed(tmp), JSON.stringify(arr, null, 2), 'utf-8');
-    renameSync(tmp, ensureWriteAllowed(p));
-  } finally { releaseLock(); }
+    const raw = JSON.parse(readFileSync(ensureReadInWorkspace(p, env.workspaceRoot), 'utf-8'));
+    const out = { compaction: { ...DEFAULT_TIMER_COMPACTION } };
+    if (raw && typeof raw === 'object'){
+      const src = raw.compaction && typeof raw.compaction === 'object' ? raw.compaction : raw;
+      const t = Number(src.thresholdTokens);
+      const fb = Number(src.fallbackBytes);
+      const fc = Number(src.fallbackChars);
+      const k = Number(src.keepRecentMessages);
+      if (Number.isFinite(t) && t > 0) out.compaction.thresholdTokens = t;
+      if (Number.isFinite(fb) && fb > 0) { out.compaction.fallbackBytes = fb; }
+      else if (Number.isFinite(fc) && fc > 0) { out.compaction.fallbackBytes = fc; }
+      if (Number.isFinite(k) && k > 0) out.compaction.keepRecentMessages = k;
+    }
+    return out;
+  } catch {
+    return base;
+  }
+}
+
+export function saveTimerSettings(settings, options){
+  const env = resolveAgentContext(options);
+  const p = settingsPath(options);
+  const tmp = p + '.tmp';
+  const current = loadTimerSettings(options) || { compaction: { ...DEFAULT_TIMER_COMPACTION } };
+  const incoming = settings && typeof settings === 'object' ? settings : {};
+  const srcComp = incoming.compaction && typeof incoming.compaction === 'object' ? incoming.compaction : incoming;
+
+  const baseComp = current.compaction && typeof current.compaction === 'object' ? current.compaction : { ...DEFAULT_TIMER_COMPACTION };
+  const nextComp = { ...DEFAULT_TIMER_COMPACTION, ...baseComp };
+
+  function pickNumber(v){
+    const n = Number(v);
+    return (Number.isFinite(n) && n > 0) ? n : null;
+  }
+
+  const t = pickNumber(srcComp.thresholdTokens);
+  const fb = pickNumber(srcComp.fallbackBytes);
+  const fcLegacy = pickNumber(srcComp.fallbackChars);
+  const k = pickNumber(srcComp.keepRecentMessages);
+  if (t != null) nextComp.thresholdTokens = t;
+  if (fb != null) nextComp.fallbackBytes = fb;
+  else if (fcLegacy != null && (fb == null)) nextComp.fallbackBytes = fcLegacy;
+  if (k != null) nextComp.keepRecentMessages = k;
+
+  const finalSettings = { compaction: nextComp };
+
+  writeFileSync(ensureWriteInWorkspace(tmp, env.workspaceRoot), JSON.stringify(finalSettings, null, 2), 'utf-8');
+  renameSync(tmp, ensureWriteInWorkspace(p, env.workspaceRoot));
+  return finalSettings;
+}
+
+function saveJobsArray(arr, options){
+  const env = resolveAgentContext(options);
+  const p = jobsPath(options);
+  const tmp = p + '.tmp';
+  if (!acquireLock(5000, options)) throw new Error('timer_store_lock_timeout');
+  try {
+    writeFileSync(ensureWriteInWorkspace(tmp, env.workspaceRoot), JSON.stringify(arr, null, 2), 'utf-8');
+    renameSync(tmp, ensureWriteInWorkspace(p, env.workspaceRoot));
+  } finally { releaseLock(options); }
 }
 
 function genId(title){
@@ -63,7 +248,7 @@ function genId(title){
   return stamp + '--' + slug + '-' + rand;
 }
 
-export function addJob({ title, schedule, task, enabled=true }){
+export function addJob({ title, schedule, task, enabled=true }, options){
   const t = String(title||'').trim() || 'Timer Job';
   const s = schedule && typeof schedule === 'object' ? schedule : null;
   if (!s || !s.type) throw new Error('invalid_schedule');
@@ -75,6 +260,11 @@ export function addJob({ title, schedule, task, enabled=true }){
     if (!String(tk.command||'').trim()) throw new Error('exec_missing_command');
   } else if (kind === 'arcana') {
     if (!String(tk.prompt||'').trim()) throw new Error('arcana_missing_prompt');
+    if (tk.timeoutMs !== undefined) {
+      const n = Number(tk.timeoutMs);
+      if (!Number.isFinite(n) || n <= 0) throw new Error('arcana_invalid_timeout');
+      tk.timeoutMs = n;
+    }
   } else {
     throw new Error('unknown_task_kind');
   }
@@ -97,39 +287,57 @@ export function addJob({ title, schedule, task, enabled=true }){
   };
   obj.nextRunAtMs = computeNextRun(obj.schedule, nowMs());
 
-  const arr = listJobs();
+  const arr = listJobs(options);
   arr.push(obj);
-  saveJobsArray(arr);
+  saveJobsArray(arr, options);
   return obj;
 }
 
-export function findJob(id){
-  const arr = listJobs();
-  return arr.find(j=> j.id === id) || null;
+export function findJob(id, options){
+  const arr = listJobs(options);
+  return arr.find((j)=> j.id === id) || null;
 }
 
-export function saveJob(job){
-  const arr = listJobs();
-  const idx = arr.findIndex(j=> j.id === job.id);
+export function saveJob(job, options){
+  const arr = listJobs(options);
+  const idx = arr.findIndex((j)=> j.id === job.id);
   if (idx === -1) throw new Error('job_not_found');
   arr[idx] = job;
-  saveJobsArray(arr);
+  saveJobsArray(arr, options);
   return job;
 }
 
-export function removeJob(id){
-  const arr = listJobs();
-  const next = arr.filter(j=> j.id !== id);
-  saveJobsArray(next);
+export function removeJob(id, options){
+  const arr = listJobs(options);
+  const next = arr.filter((j)=> j.id !== id);
+  saveJobsArray(next, options);
   return arr.length !== next.length;
 }
 
-export function enableJob(id){ const arr = listJobs(); const j = arr.find(x=>x.id===id); if (!j) throw new Error('job_not_found'); j.enabled = true; j.updatedAt = nowIso(); if (!j.nextRunAtMs) j.nextRunAtMs = computeNextRun(j.schedule, nowMs()); saveJobsArray(arr); return j; }
-export function disableJob(id){ const arr = listJobs(); const j = arr.find(x=>x.id===id); if (!j) throw new Error('job_not_found'); j.enabled = false; j.updatedAt = nowIso(); saveJobsArray(arr); return j; }
+export function enableJob(id, options){
+  const arr = listJobs(options);
+  const j = arr.find((x)=> x.id === id);
+  if (!j) throw new Error('job_not_found');
+  j.enabled = true;
+  j.updatedAt = nowIso();
+  if (!j.nextRunAtMs) j.nextRunAtMs = computeNextRun(j.schedule, nowMs());
+  saveJobsArray(arr, options);
+  return j;
+}
 
-export function patchJob(id, patch){
-  const arr = listJobs();
-  const j = arr.find(x=> x.id === id);
+export function disableJob(id, options){
+  const arr = listJobs(options);
+  const j = arr.find((x)=> x.id === id);
+  if (!j) throw new Error('job_not_found');
+  j.enabled = false;
+  j.updatedAt = nowIso();
+  saveJobsArray(arr, options);
+  return j;
+}
+
+export function patchJob(id, patch, options){
+  const arr = listJobs(options);
+  const j = arr.find((x)=> x.id === id);
   if (!j) throw new Error('job_not_found');
   let resched = false;
   if (typeof patch.title === 'string' && patch.title.trim()) { j.title = patch.title.trim(); }
@@ -151,48 +359,133 @@ export function patchJob(id, patch){
       if (typeof patch.task.prompt === 'string') j.task.prompt = patch.task.prompt;
       if (typeof patch.task.sessionId === 'string') j.task.sessionId = patch.task.sessionId;
       if (typeof patch.task.title === 'string') j.task.title = patch.task.title;
+      if (Object.prototype.hasOwnProperty.call(patch.task, 'timeoutMs')) {
+        const n = Number(patch.task.timeoutMs);
+        if (Number.isFinite(n) && n > 0) j.task.timeoutMs = n;
+        else if (patch.task.timeoutMs === null) delete j.task.timeoutMs;
+      }
       if (!String(j.task.prompt||'').trim()) throw new Error('arcana_missing_prompt');
     } else throw new Error('unknown_task_kind');
   }
   if (resched) j.nextRunAtMs = computeNextRun(j.schedule, nowMs());
   j.updatedAt = nowIso();
-  saveJobsArray(arr);
+  saveJobsArray(arr, options);
   return j;
 }
 
-export function appendRun(rec){
+export function appendRun(rec, options){
+  const env = resolveAgentContext(options);
   const line = JSON.stringify(rec) + '\n';
-  const p = runsPath();
-  appendFileSync(ensureWriteAllowed(p), line, { encoding: 'utf-8' });
+  const p = runsPath(options);
+  appendFileSync(ensureWriteInWorkspace(p, env.workspaceRoot), line, { encoding: 'utf-8' });
 }
 
-export function listRuns({ limit = 50 } = {}){
-  const p = runsPath();
+export function listRuns({ limit = 50 } = {}, options){
+  const env = resolveAgentContext(options);
+  maybeMigrateLegacyTimerFiles(env);
+  const p = runsPath(options);
   if (!existsSync(p)) return [];
   // Simple implementation: read whole file; acceptable for modest sizes
   try {
-    const text = readFileSync(ensureReadAllowed(p), 'utf-8');
+    const text = readFileSync(ensureReadInWorkspace(p, env.workspaceRoot), 'utf-8');
     const lines = text.split('\n').filter(Boolean);
     const tail = lines.slice(-Math.max(1, Math.min(500, limit)));
     return tail.map((l)=>{ try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   } catch { return []; }
 }
 
-export function jobLogDir(jobId){ const d = join(logsDir(), jobId); if (!existsSync(d)) mkdirSync(ensureWriteAllowed(d), { recursive: true }); return d; }
-export function buildLogPath(jobId, stamp){ return join(jobLogDir(jobId), stamp + '.log'); }
+export function jobLogDir(jobId, options){
+  const d = join(logsDir(options), jobId);
+  const env = resolveAgentContext(options);
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, env.workspaceRoot), { recursive: true });
+  return d;
+}
 
-export function setJobNextRun(job, baseMs){ job.nextRunAtMs = computeNextRun(job.schedule, typeof baseMs==='number'?baseMs:nowMs()); job.updatedAt = nowIso(); saveJob(job); return job; }
+export function buildLogPath(jobId, stamp, options){
+  return join(jobLogDir(jobId, options), stamp + '.log');
+}
 
-export function listJobSummaries(){
-  const arr = listJobs();
+export function setJobNextRun(job, baseMs, options){
+  job.nextRunAtMs = computeNextRun(job.schedule, typeof baseMs==='number'?baseMs:nowMs());
+  job.updatedAt = nowIso();
+  saveJob(job, options);
+  return job;
+}
+
+export function listJobSummaries(options){
+  const arr = listJobs(options);
   return arr.map((j)=> ({ id: j.id, title: j.title, enabled: j.enabled, schedule: j.schedule, nextRunAtMs: j.nextRunAtMs, lastRunAtMs: j.lastRunAtMs, lastStatus: j.lastStatus }));
 }
 
-export function acquireJobRunLock(jobId){
-  const path = join(locksDir(), jobId + '.lock');
-  try { const fd = openSync(ensureWriteAllowed(path), 'wx'); closeSync(fd); return path; } catch { return null; }
+export function acquireJobRunLock(jobId, options){
+  const env = resolveAgentContext(options);
+  const path = join(locksDir(options), jobId + '.lock');
+  const now = nowMs();
+  let staleMs = 10 * 60 * 1000;
+  try {
+    const raw = process.env.ARCANA_TIMER_JOB_LOCK_STALE_MS;
+    if (raw != null && raw !== '') {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) staleMs = n;
+    }
+  } catch {}
+  const payload = JSON.stringify({ pid: process.pid, startedAtMs: now });
+  const tryCreate = () => {
+    const fd = openSync(ensureWriteInWorkspace(path, env.workspaceRoot), 'wx');
+    try {
+      try { writeFileSync(fd, payload, { encoding: 'utf-8' }); } catch {}
+    } finally {
+      try { closeSync(fd); } catch {}
+    }
+    return path;
+  };
+  try {
+    return tryCreate();
+  } catch {
+    try {
+      const st = statSync(ensureReadInWorkspace(path, env.workspaceRoot));
+      const age = nowMs() - st.mtimeMs;
+      if (age > staleMs) {
+        try { unlinkSync(ensureWriteInWorkspace(path, env.workspaceRoot)); } catch {}
+        try { return tryCreate(); } catch {}
+      }
+    } catch {}
+    return null;
+  }
 }
-export function releaseJobRunLock(lockPath){ if (!lockPath) return; try { unlinkSync(ensureWriteAllowed(lockPath)); } catch {} }
+
+export function releaseJobRunLock(lockPath, options){
+  if (!lockPath) return;
+  const env = resolveAgentContext(options);
+  try { unlinkSync(ensureWriteInWorkspace(lockPath, env.workspaceRoot)); } catch {}
+}
+
+export function listAgentIdsWithJobs({ workspaceRoot } = {}){
+  const root = resolveWorkspaceRootForOptions({ workspaceRoot });
+  const agentIds = new Set();
+  try {
+    const agentsDir = join(root, '.arcana', 'agents');
+    if (existsSync(agentsDir)){
+      for (const name of readdirSync(agentsDir)){
+        const jobs = join(agentsDir, name, 'timer', 'jobs.json');
+        try { if (existsSync(jobs)) agentIds.add(name); } catch {}
+      }
+    }
+  } catch {}
+
+  // Legacy default agent: .arcana/timer/jobs.json
+  try {
+    const legacyJobs = join(root, '.arcana', 'timer', 'jobs.json');
+    const defaultDir = join(root, '.arcana', 'agents', DEFAULT_AGENT_ID, 'timer');
+    const newJobs = join(defaultDir, 'jobs.json');
+    if (existsSync(legacyJobs) || existsSync(newJobs)){
+      maybeMigrateLegacyTimerFiles({ workspaceRoot: root, agentId: DEFAULT_AGENT_ID });
+      if (existsSync(newJobs)) agentIds.add(DEFAULT_AGENT_ID);
+    }
+  } catch {}
+
+  return Array.from(agentIds);
+}
 
 export default {
   listJobs,
@@ -211,5 +504,7 @@ export default {
   listJobSummaries,
   acquireJobRunLock,
   releaseJobRunLock,
+  listAgentIdsWithJobs,
+  loadTimerSettings,
+  saveTimerSettings,
 };
-

@@ -106,7 +106,7 @@ async function timerCLI({ args }){
   const [, , sub, ...rest] = args;
   const s = String(sub||'').toLowerCase();
   if (s === 'once'){
-    const results = await runDueOnce();
+    const results = await runDueOnce({ workspaceRoot: process.cwd() });
     for (const r of results){
       if (r.skipped) console.log('[arcana] skipped', r.reason||'');
       else console.log('[arcana] run', r.jobId, r.ok?'ok':'error');
@@ -115,19 +115,19 @@ async function timerCLI({ args }){
   }
   if (s === 'serve'){
     console.log('[arcana] timer: serve loop (Ctrl+C to stop)');
-    await serveLoop({ intervalMs: 1000 });
+    await serveLoop({ intervalMs: 1000, workspaceRoot: process.cwd() });
     return;
   }
   if (s === 'run'){
     const id = rest[0];
     if (!id) return error('arcana timer run <id>');
-    const r = await runJobById(id);
+    const r = await runJobById(id, { workspaceRoot: process.cwd() });
     if (r && r.skipped) console.log('[arcana] skipped', r.reason||'');
     else console.log('[arcana] run', id, r && r.ok ? 'ok' : 'error');
     return;
   }
   if (s === 'list'){
-    const items = timerList();
+    const items = timerList({ workspaceRoot: process.cwd() });
     for (const j of items){
       console.log(j.id + '\t' + (j.enabled?'on':'off') + '\t' + j.schedule.type + ':' + j.schedule.value + (j.schedule.timezone?('('+j.schedule.timezone+')'):'') + '\t' + (j.nextRunAtMs?new Date(j.nextRunAtMs).toISOString():'n/a') + '\t' + j.title);
     }
@@ -137,7 +137,7 @@ async function timerCLI({ args }){
   if (s === 'runs'){
     const idx = Math.max(0, args.indexOf('--limit'));
     const limit = idx > -1 ? parseInt(args[idx+1]||'50', 10) : 50;
-    const runs = timerListRuns({ limit: Number.isFinite(limit) ? limit : 50 });
+    const runs = timerListRuns({ limit: Number.isFinite(limit) ? limit : 50 }, { workspaceRoot: process.cwd() });
     for (const r of runs){
       console.log(r.jobId + '\t' + (r.ok?'ok':'err') + '\t' + new Date(r.startedAtMs).toISOString() + '\t' + (r.title||''));
     }

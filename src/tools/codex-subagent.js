@@ -26,13 +26,25 @@ export function createCodexSubagentTool() {
     ),
   });
 
+  const CODEX_DETECT_TTL_MS = 60000;
+  let hasLocalCodexCached = null;
+  let hasLocalCodexCachedAt = 0;
+
   function hasLocalCodex() {
+    const now = Date.now();
+    if (hasLocalCodexCached !== null && (now - hasLocalCodexCachedAt) < CODEX_DETECT_TTL_MS) {
+      return hasLocalCodexCached;
+    }
+    let ok = false;
     try {
       const r = spawnSync("codex", ["--help"], { stdio: "ignore" });
-      return r && r.status === 0;
+      ok = !!(r && r.status === 0);
     } catch {
-      return false;
+      ok = false;
     }
+    hasLocalCodexCached = ok;
+    hasLocalCodexCachedAt = now;
+    return ok;
   }
 
   function buildPrompt(args) {
@@ -78,8 +90,8 @@ export function createCodexSubagentTool() {
       const prompt = buildPrompt(args);
       const { id: existing } = runner.getSessionForTask(sessionKey);
       const run = existing
-        ? await runner.resumeSession(existing, { prompt, allowedPaths: allowed })
-        : await runner.runNewSession({ prompt, allowedPaths: allowed });
+        ? await runner.resumeSession(existing, { prompt, allowedPaths: allowed, toolCallId: _id, toolName: "codex" })
+        : await runner.runNewSession({ prompt, allowedPaths: allowed, toolCallId: _id, toolName: "codex" });
       const sessionId = run.id || existing || null;
       if (sessionId) runner.saveSessionForTask(sessionKey, sessionId);
 

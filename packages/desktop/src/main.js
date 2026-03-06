@@ -23,15 +23,23 @@ function ensureUserWorkspace(){
 }
 
 async function createWindow(){
+  const isMac = process.platform === 'darwin';
   const win = new BrowserWindow({
     width: 1220,
     height: 800,
+    minWidth: 960,
+    minHeight: 640,
+    title: 'Arcana',
+    titleBarStyle: isMac ? 'hiddenInset' : 'default',
+    trafficLightPosition: isMac ? { x: 16, y: 16 } : undefined,
+    vibrancy: isMac ? 'sidebar' : undefined,
+    visualEffectState: isMac ? 'active' : undefined,
+    backgroundColor: isMac ? '#00000000' : '#f6f7fb',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       preload: join(__dirname, 'preload.cjs'),
     },
-    title: 'Arcana',
   });
   const url = 'http://localhost:' + arcanaPort;
   await win.loadURL(url);

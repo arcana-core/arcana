@@ -1,11 +1,11 @@
 ---
 name: create_skill
-description: "默认在当前 Agent 的 ~/.arcana/agents/<agentId>/skills 下初始化一个 Skill（含 SKILL.md）；仅在显式使用 --shared 时写入项目 ./skills。工具代码应放在 <skill>/tools 下并通过 frontmatter 声明可见性。"
+description: "默认在当前 Agent 的 $ARCANA_HOME/agents/<agentId>/skills 下初始化一个 Skill（含 SKILL.md）；仅在显式使用 --shared 时写入项目 ./skills。工具代码应放在 <skill>/tools 下并通过 frontmatter 声明可见性。"
 ---
 
 # Create Skill
 
-This skill scaffolds a new skill for the active agent under `~/.arcana/agents/<agentId>/skills` by default, with an opt-in shared mode that writes into the current workspace `./skills` directory. Arcana discovers skills from agent home, workspace, and package layers via `src/skills.js`. Keep the skill lean and follow progressive disclosure.
+This skill scaffolds a new skill for the active agent under `$ARCANA_HOME/agents/<agentId>/skills` by default (ARCANA_HOME defaults to `~/.arcana`), with an opt-in shared mode that writes into the current workspace `./skills` directory. Arcana discovers skills from agent home, workspace, and package layers via `src/skills.js`. Keep the skill lean and follow progressive disclosure.
 
 ## Quick Steps
 

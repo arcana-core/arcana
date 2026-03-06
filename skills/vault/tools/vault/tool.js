@@ -16,8 +16,8 @@ function ensureNames(arr){
 function createVaultTool(){
   return {
     name: 'vault',
-    label: 'Vault',
-    description: 'Open the vault UI and optionally suggest variable names like OPENAI_API_KEY or WECHAT_APP_ID.',
+    label: '\u5bc6\u7801\u7bb1',
+    description: '\u6253\u5f00\u5bc6\u7801\u7bb1\u754c\u9762, \u53ef\u9884\u8bbe\u53d8\u91cf\u540d\u5e76\u5f15\u5bfc\u586b\u5199.',
     parameters: {
       type: 'object',
       properties: {
