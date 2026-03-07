@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 
 import { createHash, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
-import { createArcanaSession, runWithAgentEnvOverlay } from '../src/session.js';
+import { createArcanaSession } from '../src/session.js';
 import { eventBus, runWithContext } from '../src/event-bus.js';
 import { parseFrontmatter, parseSkillBlock } from '@mariozechner/pi-coding-agent';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed, resetWorkspaceRootCache } from '../src/workspace-guard.js';
@@ -25,7 +25,7 @@ import {
 } from '../src/sessions-store.js';
 import { buildSopExtractionPrompt } from '../src/memory-reflection.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
-import { loadTimerSettings as timerLoadSettings, saveTimerSettings as timerSaveSettings } from '../src/timer/store.js';
+import { loadTimerSettings as timerLoadSettings, saveTimerSettings as timerSaveSettings, acquireSessionTurnLock, releaseSessionTurnLock } from '../src/timer/store.js';
 // Tier1 memory triggers (direct daily append)
 
 
@@ -34,6 +34,161 @@ const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..'); //
 let workspaceRoot = null; // set on start
 
 const DEFAULT_AGENT_ID = 'default';
+
+// On-disk cache for tool outputs (meta/result/stream logs)
+const TOOL_OUTPUT_BASE_DIR = join(projectRoot, '.cache', 'tool-output');
+
+function sanitizeIdSegment(raw, fallback){
+  try {
+    const base = String(raw || '').trim() || String(fallback || '');
+    const cleaned = base.replace(/[^A-Za-z0-9_.-]+/g, '_');
+    if (!cleaned || cleaned === '.' || cleaned === '..') return String(fallback || 'default');
+    return cleaned.slice(0, 80);
+  } catch { return String(fallback || 'default'); }
+}
+
+function ensureToolOutputDir(agentId, sessionId, toolCallId){
+  try {
+    const a = sanitizeIdSegment(normalizeAgentId(agentId || DEFAULT_AGENT_ID), DEFAULT_AGENT_ID);
+    const sid = sanitizeIdSegment(sessionId || 'default', 'default');
+    const tid = sanitizeIdSegment(toolCallId || 'tool', 'tool');
+    const dir = join(TOOL_OUTPUT_BASE_DIR, a, sid, tid);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch {
+    try {
+      const a = sanitizeIdSegment(DEFAULT_AGENT_ID, DEFAULT_AGENT_ID);
+      const sid = sanitizeIdSegment('default', 'default');
+      const tid = sanitizeIdSegment(toolCallId || 'tool', 'tool');
+      const dir = join(TOOL_OUTPUT_BASE_DIR, a, sid, tid);
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    } catch { return TOOL_OUTPUT_BASE_DIR; }
+  }
+}
+
+function toolOutputKey(agentId, sessionId, toolCallId){
+  try {
+    const a = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    const sid = String(sessionId || 'default');
+    const tid = String(toolCallId || '');
+    return a + '|' + sid + '|' + tid;
+  } catch {
+    return String(toolCallId || '');
+  }
+}
+
+async function persistToolMetaToDisk({ agentId, sessionId, toolCallId, toolName, args }){
+  try {
+    if (!toolCallId) return;
+    const dir = ensureToolOutputDir(agentId, sessionId, toolCallId);
+    const metaPath = join(dir, 'meta.json');
+    const payload = {
+      toolName: String(toolName || ''),
+      args: args == null ? null : args,
+      startedAt: nowIso(),
+    };
+    await writeFile(metaPath, JSON.stringify(payload, null, 2), 'utf-8');
+  } catch {}
+}
+
+async function persistToolResultToDisk({ agentId, sessionId, event }){
+  try {
+    if (!event || !event.toolCallId) return;
+    const dir = ensureToolOutputDir(agentId, sessionId, event.toolCallId);
+    const resultPath = join(dir, 'result.json');
+    const isErr = !!(event?.isError || event?.error || (event?.result && ((event.result.details && event.result.details.ok === false) || event.result.error)));
+    const payload = {
+      endedAt: nowIso(),
+      isError: isErr,
+      error: event.error == null ? null : event.error,
+      result: event.result == null ? null : event.result,
+    };
+    await writeFile(resultPath, JSON.stringify(payload, null, 2), 'utf-8');
+  } catch {}
+}
+
+const TOOL_STREAM_FLUSH_MS = 200;
+const TOOL_STREAM_MAX_BYTES = (()=>{
+  try {
+    const raw = process.env.ARCANA_TOOL_STREAM_CACHE_MAX_BYTES;
+    if (!raw) return 2000000;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return 2000000;
+    return Math.floor(n);
+  } catch { return 2000000; }
+})();
+
+const toolStreamBuffers = new Map(); // key -> { buf:string, timer:any, path:string }
+
+function flushToolStreamBuffer(key){
+  try {
+    const state = toolStreamBuffers.get(key);
+    if (!state) return;
+    const text = state.buf || '';
+    const logPath = state.path;
+    state.buf = '';
+    state.timer = null;
+    if (!text || !logPath) return;
+    try {
+      appendFileSync(logPath, text, 'utf-8');
+    } catch {}
+    if (TOOL_STREAM_MAX_BYTES > 0){
+      try {
+        const st = statSync(logPath);
+        if (st && st.size > TOOL_STREAM_MAX_BYTES){
+          const buf = readFileSync(logPath);
+          const tail = buf.slice(Math.max(0, buf.length - TOOL_STREAM_MAX_BYTES));
+          try { writeFileSync(logPath, tail); } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+function scheduleAppendToolStream({ agentId, sessionId, toolCallId, stream, chunk }){
+  try {
+    if (!toolCallId) return;
+    const dir = ensureToolOutputDir(agentId, sessionId, toolCallId);
+    const logPath = join(dir, 'stream.log');
+    const key = toolOutputKey(agentId, sessionId, toolCallId);
+    let state = toolStreamBuffers.get(key);
+    if (!state){
+      state = { buf: '', timer: null, path: logPath };
+      toolStreamBuffers.set(key, state);
+    } else {
+      state.path = logPath;
+    }
+    const line = '[' + String(stream || '') + '] ' + String(chunk || '') + '\n';
+    state.buf += line;
+    if (!state.timer){
+      const handle = setTimeout(()=>{
+        try { flushToolStreamBuffer(key); } catch {}
+      }, TOOL_STREAM_FLUSH_MS);
+      try { if (handle && typeof handle.unref === 'function') handle.unref(); } catch {}
+      state.timer = handle;
+    }
+  } catch {}
+}
+
+function readStreamLogTail(agentId, sessionId, toolCallId, tailBytes){
+  try {
+    const a = sanitizeIdSegment(normalizeAgentId(agentId || DEFAULT_AGENT_ID), DEFAULT_AGENT_ID);
+    const sid = sanitizeIdSegment(sessionId || 'default', 'default');
+    const tid = sanitizeIdSegment(toolCallId || 'tool', 'tool');
+    const dir = join(TOOL_OUTPUT_BASE_DIR, a, sid, tid);
+    const p = join(dir, 'stream.log');
+    if (!existsSync(p)) return '';
+    const st = statSync(p);
+    if (!st || !st.size) return '';
+    const size = st.size;
+    const n = (typeof tailBytes === 'number' && tailBytes > 0) ? tailBytes : 200000;
+    const start = size > n ? (size - n) : 0;
+    const buf = readFileSync(p);
+    const tail = start ? buf.slice(start) : buf;
+    try { return tail.toString('utf-8'); } catch { return String(tail); }
+  } catch { return ''; }
+}
 
 // Feature flags for automatic memory writes
 function envFlagEnabled(name){
@@ -72,100 +227,6 @@ function mergeAgentConfig(globalCfg, agentCfg){
     if (agent.path) base.path = agent.path;
   }
   return base;
-}
-
-class AsyncMutex{
-  constructor(){
-    this._locked = false;
-    this._waiters = [];
-  }
-  async acquire(){
-    if (!this._locked){
-      this._locked = true;
-      return;
-    }
-    await new Promise((resolve) => { this._waiters.push(resolve); });
-  }
-  release(){
-    if (this._waiters.length){
-      const next = this._waiters.shift();
-      try { next(); } catch {}
-    } else {
-      this._locked = false;
-    }
-  }
-  async runExclusive(fn){
-    await this.acquire();
-    try { return await fn(); }
-    finally { this.release(); }
-  }
-}
-
-const providerEnvMutex = new AsyncMutex();
-const PROVIDER_ENV_KEYS = [
-  'OPENAI_API_KEY','OPENAI_BASE_URL','OPENAI_API_BASE',
-  'OPENROUTER_API_KEY','OPENROUTER_BASE_URL',
-  'XAI_API_KEY',
-  'ANTHROPIC_API_KEY',
-  'GOOGLE_API_KEY','GOOGLE_API_BASE',
-  'ARCANA_GENERIC_API_KEY','ARCANA_GENERIC_BASE_URL',
-];
-
-function overlayProviderEnv(cfg){
-  if (!cfg) return;
-  const provider = (cfg.provider || 'openai').toLowerCase();
-  const key = cfg.key && String(cfg.key).trim();
-  const base = cfg.base_url && String(cfg.base_url).trim();
-
-  if (provider === 'openai'){
-    if (key) process.env.OPENAI_API_KEY = key;
-    if (base){
-      process.env.OPENAI_BASE_URL = base;
-      process.env.OPENAI_API_BASE = base;
-    }
-  } else if (provider === 'openrouter'){
-    if (key) process.env.OPENROUTER_API_KEY = key;
-    if (base) process.env.OPENROUTER_BASE_URL = base;
-  } else if (provider === 'xai'){
-    if (key) process.env.XAI_API_KEY = key;
-  } else if (provider === 'anthropic'){
-    if (key) process.env.ANTHROPIC_API_KEY = key;
-  } else if (provider === 'google'){
-    if (key) process.env.GOOGLE_API_KEY = key;
-    if (base) process.env.GOOGLE_API_BASE = base;
-  } else {
-    if (key) process.env.ARCANA_GENERIC_API_KEY = key;
-    if (base) process.env.ARCANA_GENERIC_BASE_URL = base;
-  }
-}
-
-async function runWithProviderAndAgentEnv(agentHomeDir, fn){
-  const baseCfg = loadArcanaConfig();
-  let agentCfg = null;
-  try { agentCfg = agentHomeDir ? loadAgentConfig(agentHomeDir) : null; } catch { agentCfg = null; }
-  const cfg = mergeAgentConfig(baseCfg, agentCfg);
-
-  return providerEnvMutex.runExclusive(async () => {
-    const previous = new Map();
-    try {
-      for (const name of PROVIDER_ENV_KEYS){
-        if (!name) continue;
-        const has = Object.prototype.hasOwnProperty.call(process.env, name);
-        previous.set(name, has ? process.env[name] : undefined);
-      }
-      overlayProviderEnv(cfg);
-      return await runWithAgentEnvOverlay(agentHomeDir, fn);
-    } finally {
-      for (const [name, value] of previous.entries()){
-        if (!name) continue;
-        if (value === undefined) {
-          try { delete process.env[name]; } catch {}
-        } else {
-          process.env[name] = value;
-        }
-      }
-    }
-  });
 }
 
 function expandHomeDirPath(input){
@@ -657,7 +718,7 @@ async function summarizeOlderMessagesForCompaction({ ws, agentId, agentHomeDir, 
           prompt += 'Write the summary as plain text paragraphs.\n\n';
           prompt += 'Messages to summarize:\n';
           prompt += historyText + '\n\n';
-          try { await runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(prompt)); } catch {}
+          try { await sess.prompt(prompt); } catch {}
           const segSummary = String(latestSummaryText || '').trim();
           if (segSummary) segmentSummaries.push(segSummary);
           latestSummaryText = '';
@@ -676,7 +737,7 @@ async function summarizeOlderMessagesForCompaction({ ws, agentId, agentHomeDir, 
           mergePrompt += 'Write the summary as plain text paragraphs.\n\n';
           mergePrompt += 'Segment summaries:\n';
           mergePrompt += segmentSummaries.map((s, idx) => 'Segment ' + String(idx + 1) + ':\n' + s + '\n').join('\n');
-          try { await runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(mergePrompt)); } catch {}
+          try { await sess.prompt(mergePrompt); } catch {}
           const mergedSummary = String(latestSummaryText || '').trim();
           finalSummaryText = mergedSummary || segmentSummaries.join('\n\n');
         }
@@ -1576,7 +1637,7 @@ function scheduleSopExtraction({ ws, sessionId, agentId, toolName, safeArgs, err
               }
             } catch {}
           });
-          try { await runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(prompt)); } catch {}
+          try { await sess.prompt(prompt); } catch {}
           try { unsub && unsub(); } catch {}
           if (sopText) {
             let normalized = '';
@@ -1689,7 +1750,11 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
     subagentHooked = true;
     try {
       eventBus.on('event', (ev) => {
-        broadcast(ev);
+        try {
+          const t = ev && ev.type ? String(ev.type) : '';
+          if (t && SSE_SKIP_RAW_TYPES.has(t)) return;
+          broadcast(ev);
+        } catch {}
       });
     } catch {}
   }
@@ -1714,6 +1779,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
         // Forward original start event with sessionId for filtering on the client
         broadcast({ type: 'tool_execution_start', toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {}, sessionId });
         try { if (ev && ev.toolCallId) toolArgsByCallId.set(ev.toolCallId, ev.args || {}); } catch {}
+        try { persistToolMetaToDisk({ agentId: effectiveAgentId, sessionId, toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
         // If the agent is reading a SKILL.md, auto-activate that skill's tools for this session
         try {
           if (ev.toolName === 'read' && ev.args && ev.args.path && /\bSKILL\.md$/i.test(String(ev.args.path))) {
@@ -1728,10 +1794,21 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
 
       // Forward updates/ends tagged with sessionId
       if (t === 'tool_execution_update') {
-        try { broadcast({ type: 'tool_execution_update', toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {}, partialResult: ev.partialResult, sessionId }); } catch {}
+        try {
+          const raw = (typeof ev.partialResult !== 'undefined') ? ev.partialResult : ev.update;
+          if (raw && typeof raw === 'object'){
+            const stream = String(raw.stream || '').toLowerCase();
+            const chunkVal = raw.chunk;
+            if ((stream === 'stdout' || stream === 'stderr') && typeof chunkVal === 'string'){
+              try { scheduleAppendToolStream({ agentId: effectiveAgentId, sessionId, toolCallId: ev.toolCallId, stream, chunk: chunkVal }); } catch {}
+              const payload = { type: 'tool_execution_update', toolCallId: ev.toolCallId, toolName: ev.toolName, update: { stream, chunk: chunkVal }, sessionId };
+              broadcast(payload);
+            }
+          }
+        } catch {}
       }
       if (t === 'tool_execution_end') {
-        try { broadcast({ type: 'tool_execution_end', toolCallId: ev.toolCallId, toolName: ev.toolName, result: ev.result, isError: ev.isError, error: ev.error, sessionId }); } catch {}
+        let errorSummary = '';
         // Best-effort SOP extraction on tool failures (deduped + serialized per workspace)
         if (String(ev.toolName||'') === "codex"){
           const sidKey = String(sessionId||"default");
@@ -1773,6 +1850,8 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
               errTextRaw = String(errTextRaw||'').slice(0, 2000);
             } catch {}
 
+            errorSummary = errTextRaw;
+
             // Tier1: direct daily memory append of the failure (deduped), keep SOP extraction infra intact
             try {
               if (MEMORY_TRIGGERS_ENABLED) {
@@ -1794,6 +1873,20 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
             }
           }
         } catch {}
+        const endIsErr = !!(ev?.isError || ev?.error || (ev?.result && ((ev.result.details && ev.result.details.ok===false) || ev.result.error)));
+        const cachedFlag = !!(ev && (ev.cached || ev.isCached || ev.fromCache));
+        try {
+          broadcast({
+            type: 'tool_execution_end',
+            toolCallId: ev.toolCallId,
+            toolName: ev.toolName,
+            isError: endIsErr,
+            errorSummary,
+            sessionId,
+            cached: cachedFlag,
+          });
+        } catch {}
+        try { persistToolResultToDisk({ agentId: effectiveAgentId, sessionId, event: ev }); } catch {}
       }
 
       // Turn lifecycle
@@ -2100,7 +2193,7 @@ async function handleChat(req, res) {
         } catch {}
       }
     });
-    try { await runWithProviderAndAgentEnv(arcanaHomePath('agents', DEFAULT_AGENT_ID), () => sess.prompt(message)); } catch {}
+    try { await sess.prompt(message); } catch {}
     try { unsub && unsub(); } catch {}
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: out }));
   } catch (e) {
@@ -2232,7 +2325,7 @@ async function handleChat2(req, res) {
     if (sess && sess.isStreaming) {
       try {
         await runWithContext(ctxBase, () =>
-          runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true }))
+          sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
         );
         try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
       } catch (e) {
@@ -2255,7 +2348,7 @@ async function handleChat2(req, res) {
             const retryPayload = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
             try {
               await runWithContext(ctxBase, () =>
-                runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(retryPayload, { streamingBehavior: 'steer', expandPromptTemplates: true }))
+                sess.prompt(retryPayload, { streamingBehavior: 'steer', expandPromptTemplates: true })
               );
               try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
             } catch {
@@ -2275,46 +2368,55 @@ async function handleChat2(req, res) {
     // Normal path: not streaming -> start a new agent turn
     let promptError = null;
     let attemptedCompaction = false;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      promptError = null;
-      try {
-        await runWithContext(ctxBase, () => runWithProviderAndAgentEnv(agentHomeDir, () => sess.prompt(payloadMsg)));
-      } catch (e) {
-        promptError = e;
-      }
-      if (!promptError) break;
-
-      let msg = '';
-      try {
-        msg = String(promptError && (promptError.message || promptError)) || 'agent_prompt_failed';
-      } catch {
-        msg = 'agent_prompt_failed';
-      }
-
-      if (!attemptedCompaction && isContextOverflowErrorMessage(msg)) {
-        attemptedCompaction = true;
+    const turnLockOptions = { agentId, workspaceRoot: ws };
+    let turnLockPath = null;
+    try {
+      try { turnLockPath = acquireSessionTurnLock(sessionId, turnLockOptions); } catch {}
+      for (let attempt = 0; attempt < 2; attempt++) {
+        promptError = null;
         try {
-          await compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir });
-          const updated = ssLoad(sessionId, { agentId });
-          let preludeAfter = '';
-          if (updated && Array.isArray(updated.messages) && updated.messages.length){
-            const msgsAfter = updated.messages;
-            const last = msgsAfter[msgsAfter.length - 1];
-            let historyAfter = updated;
-            if (last && last.role === 'user') {
-              historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
-            }
-            preludeAfter = ssPrelude(historyAfter);
-          }
-          payloadMsg = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
-          continue;
-        } catch {
-          // fall through to error handling below
+          await runWithContext(ctxBase, () => sess.prompt(payloadMsg));
+        } catch (e) {
+          promptError = e;
         }
-      }
+        if (!promptError) break;
 
-      // Non-overflow error or compaction failed -> stop retrying
-      break;
+        let msg = '';
+        try {
+          msg = String(promptError && (promptError.message || promptError)) || 'agent_prompt_failed';
+        } catch {
+          msg = 'agent_prompt_failed';
+        }
+
+        if (!attemptedCompaction && isContextOverflowErrorMessage(msg)) {
+          attemptedCompaction = true;
+          try {
+            await compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir });
+            const updated = ssLoad(sessionId, { agentId });
+            let preludeAfter = '';
+            if (updated && Array.isArray(updated.messages) && updated.messages.length){
+              const msgsAfter = updated.messages;
+              const last = msgsAfter[msgsAfter.length - 1];
+              let historyAfter = updated;
+              if (last && last.role === 'user') {
+                historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
+              }
+              preludeAfter = ssPrelude(historyAfter);
+            }
+            payloadMsg = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
+            continue;
+          } catch {
+            // fall through to error handling below
+          }
+        }
+
+        // Non-overflow error or compaction failed -> stop retrying
+        break;
+      }
+    } finally {
+      try {
+        if (turnLockPath) releaseSessionTurnLock(turnLockPath, turnLockOptions);
+      } catch {}
     }
     try { unsub && unsub(); } catch {}
 
@@ -2411,7 +2513,7 @@ async function handleSteer(req, res) {
     applyExecPolicyToSession(sess, policy);
     try {
       await runWithContext({ sessionId, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () =>
-        runWithProviderAndAgentEnv(ctx.agentHomeDir, () => sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true }))
+        sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
       );
       try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
     } catch {}
@@ -2697,6 +2799,68 @@ async function handleDeleteSession(req, res, id) {
   }
 }
 
+async function handleGetToolOutput(req, res) {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
+    const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+    const toolCallId = String(url.searchParams.get('toolCallId') || '').trim();
+    const tailRaw = String(url.searchParams.get('tailBytes') || '').trim();
+    const agentId = agentIdParam || DEFAULT_AGENT_ID;
+    if (!sessionId || !toolCallId) {
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'missing_params' }));
+      return;
+    }
+
+    let tailBytes = undefined;
+    if (tailRaw) {
+      try {
+        const n = Number(tailRaw);
+        if (Number.isFinite(n) && n > 0) tailBytes = Math.floor(n);
+      } catch {}
+    }
+
+    const a = sanitizeIdSegment(normalizeAgentId(agentId || DEFAULT_AGENT_ID), DEFAULT_AGENT_ID);
+    const sid = sanitizeIdSegment(sessionId || 'default', 'default');
+    const tid = sanitizeIdSegment(toolCallId || 'tool', 'tool');
+    const dir = join(TOOL_OUTPUT_BASE_DIR, a, sid, tid);
+    const metaPath = join(dir, 'meta.json');
+    const resultPath = join(dir, 'result.json');
+
+    let meta = null;
+    let result = null;
+    try {
+      if (existsSync(metaPath)){
+        const raw = readFileSync(metaPath, 'utf-8');
+        if (raw) meta = JSON.parse(raw);
+      }
+    } catch {}
+    try {
+      if (existsSync(resultPath)){
+        const raw = readFileSync(resultPath, 'utf-8');
+        if (raw) result = JSON.parse(raw);
+      }
+    } catch {}
+
+    const streamTail = readStreamLogTail(agentId, sessionId, toolCallId, tailBytes);
+
+    if (!meta && !result && !streamTail){
+      res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'not_found' }));
+      return;
+    }
+
+    const payload = {
+      ok: true,
+      meta: meta || null,
+      result: result || null,
+      streamTail: streamTail || '',
+    };
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify(payload));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'tool_output_failed', message: e?.message || String(e) }));
+  }
+}
+
 async function serveStatic(req, res) {
   const url = new URL(req.url, 'http://localhost');
   let path = url.pathname;
@@ -2716,7 +2880,10 @@ async function serveStatic(req, res) {
       : type === '.webp' ? 'image/webp'
       : type === '.ico' ? 'image/x-icon'
       : 'application/octet-stream';
-    res.writeHead(200, { 'content-type': ct });
+    res.writeHead(200, {
+      'content-type': ct,
+      'cache-control': 'no-cache, no-store, must-revalidate',
+    });
     res.end(data);
   } catch {
     res.writeHead(404).end('Not Found');
@@ -2768,6 +2935,7 @@ function createRequestHandler() {
     if (req.method === 'POST' && url.pathname === '/api/agent-config') { await handlePostAgentConfig(req, res); return; }
     if (req.method === 'GET' && url.pathname === '/api/timer-settings') { await handleGetTimerSettings(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/timer-settings') { await handlePostTimerSettings(req, res); return; }
+    if (req.method === 'GET' && url.pathname === '/api/tool-output') { await handleGetToolOutput(req, res); return; }
 
     await serveStatic(req, res);
   };

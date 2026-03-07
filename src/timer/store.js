@@ -26,6 +26,18 @@ function normalizeAgentId(raw){
   }
 }
 
+function normalizeSessionId(raw){
+  try {
+    const s = String(raw || '').trim();
+    if (!s) return null;
+    const safe = s.replace(/[^A-Za-z0-9_-]/g, '_');
+    if (!safe) return null;
+    return safe;
+  } catch {
+    return null;
+  }
+}
+
 function withWorkspaceRoot(workspaceRoot, fn){
   if (typeof fn !== 'function') return undefined;
   if (!workspaceRoot) return fn();
@@ -60,6 +72,38 @@ function ensureTimerBaseDir(workspaceRoot, agentId){
   const base = join(workspaceRoot, '.arcana', 'agents', agentId, 'timer');
   if (!existsSync(base)) mkdirSync(ensureWriteInWorkspace(base, workspaceRoot), { recursive: true });
   return base;
+}
+
+function sessionEventsDir(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  const d = join(baseDir, 'session_events');
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, workspaceRoot), { recursive: true });
+  return d;
+}
+
+function sessionWakesDir(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  const d = join(baseDir, 'session_wakes');
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, workspaceRoot), { recursive: true });
+  return d;
+}
+
+function sessionEventLocksDir(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  const d = join(baseDir, 'session_event_locks');
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, workspaceRoot), { recursive: true });
+  return d;
+}
+
+function sessionTurnLocksDir(options){
+  const { workspaceRoot, agentId } = resolveAgentContext(options);
+  const baseDir = ensureTimerBaseDir(workspaceRoot, agentId);
+  const d = join(baseDir, 'session_turn_locks');
+  if (!existsSync(d)) mkdirSync(ensureWriteInWorkspace(d, workspaceRoot), { recursive: true });
+  return d;
 }
 
 function jobsPath(options){
@@ -460,6 +504,219 @@ export function releaseJobRunLock(lockPath, options){
   try { unlinkSync(ensureWriteInWorkspace(lockPath, env.workspaceRoot)); } catch {}
 }
 
+const MAX_SESSION_EVENTS = 20;
+
+function sessionEventFilePath(sessionId, options){
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return null;
+  const d = sessionEventsDir(options);
+  return join(d, sid + '.json');
+}
+
+function sessionWakeFilePath(sessionId, options){
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return null;
+  const d = sessionWakesDir(options);
+  return join(d, sid + '.wake');
+}
+
+function sessionEventLockPath(sessionId, options){
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return null;
+  const d = sessionEventLocksDir(options);
+  return join(d, sid + '.lock');
+}
+
+function sessionTurnLockPath(sessionId, options){
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return null;
+  const d = sessionTurnLocksDir(options);
+  return join(d, sid + '.lock');
+}
+
+export function enqueueSessionEvent({ sessionId, text }, options){
+  const env = resolveAgentContext(options);
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return { ok: false, size: 0 };
+  const lockPath = sessionEventLockPath(sid, options);
+  if (!lockPath) return { ok: false, size: 0 };
+  const start = nowMs();
+  const timeoutMs = 5000;
+  let acquired = false;
+  while (!acquired && (nowMs() - start) < timeoutMs){
+    try {
+      const fd = openSync(ensureWriteInWorkspace(lockPath, env.workspaceRoot), 'wx');
+      closeSync(fd);
+      acquired = true;
+      break;
+    } catch {}
+    try {
+      const st = statSync(ensureReadInWorkspace(lockPath, env.workspaceRoot));
+      if (nowMs() - st.mtimeMs > 30000) {
+        try { unlinkSync(ensureWriteInWorkspace(lockPath, env.workspaceRoot)); } catch {}
+      }
+    } catch {}
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  if (!acquired) return { ok: false, size: 0 };
+
+  let events = [];
+  const filePath = sessionEventFilePath(sid, options);
+  try {
+    if (filePath && existsSync(filePath)){
+      try {
+        const raw = readFileSync(ensureReadInWorkspace(filePath, env.workspaceRoot), 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) events = parsed;
+      } catch {}
+    }
+  } catch {}
+
+  const trimmed = String(text || '').trim();
+  let skippedDuplicate = false;
+  if (trimmed){
+    const last = events.length ? events[events.length - 1] : null;
+    const lastText = last && typeof last.text === 'string' ? last.text.trim() : '';
+    if (lastText === trimmed){
+      skippedDuplicate = true;
+    } else {
+      events.push({ text: trimmed, ts: nowIso() });
+    }
+  }
+  if (events.length > MAX_SESSION_EVENTS){
+    events = events.slice(events.length - MAX_SESSION_EVENTS);
+  }
+
+  if (filePath){
+    try {
+      const tmp = filePath + '.tmp';
+      writeFileSync(ensureWriteInWorkspace(tmp, env.workspaceRoot), JSON.stringify(events, null, 2), 'utf-8');
+      renameSync(tmp, ensureWriteInWorkspace(filePath, env.workspaceRoot));
+    } catch {}
+  }
+
+  try {
+    const wakePath = sessionWakeFilePath(sid, options);
+    if (wakePath){
+      writeFileSync(ensureWriteInWorkspace(wakePath, env.workspaceRoot), '', 'utf-8');
+    }
+  } catch {}
+
+  try { unlinkSync(ensureWriteInWorkspace(lockPath, env.workspaceRoot)); } catch {}
+
+  return { ok: true, skippedDuplicate: skippedDuplicate || undefined, size: events.length };
+}
+
+export function listSessionWakes(options){
+  const env = resolveAgentContext(options);
+  const dir = sessionWakesDir(options);
+  const out = [];
+  try {
+    const entries = readdirSync(ensureReadInWorkspace(dir, env.workspaceRoot));
+    for (const name of entries){
+      if (!name.endsWith('.wake')) continue;
+      const base = name.slice(0, -5);
+      const sid = normalizeSessionId(base);
+      if (sid) out.push(sid);
+    }
+  } catch {}
+  return out;
+}
+
+export function readSessionEvents(sessionId, options){
+  const env = resolveAgentContext(options);
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return [];
+  const filePath = sessionEventFilePath(sid, options);
+  if (!filePath || !existsSync(filePath)) return [];
+  try {
+    const raw = readFileSync(ensureReadInWorkspace(filePath, env.workspaceRoot), 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((e)=> ({ text: String(e && e.text || ''), ts: e && e.ts ? String(e.ts) : nowIso() }));
+  } catch {
+    return [];
+  }
+}
+
+export function clearSessionEvents(sessionId, options){
+  const env = resolveAgentContext(options);
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return false;
+  const filePath = sessionEventFilePath(sid, options);
+  const wakePath = sessionWakeFilePath(sid, options);
+  let ok = true;
+  try {
+    if (filePath && existsSync(filePath)){
+      try { unlinkSync(ensureWriteInWorkspace(filePath, env.workspaceRoot)); } catch { ok = false; }
+    }
+  } catch {}
+  try {
+    if (wakePath && existsSync(wakePath)){
+      try { unlinkSync(ensureWriteInWorkspace(wakePath, env.workspaceRoot)); } catch { ok = false; }
+    }
+  } catch {}
+  return ok;
+}
+
+export function isSessionTurnLocked(sessionId, options){
+  const env = resolveAgentContext(options);
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return false;
+  const path = sessionTurnLockPath(sid, options);
+  if (!path) return false;
+  try {
+    const st = statSync(ensureReadInWorkspace(path, env.workspaceRoot));
+    const age = nowMs() - st.mtimeMs;
+    const staleMs = 10 * 60 * 1000;
+    if (age > staleMs){
+      try { unlinkSync(ensureWriteInWorkspace(path, env.workspaceRoot)); } catch {}
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function acquireSessionTurnLock(sessionId, options){
+  const env = resolveAgentContext(options);
+  const sid = normalizeSessionId(sessionId);
+  if (!sid) return null;
+  const path = sessionTurnLockPath(sid, options);
+  if (!path) return null;
+  const now = nowMs();
+  const staleMs = 10 * 60 * 1000;
+  const payload = JSON.stringify({ pid: process.pid, startedAtMs: now });
+  const tryCreate = () => {
+    const fd = openSync(ensureWriteInWorkspace(path, env.workspaceRoot), 'wx');
+    try {
+      try { writeFileSync(fd, payload, { encoding: 'utf-8' }); } catch {}
+    } finally {
+      try { closeSync(fd); } catch {}
+    }
+    return path;
+  };
+  try {
+    return tryCreate();
+  } catch {}
+  try {
+    const st = statSync(ensureReadInWorkspace(path, env.workspaceRoot));
+    const age = nowMs() - st.mtimeMs;
+    if (age > staleMs){
+      try { unlinkSync(ensureWriteInWorkspace(path, env.workspaceRoot)); } catch {}
+      try { return tryCreate(); } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+export function releaseSessionTurnLock(lockPath, options){
+  if (!lockPath) return;
+  const env = resolveAgentContext(options);
+  try { unlinkSync(ensureWriteInWorkspace(lockPath, env.workspaceRoot)); } catch {}
+}
+
 export function listAgentIdsWithJobs({ workspaceRoot } = {}){
   const root = resolveWorkspaceRootForOptions({ workspaceRoot });
   const agentIds = new Set();
@@ -507,4 +764,11 @@ export default {
   listAgentIdsWithJobs,
   loadTimerSettings,
   saveTimerSettings,
+  enqueueSessionEvent,
+  listSessionWakes,
+  readSessionEvents,
+  clearSessionEvents,
+  isSessionTurnLocked,
+  acquireSessionTurnLock,
+  releaseSessionTurnLock,
 };

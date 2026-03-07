@@ -17,6 +17,7 @@ export function createTimerTool(){
     kind: Type.Literal('arcana'),
     prompt: Type.String(),
     sessionId: Type.Optional(Type.String()),
+    sessionMode: Type.Optional(Type.String({ description: 'inherit|new|main_queue' })),
     title: Type.Optional(Type.String()),
     timeoutMs: Type.Optional(Type.Number({ description: 'Override arcana job timeout in ms' })),
   });
@@ -64,8 +65,11 @@ export function createTimerTool(){
         }
         let task = rawTask;
         if (task && typeof task === 'object' && String(task.kind||'').toLowerCase() === 'arcana'){
-          const sid = task.sessionId || ctx.sessionId;
-          if (sid && !task.sessionId) task = { ...task, sessionId: sid };
+          const sessionMode = typeof task.sessionMode === 'string' ? task.sessionMode : 'inherit';
+          if (sessionMode === 'inherit' || sessionMode === 'main_queue'){
+            const sid = task.sessionId || ctx.sessionId;
+            if (sid && !task.sessionId) task = { ...task, sessionId: sid };
+          }
         }
         try {
           const job = addJob({ title, schedule, task, enabled: args.enabled !== false }, storeOpts);
@@ -130,8 +134,11 @@ export function createTimerTool(){
         if (!id) return { content:[{ type:'text', text:'id required' }], details:{ ok:false, error:'missing_id' } };
         let taskPatch = args.task;
         if (taskPatch && typeof taskPatch === 'object' && String(taskPatch.kind||'').toLowerCase() === 'arcana'){
-          const sid = taskPatch.sessionId || ctx.sessionId;
-          if (sid && !taskPatch.sessionId) taskPatch = { ...taskPatch, sessionId: sid };
+          const sessionMode = typeof taskPatch.sessionMode === 'string' ? taskPatch.sessionMode : 'inherit';
+          if (sessionMode === 'inherit' || sessionMode === 'main_queue'){
+            const sid = taskPatch.sessionId || ctx.sessionId;
+            if (sid && !taskPatch.sessionId) taskPatch = { ...taskPatch, sessionId: sid };
+          }
         }
         try {
           const j = patchJob(id, { title: args.title, enabled: args.enabled, schedule: args.schedule, task: taskPatch }, storeOpts);

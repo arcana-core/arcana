@@ -318,6 +318,9 @@ export async function createArcanaSession(opts={}){
   const agentCfg = loadAgentConfig(agentHomeRoot);
   const cfg = mergeAgentConfig(globalCfg, agentCfg);
 
+  const providerName = (cfg && cfg.provider) ? String(cfg.provider).trim() : '';
+  const providerKey = (cfg && cfg.key) ? String(cfg.key).trim() : '';
+
   let model;
   const sel = resolveModelFromConfig(cfg) || resolveModelFromEnv();
   if (sel) { try { model = getModel(sel.provider, sel.id); } catch {} }
@@ -351,15 +354,14 @@ export async function createArcanaSession(opts={}){
   }
   const repoRoot = dirname(pkgRoot);
   // Skill-scoped tools (preload definitions; activation controlled by skill gate)
-  const arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+  let arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
   let skillTools = []; let skillToolMap = new Map();
   try {
     const res = await loadSkillTools(arcanaSkills);
     skillTools = res.tools || [];
     skillToolMap = res.skillToolNamesBySkill || new Map();
   } catch {}
-
-  const customTools = [
+  const buildCustomTools = () => ([
     notebook,
     ...memoryTools,
     codex,
@@ -371,7 +373,9 @@ export async function createArcanaSession(opts={}){
     webExtract,
     webSearchProxy,
     bashProxy,
-  ];
+  ]);
+
+  const customTools = buildCustomTools();
 
   // Compute skills prompt early so the resource loader can append it
   let skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
@@ -391,17 +395,39 @@ export async function createArcanaSession(opts={}){
     }
   });
   await loader.reload();
+  let createdSession = null;
   // Start a lightweight watcher that refreshes the skills prompt when SKILL.md files change
   try {
     ensureArcanaSkillsWatcher({
       workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot,
       onChange: () => {
-        try {
-          skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
-          const p = loader.reload();
-          if (p && typeof p.then === 'function') p.catch(() => {});
-          emit({ type: 'skills_refresh', reason: 'watch' });
-        } catch {}
+        (async () => {
+          try {
+            skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+            arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+            try {
+              const res = await loadSkillTools(arcanaSkills);
+              skillTools = res.tools || [];
+              skillToolMap = res.skillToolNamesBySkill || new Map();
+            } catch {}
+
+            const nextCustomTools = buildCustomTools();
+            const wrappedCustomTools = nextCustomTools.map((t) => wrapToolWithEnvOverlay(t, agentHomeRoot));
+
+            if (createdSession && typeof createdSession.reload === 'function') {
+              try {
+                createdSession._customTools = wrappedCustomTools;
+                await createdSession.reload();
+              } catch {}
+            } else {
+              const p = loader.reload();
+              if (p && typeof p.then === 'function') p.catch(() => {});
+            }
+          } catch {}
+          try {
+            emit({ type: 'skills_refresh', reason: 'watch' });
+          } catch {}
+        })().catch(() => {});
       }
     });
   } catch {}
@@ -480,6 +506,16 @@ export async function createArcanaSession(opts={}){
     resourceLoader: loader,
     ...(thinkingLevel ? { thinkingLevel } : {}),
   });
+
+  createdSession = created && created.session ? created.session : null;
+
+  // Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
+  try {
+    const prov = providerName || (model && model.provider) || '';
+    if (prov && providerKey && created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage && typeof created.session.modelRegistry.authStorage.setRuntimeApiKey === 'function') {
+      created.session.modelRegistry.authStorage.setRuntimeApiKey(prov, providerKey);
+    }
+  } catch {}
 
   // Apply initial execution policy to active tool names so chat2 sessions
   // honor the requested policy without an extra server-side toggle.

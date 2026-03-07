@@ -24,7 +24,7 @@ const toolPanels = new Map();
 const lastToolTurnBySession = new Map(); // sessionId -> current turn index (0-based)
 
 // Local persistence for tool panels
-const TOOL_PANELS_KEY = 'arcana.toolPanels.v1';
+const TOOL_PANELS_KEY = 'arcana.toolPanels.v2';
 const TOOL_PANELS_MAX_ACTIONS = 200;
 const TOOL_PANELS_MAX_TURNS = 200;
 const TOOL_PANELS_MAX_LOG_CHARS = 50000;
@@ -386,7 +386,7 @@ function ensureBuckets(sessionId){
   if (!logStore.has(sid)) logStore.set(sid, { main: [], tools: [], subagents: [] });
   return logStore.get(sid);
 }
-function sectionSelectorFor(tab){ return tab==='tools' ? '#logs-tools' : (tab==='details' ? '#logs-details' : (tab==='subagents' ? '#logs-subagents' : '#logs-main-sys')); }
+function sectionSelectorFor(tab){ return tab==='tools' ? '#logs-tools' : (tab==='details' ? '#logs-details' : '#logs-main-sys'); }
 function renderLogsFor(sessionId, tab){
   const el = document.querySelector(sectionSelectorFor(tab)); if (!el) return;
   if (tab === 'tools'){
@@ -416,7 +416,7 @@ function addLogLine(sessionId, tab, text){
   }
 }
 function setActiveLogTab(tab){
-  activeLogTab = (tab==='tools' || tab==='details' || tab==='subagents') ? tab : 'main';
+  activeLogTab = (tab==='tools' || tab==='details') ? tab : 'main';
   try{ localStorage.setItem('arcana.logs.activeTab', activeLogTab); } catch {}
   try{
     const bar = document.getElementById('tabs-bar');
@@ -424,11 +424,10 @@ function setActiveLogTab(tab){
       const btns = Array.from(bar.querySelectorAll('.tab'));
       for (const b of btns){ b.classList.toggle('active', (b && b.dataset && b.dataset.tab) === activeLogTab); }
     }
-    // toggle sections visibility
-    const mainEl = document.querySelector('#logs-main'); if (mainEl) mainEl.style.display = (activeLogTab==='main') ? 'block' : 'none';
-    const toolsEl = document.querySelector('#logs-tools'); if (toolsEl) toolsEl.style.display = (activeLogTab==='tools') ? 'block' : 'none';
-    const detailsEl = document.querySelector('#logs-details'); if (detailsEl) detailsEl.style.display = (activeLogTab==='details') ? 'block' : 'none';
-    const subEl = document.querySelector('#logs-subagents'); if (subEl) subEl.style.display = (activeLogTab==='subagents') ? 'block' : 'none';
+    // toggle sections visibility (preserve CSS-driven display types)
+    const mainEl = document.querySelector('#logs-main'); if (mainEl) mainEl.style.display = (activeLogTab==='main') ? '' : 'none';
+    const toolsEl = document.querySelector('#logs-tools'); if (toolsEl) toolsEl.style.display = (activeLogTab==='tools') ? '' : 'none';
+    const detailsEl = document.querySelector('#logs-details'); if (detailsEl) detailsEl.style.display = (activeLogTab==='details') ? '' : 'none';
   } catch {}
   renderLogsFor(getCurrentSessionId(), activeLogTab);
 }
@@ -600,21 +599,16 @@ function upsertToolAction(data){
     if (data.type === 'tool_execution_end'){
       action.status = data.isError || data.error ? 'error' : 'done';
       action.endedAt = ts;
-      if (data.result && typeof data.result === 'object' && !data.error){
-        try{
-          const s = JSON.stringify(data.result, null, 2);
-          if (s) action.log = action.log ? (action.log + '\n' + s) : s;
-        } catch {}
-      }
-      if (data.error){
-        const err = (data.error && (data.error.message || (data.error.toString && data.error.toString()))) || '';
-        if (err) action.log = action.log ? (action.log + '\n[error] ' + err) : ('[error] ' + err);
-      }
     }
     if (data.type === 'tool_execution_update'){
       const raw = (typeof data.partialResult !== 'undefined') ? data.partialResult : data.update;
       const info = formatToolUpdateInfo(raw);
-      if (info){ action.log = action.log ? (action.log + '\n' + info) : info; }
+      if (toolStreamEnabled && info){
+        action.log = action.log ? (action.log + '\n' + info) : info;
+      }
+    }
+    if (typeof action.log === 'string' && action.log.length > TOOL_PANELS_MAX_LOG_CHARS){
+      action.log = action.log.slice(-TOOL_PANELS_MAX_LOG_CHARS);
     }
     try{ scheduleSaveToolPanel(sid); } catch {}
     if (sid === getCurrentSessionId()){
@@ -857,7 +851,7 @@ function renderToolDetails(sessionId){
 	    metaEl.textContent = '';
       if (argsEl) argsEl.textContent = '';
       if (argsWrap) argsWrap.removeAttribute('open');
-	    bodyEl.textContent = 'When tools run, their live output will appear here.';
+	    bodyEl.textContent = 'When tools run, you can fetch their output on demand.';
 	    if (atBottom){ bodyEl.scrollTop = bodyEl.scrollHeight; } else { bodyEl.scrollTop = prevScrollTop; }
 	    return;
 	  }
@@ -1657,6 +1651,59 @@ function setupToolStreamToggle(){
   } catch{}
 }
 
+async function fetchSelectedToolOutput(){
+  try{
+    const sid = getCurrentSessionId() || currentId || '';
+    if (!sid) return;
+    const panel = getToolPanel(sid);
+    if (!panel || !panel.selectedId) return;
+    const action = panel.actions.get(panel.selectedId);
+    if (!action) return;
+    const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const params = new URLSearchParams();
+    params.set('agentId', aid);
+    params.set('sessionId', sid);
+    params.set('toolCallId', action.id);
+    params.set('tailBytes', '200000');
+    const url = '/api/tool-output?' + params.toString();
+    const r = await fetch(url);
+    const bodyEl = document.getElementById('tools-details-body');
+    if (!r.ok){
+      if (bodyEl) bodyEl.textContent = 'Failed to fetch tool output: HTTP ' + r.status;
+      return;
+    }
+    let j = null;
+    try { j = await r.json(); } catch {
+      if (bodyEl) bodyEl.textContent = 'Failed to parse tool output response.';
+      return;
+    }
+    if (!j || j.ok !== true){
+      if (bodyEl) bodyEl.textContent = 'Tool output not available.';
+      return;
+    }
+    const parts = [];
+    if (j.meta){
+      try{ parts.push('Meta:\n' + JSON.stringify(j.meta, null, 2)); } catch{}
+    }
+    if (j.result){
+      try{ parts.push('Result:\n' + JSON.stringify(j.result, null, 2)); } catch{}
+    }
+    if (typeof j.streamTail === 'string' && j.streamTail){
+      parts.push('Stream tail:\n' + j.streamTail);
+    }
+    const text = parts.length ? parts.join('\n\n') : 'No cached output.';
+    if (bodyEl){
+      const atBottom = (bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight) <= 16;
+      const prevScrollTop = bodyEl.scrollTop;
+      bodyEl.textContent = text;
+      if (atBottom){ bodyEl.scrollTop = bodyEl.scrollHeight; } else { bodyEl.scrollTop = prevScrollTop; }
+    }
+  } catch(e){
+    const bodyEl = document.getElementById('tools-details-body');
+    if (bodyEl) bodyEl.textContent = 'Error fetching tool output: ' + (((e && e.message) || e));
+  }
+}
+
 function setupSseConnection(){
   try {
     try { if (window.__arcana_global_es){ try { window.__arcana_global_es.close() } catch {} window.__arcana_global_es = null } } catch {}
@@ -1811,7 +1858,8 @@ function setupSseConnection(){
           if (targetId === currentId){ renderLiveInfoFor(targetId); }
         } catch {}
         try { upsertToolAction(data); } catch {}
-        logTools(sid, 'tool start: ' + data.toolName + (data.args ? (' ' + JSON.stringify(data.args)) : ''));
+        const summary = summarizeArgs(data.args || {});
+        logTools(sid, 'tool start: ' + (data.toolName||'') + (summary ? (' ' + summary) : ''));
         return;
       }
       if (data.type === 'tool_execution_end'){
@@ -1819,7 +1867,8 @@ function setupSseConnection(){
         let errMsg = '';
         if (isErr){ const cand = data.error?.message || data.error || data.result?.error?.message || data.result?.error || data.result?.stderr || data.result?.stdout; if (typeof cand === 'string') errMsg = cand; else if (cand) { try { errMsg = JSON.stringify(cand) } catch { errMsg = String(cand) } } }
         try { upsertToolAction(data); } catch {}
-        logTools(sid, 'tool end: ' + data.toolName + (isErr ? (' error: ' + (errMsg||'')) : ' ok'));
+        const cachedFlag = data.cached ? ' cached' : '';
+        logTools(sid, 'tool end: ' + (data.toolName||'') + (isErr ? (' error: ' + (errMsg||'')) : ' ok') + cachedFlag);
         return;
       }
       if (data.type === 'tool_repeat'){
@@ -1843,7 +1892,11 @@ function setupSseConnection(){
         const raw = (typeof data.partialResult !== 'undefined') ? data.partialResult : data.update;
         const info = formatToolUpdateInfo(raw);
         try { upsertToolAction(data); } catch {}
-        logTools(sid, 'update: ' + (data.toolName||'') + (info ? (' ' + info) : ''));
+        if (info){
+          logTools(sid, 'update: ' + (data.toolName||'') + ' ' + info);
+        } else {
+          logTools(sid, 'update: ' + (data.toolName||''));
+        }
         return;
       }
 
@@ -2005,6 +2058,12 @@ function setupSseConnection(){
 }
 
 setupToolStreamToggle();
+try{
+  const btn = document.getElementById('fetch-tool-output');
+  if (btn && btn.addEventListener){
+    btn.addEventListener('click', ()=>{ fetchSelectedToolOutput().catch(()=>{}); });
+  }
+} catch{}
 setupSseConnection();
 
 // Sidebar actions

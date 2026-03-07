@@ -112,7 +112,6 @@
           <button class="tab active" data-tab="main">主Agent</button>
           <button class="tab" data-tab="tools">工具</button>
           <button class="tab" data-tab="details">详情</button>
-          <button class="tab" data-tab="subagents">子Agent</button>
         </div>
 	        <div class="tabs-views" id="tabs-views" style="flex:1;overflow:auto;background:#fff;">
 	          <section id="logs-main" class="logs">
@@ -141,8 +140,9 @@
 	            <div class="tools-details">
 	              <div class="tools-details-header">
 	                <div id="tools-details-title" class="tools-details-title">No action selected</div>
-	                <div id="tools-details-meta" class="tools-details-meta"></div>
-	                <button id="toggle-tool-stream" type="button">实时工具输出: 关</button>
+                <div id="tools-details-meta" class="tools-details-meta"></div>
+                <button id="fetch-tool-output" type="button">Fetch tool output</button>
+                <button id="toggle-tool-stream" type="button">实时工具输出: 关</button>
 	              </div>
 	              <details class="tools-details-args-wrap" open>
 	                <summary>参数</summary>
@@ -151,7 +151,6 @@
 	              <pre id="tools-details-body" class="tools-details-body">When tools run, their live output will appear here.</pre>
 	            </div>
 	          </section>
-	          <section id="logs-subagents" class="logs" style="display:none"></section>
 	        </div>
       </div>
     </div>

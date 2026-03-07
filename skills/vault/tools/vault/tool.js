@@ -21,8 +21,8 @@ function createVaultTool(){
     parameters: {
       type: 'object',
       properties: {
-        names: { type: 'array', items: { type: 'string' }, description: 'Suggested variable names to highlight', nullable: true },
-        note: { type: 'string', description: 'Optional note to log for the user', nullable: true }
+        names: { type: 'array', items: { type: 'string' }, description: 'Suggested variable names to highlight' },
+        note: { type: 'string', description: 'Optional note to log for the user' }
       },
       required: []
     },

@@ -1,6 +1,7 @@
-import { listJobs, saveJob, setJobNextRun, buildLogPath, appendRun, acquireJobRunLock, releaseJobRunLock, listAgentIdsWithJobs } from './store.js';
+import { listJobs, saveJob, setJobNextRun, buildLogPath, appendRun, acquireJobRunLock, releaseJobRunLock, listAgentIdsWithJobs, enqueueSessionEvent, listSessionWakes, readSessionEvents, clearSessionEvents, isSessionTurnLocked } from './store.js';
 import { runExecTask } from './exec.js';
 import { runArcanaTask } from './arcana-task.js';
+import { createSession } from '../sessions-store.js';
 
 function nowIso(){ return new Date().toISOString(); }
 
@@ -37,7 +38,28 @@ async function runOne(job, { agentId, workspaceRoot } = {}){
       res = await runExecTask({ command: String(job.task.command||''), logPath });
     } else if (kind === 'arcana') {
       const arcanaTimeoutMs = resolveArcanaTimeoutMs(job);
-      res = await runArcanaTask({ prompt: String(job.task.prompt||''), sessionId: job.task.sessionId, title: job.task.title||job.title, logPath, agentId, timeoutMs: arcanaTimeoutMs });
+      const sessionMode = String(job.task && job.task.sessionMode || 'inherit').toLowerCase();
+      if (sessionMode === 'main_queue') {
+        const sessionId = String(job.task && job.task.sessionId || '').trim();
+        if (!sessionId) {
+          const finishedAtMs = Date.now();
+          res = { ok:false, error:'missing_sessionId', startedAtMs:startMs, finishedAtMs, outputTail:'' };
+        } else {
+          const enqueueRes = enqueueSessionEvent({ sessionId, text: job.task.prompt }, storeOpts);
+          const parts = ['enqueued_to_main_queue'];
+          if (enqueueRes && typeof enqueueRes.size === 'number') parts.push('size=' + enqueueRes.size);
+          if (enqueueRes && enqueueRes.skippedDuplicate) parts.push('skippedDuplicate=true');
+          const finishedAtMs = Date.now();
+          res = { ok:true, startedAtMs:startMs, finishedAtMs, outputTail: parts.join(' ') };
+        }
+      } else if (sessionMode === 'new') {
+        const title = job.task && job.task.title || job.title || 'Arcana Timer';
+        const sess = createSession({ title, workspace: storeOpts.workspaceRoot, agentId });
+        const sid = sess && sess.id;
+        res = await runArcanaTask({ prompt: String(job.task.prompt||''), sessionId: sid, title: job.task.title||job.title, logPath, agentId, timeoutMs: arcanaTimeoutMs });
+      } else {
+        res = await runArcanaTask({ prompt: String(job.task.prompt||''), sessionId: job.task.sessionId, title: job.task.title||job.title, logPath, agentId, timeoutMs: arcanaTimeoutMs });
+      }
     } else {
       res = { ok:false, error:'unknown_task_kind', startedAtMs:startMs, finishedAtMs: Date.now(), outputTail:'' };
     }
@@ -86,6 +108,42 @@ export async function runDueOnce({ workspaceRoot } = {}){
       } catch (e) {
         try {
           appendRun({ jobId: j.id, agentId, title: j.title, ok:false, error: String(e?.message||e), startedAtMs: Date.now(), finishedAtMs: Date.now() }, storeOpts);
+        } catch {}
+      }
+    }
+
+    const wakes = listSessionWakes(storeOpts);
+    if (wakes && wakes.length){
+      const arcanaTimeoutMs = resolveArcanaTimeoutMs(null);
+      for (const sessionId of wakes){
+        if (isSessionTurnLocked(sessionId, storeOpts)) continue;
+        const events = readSessionEvents(sessionId, storeOpts);
+        if (!events || !events.length){
+          clearSessionEvents(sessionId, storeOpts);
+          continue;
+        }
+        const lines = [];
+        lines.push('You are processing queued timer events for the current conversation.');
+        lines.push('');
+        lines.push('Events:');
+        let idx = 1;
+        for (const ev of events){
+          const text = String(ev && ev.text || '').trim();
+          if (!text) continue;
+          lines.push(String(idx) + '. ' + text);
+          idx++;
+        }
+        lines.push('');
+        lines.push('Respond once and address them concisely.');
+        const mergedPrompt = lines.join('\n');
+        const queueJobId = '__queue__';
+        const logPath = buildLogPath(queueJobId, stamp(), storeOpts);
+        try {
+          const res = await runArcanaTask({ prompt: mergedPrompt, sessionId, title: 'Timer Queue', logPath, agentId, timeoutMs: arcanaTimeoutMs });
+          if (res && res.ok) {
+            clearSessionEvents(sessionId, storeOpts);
+          }
+          results.push({ skipped:false, jobId: queueJobId + ':' + sessionId, ok: !!(res && res.ok), logPath, agentId });
         } catch {}
       }
     }

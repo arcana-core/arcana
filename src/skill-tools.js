@@ -54,7 +54,14 @@ export async function loadSkillTools(skills){
         const entry = resolveEntry(skillDir, name);
         if (!entry) { errors.push({ skill: s.name, tool: name, error: 'entry_not_found' }); continue; }
         try {
-          const mod = await import(pathToFileURL(entry).href);
+          let href = pathToFileURL(entry).href;
+          try {
+            const st = statSync(entry);
+            const m = st.mtimeMs || 0;
+            const sep = href.includes('?') ? '&' : '?';
+            href = href + sep + 'mtime=' + String(m);
+          } catch {}
+          const mod = await import(href);
           const fn = (mod && mod.default && typeof mod.default === 'function') ? mod.default : null;
           if (!fn) { errors.push({ skill: s.name, tool: name, error: 'no_default_factory' }); continue; }
           const def = await Promise.resolve(fn());

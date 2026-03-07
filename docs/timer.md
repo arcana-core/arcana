@@ -22,6 +22,12 @@ Examples:
   {"action":"add","title":"Daily Brief","schedule":{"type":"cron","value":"0 9 any any any","timezone":"UTC"},"task":{"kind":"arcana","prompt":"Summarize repo changes in 5 bullets"}}
 - Add an arcana job with a 2 minute timeout override (in ms):
   {"action":"add","title":"Short Arcana","schedule":{"type":"every","value":"10m"},"task":{"kind":"arcana","prompt":"Do a quick check","timeoutMs":120000}}
+- Arcana sessionMode inherit (default): uses or auto-fills the current chat sessionId when missing so existing jobs stay backward compatible.
+  {"action":"add","title":"Inherit Session","schedule":{"type":"every","value":"15m"},"task":{"kind":"arcana","prompt":"Check status","sessionMode":"inherit"}}
+- Arcana sessionMode new: creates a new isolated session for each timer run (no history is shared with interactive chat or other runs).
+  {"action":"add","title":"New Session Each Run","schedule":{"type":"every","value":"1h"},"task":{"kind":"arcana","prompt":"Summarize logs","sessionMode":"new"}}
+- Arcana sessionMode main_queue: enqueues the prompt as a per-session event and later drains queued events into one arcana turn when the main session is idle; consecutive duplicate events are suppressed and each session queue holds at most 20 events.
+  {"action":"add","title":"Main Queue Monitor","schedule":{"type":"every","value":"5m"},"task":{"kind":"arcana","prompt":"Poll latest metrics","sessionMode":"main_queue"}}
 
 Storage
 - .arcana/agents/<agentId>/timer/jobs.json
@@ -29,6 +35,9 @@ Storage
 - .arcana/agents/<agentId>/timer/logs/<jobId>/logs
 - .arcana/agents/<agentId>/timer/jobs.lock
 - .arcana/agents/<agentId>/timer/locks/<jobId>.lock
+- .arcana/agents/<agentId>/timer/session_events/
+- .arcana/agents/<agentId>/timer/session_wakes/
+- .arcana/agents/<agentId>/timer/session_turn_locks/
 
 Notes
 - exec uses /bin/zsh -lc to run commands; output is logged.

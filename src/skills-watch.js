@@ -14,6 +14,7 @@ let gWatcher = null;
 function computeSnapshot(roots) {
   const entries = [];
   const cap = 300;
+  const toolsCap = 300;
   for (const root of roots) {
     try {
       // root/SKILL.md
@@ -28,6 +29,7 @@ function computeSnapshot(roots) {
       let children = [];
       try { children = readdirSync(root, { withFileTypes: true }); } catch { children = []; }
       let seen = 0;
+      let toolsSeen = 0;
       for (const d of children) {
         const name = String(d.name || '');
         if (!name || name === 'node_modules' || name.startsWith('.')) { continue; }
@@ -45,12 +47,55 @@ function computeSnapshot(roots) {
 
         if (!isDir) { continue; }
 
-        const childSkill = join(root, name, 'SKILL.md');
+        const skillDir = join(root, name);
+        const childSkill = join(skillDir, 'SKILL.md');
         if (existsSync(childSkill)) {
           try {
             const st = statSync(childSkill);
             entries.push([childSkill, st.mtimeMs || 0, st.size || 0]);
           } catch { /* ignore */ }
+        }
+
+        // root/<skill>/tools/<toolName>/(tool.js|index.js)
+        if (toolsSeen < toolsCap) {
+          const toolsRoot = join(skillDir, 'tools');
+          let toolsChildren = [];
+          try {
+            const st = statSync(toolsRoot);
+            if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+              try { toolsChildren = readdirSync(toolsRoot, { withFileTypes: true }); } catch { toolsChildren = []; }
+            }
+          } catch { toolsChildren = []; }
+
+          for (const td of toolsChildren) {
+            if (toolsSeen >= toolsCap) break;
+            const tname = String(td.name || '');
+            if (!tname || tname === 'node_modules' || tname.startsWith('.')) { continue; }
+
+            let toolIsDir = false;
+            try {
+              if (td?.isDirectory?.()) {
+                toolIsDir = true;
+              } else if (td?.isSymbolicLink?.()) {
+                const st = statSync(join(toolsRoot, tname));
+                toolIsDir = !!st?.isDirectory?.();
+              }
+            } catch { /* ignore */ }
+
+            if (!toolIsDir) { continue; }
+
+            const toolDir = join(toolsRoot, tname);
+            for (const fname of ['tool.js', 'index.js']) {
+              if (toolsSeen >= toolsCap) break;
+              const candidate = join(toolDir, fname);
+              if (!existsSync(candidate)) continue;
+              try {
+                const st = statSync(candidate);
+                entries.push([candidate, st.mtimeMs || 0, st.size || 0]);
+                toolsSeen++;
+              } catch { /* ignore */ }
+            }
+          }
         }
         seen++;
         if (seen >= cap) break;
