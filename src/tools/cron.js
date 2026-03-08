@@ -2,6 +2,8 @@ import { Type } from '@sinclair/typebox';
 import { addJob, listJobSummaries, listRuns as storeListRuns, enableJob, disableJob, removeJob, patchJob, findJob } from '../cron/store.js';
 import { runDueOnce, runJobById } from '../cron/runner.js';
 import { getContext } from '../event-bus.js';
+import { createSession, listSessions } from '../sessions-store.js';
+import { loadSessionMeta } from '../session-meta-store.js';
 
 export function createCronTool(){
   const Schedule = Type.Object({
@@ -22,8 +24,10 @@ export function createCronTool(){
   });
 
   const Delivery = Type.Object({
-    mode: Type.Optional(Type.String({ description: 'none|announce' })),
+    mode: Type.Optional(Type.String({ description: 'none|announce|feishu_reply' })),
     sessionId: Type.Optional(Type.String()),
+    messageId: Type.Optional(Type.String()),
+    replyInThread: Type.Optional(Type.Boolean()),
   });
 
   const Job = Type.Object({
@@ -78,13 +82,72 @@ export function createCronTool(){
     return s === 'isolated' ? 'isolated' : 'main';
   }
 
-  function withDefaultDelivery(job, ctxSessionId){
+  function ensureCronInboxSessionId({ agentId, workspaceRoot } = {}){
+    try {
+      const agent = agentId;
+      const ws = String(workspaceRoot || '').trim() || undefined;
+      const targetTitle = '[cron-inbox]';
+      try {
+        const sessions = listSessions(agent);
+        const hit = sessions.find((s)=> String(s.title || '').trim() === targetTitle);
+        if (hit && hit.id) return hit.id;
+      } catch {}
+      const created = createSession({ title: targetTitle, workspace: ws, agentId: agent });
+      return created && created.id ? created.id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function withDefaultDelivery(job, ctxSessionId, ctx){
     const j = job && typeof job === 'object' ? { ...job } : {};
     if (!j.payload || typeof j.payload !== 'object') return j;
     const kind = String(j.payload.kind || '').toLowerCase();
     if (kind !== 'agentturn' && kind !== 'agent_turn' && kind !== 'agentturntask' && kind !== 'agentturn'.toLowerCase()) return j;
 
-    j.sessionTarget = normalizeSessionTarget(j.sessionTarget || 'main');
+    const hasSessionTarget = Object.prototype.hasOwnProperty.call(j, 'sessionTarget');
+    const hasDelivery = Object.prototype.hasOwnProperty.call(j, 'delivery');
+    const useIsolatedDefaults = !hasSessionTarget && !hasDelivery;
+
+    if (useIsolatedDefaults){
+      try {
+        const meta = ctx && ctx.sessionId ? loadSessionMeta(ctx.sessionId, { agentId: ctx.agentId }) : null;
+        const feishuMessageId = meta && meta.feishu && meta.feishu.messageId ? String(meta.feishu.messageId).trim() : '';
+        if (feishuMessageId){
+          j.sessionTarget = 'isolated';
+          j.delivery = {
+            mode: 'feishu_reply',
+            messageId: feishuMessageId,
+            replyInThread: true,
+          };
+          return j;
+        }
+      } catch {}
+
+      j.sessionTarget = 'isolated';
+      const baseDelivery = {};
+      baseDelivery.mode = 'announce';
+      let inboxId = null;
+      try {
+        inboxId = ensureCronInboxSessionId({
+          agentId: ctx && ctx.agentId,
+          workspaceRoot: ctx && ctx.workspaceRoot,
+        });
+      } catch {}
+      if (inboxId){
+        baseDelivery.sessionId = inboxId;
+      } else if (ctxSessionId){
+        baseDelivery.sessionId = ctxSessionId;
+      }
+      j.delivery = baseDelivery;
+      return j;
+    }
+
+    if (hasSessionTarget){
+      j.sessionTarget = normalizeSessionTarget(j.sessionTarget);
+    } else {
+      j.sessionTarget = normalizeSessionTarget('main');
+    }
     const baseDelivery = j.delivery && typeof j.delivery === 'object' ? { ...j.delivery } : {};
     if (!baseDelivery.mode) baseDelivery.mode = 'none';
     if (!baseDelivery.sessionId && ctxSessionId){
@@ -94,8 +157,8 @@ export function createCronTool(){
     return j;
   }
 
-  function buildJobFromArgs(args, ctxSessionId){
-    if (args.job) return withDefaultDelivery(args.job, ctxSessionId);
+  function buildJobFromArgs(args, ctxSessionId, ctx){
+    if (args.job) return withDefaultDelivery(args.job, ctxSessionId, ctx);
     const schedule = args.schedule;
     const payload = args.payload;
     if (!schedule || !payload) return null;
@@ -107,7 +170,7 @@ export function createCronTool(){
       delivery: args.delivery,
       enabled: args.enabled,
     };
-    return withDefaultDelivery(job, ctxSessionId);
+    return withDefaultDelivery(job, ctxSessionId, ctx);
   }
 
   function buildPatchFromArgs(args, ctxSessionId){
@@ -143,7 +206,7 @@ export function createCronTool(){
       const storeOpts = { agentId: ctx.agentId, workspaceRoot: ctx.workspaceRoot };
 
       if (action === 'add'){
-        const job = buildJobFromArgs(args, ctx.sessionId);
+        const job = buildJobFromArgs(args, ctx.sessionId, ctx);
         if (!job || !job.schedule || !job.payload){
           return { content:[{ type:'text', text:'job.schedule and job.payload (or schedule/payload) are required.' }], details:{ ok:false, error:'missing_params' } };
         }

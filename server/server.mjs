@@ -527,7 +527,7 @@ function resolveSessionContext(sessionId, explicitAgentId){
 }
 
 
-// Legacy per-policy sessions used by /api/chat
+// Per-policy system sessions used for shared agent context
 const sessionsByPolicy = new Map();
 let pluginFiles = [];
 let toolNames = [];
@@ -871,7 +871,7 @@ async function compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHo
   }
 }
 
-// Legacy global state (used by /api/chat)
+// Global state used by the legacy SSE bridge
 const legacyMediaRefsByTurn = new Set();
 const bridgedSessions = new WeakSet();
 const toolRepeat = new Map();
@@ -2170,54 +2170,6 @@ async function handleEvents(req, res) {
   });
 }
 
-// Legacy single-session endpoint
-async function handleChat(req, res) {
-  try {
-    const bufs = []; for await (const chunk of req) bufs.push(chunk);
-    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    const message = String(body.message || '').trim();
-    const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
-    if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
-    const sess = await ensurePolicySession(policy);
-    applyExecPolicyToSession(sess, policy);
-    // Tier1: user_issue detection -> direct daily memory append (deduped)
-    try {
-      if (MEMORY_TRIGGERS_ENABLED && detectProblemMention(message)) {
-        const key = 'legacy' + '|' + hash(message);
-        if (!seenRecentlyTtl(dedupeUserIssue, key, DEDUPE_TRIGGER_TTL_MS)) {
-          const effectiveAgentId = DEFAULT_AGENT_ID;
-          const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
-          const content = truncateText(message);
-          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_issue', content });
-        }
-      }
-      if (MEMORY_TRIGGERS_ENABLED && detectCorrectionMention(message)) {
-        const keyCorr = 'legacy' + '|corr|' + hash(message);
-        if (!seenRecentlyTtl(dedupeUserCorrection, keyCorr, DEDUPE_TRIGGER_TTL_MS)) {
-          const effectiveAgentId = DEFAULT_AGENT_ID;
-          const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
-          const content = truncateText(message);
-          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_correction', content });
-        }
-      }
-    } catch {}
-    let out = '';
-    const unsub = sess.subscribe((ev) => {
-      if (ev.type === 'message_update' && ev.message && ev.message.role === 'assistant') {
-        try {
-          const text = (Array.isArray(ev.message.content) ? ev.message.content : []).filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-          if (text) out = text;
-        } catch {}
-      }
-    });
-    try { await sess.prompt(message); } catch {}
-    try { unsub && unsub(); } catch {}
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: out }));
-  } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: e?.message || String(e) }));
-  }
-}
-
 // Concurrent + persistent endpoint
 async function handleChat2(req, res) {
   try {
@@ -2978,8 +2930,6 @@ function createRequestHandler() {
 
     if (req.method === 'GET' && url.pathname === '/api/env') { await handleGetEnv(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/env') { await handlePostEnv(req, res); return; }
-    // Legacy chat
-    if (req.method === 'POST' && url.pathname === '/api/chat') { await handleChat(req, res); return; }
 
     // Concurrent chat + persistence
     if (req.method === 'POST' && url.pathname === '/api/chat2') { await handleChat2(req, res); return; }

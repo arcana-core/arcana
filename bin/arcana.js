@@ -7,6 +7,12 @@ import { webCLI } from '../src/cli-web.js';
 import { wechatCLI } from '../src/cli-wechat.js';
 import { runDueOnce, serveLoop, runJobById } from '../src/cron/runner.js';
 import { listJobSummaries as cronList, listRuns as cronListRuns } from '../src/cron/store.js';
+import { startHeartbeatRunner } from '../src/heartbeat/runner.js';
+import { runHeartbeatOnce } from '../src/heartbeat/run-once.js';
+import { requestHeartbeatNow } from '../src/heartbeat/wake.js';
+import { enqueueSystemEvent } from '../src/system-events/store.js';
+import { loadAgentsSnapshot } from '../src/agents-snapshot.js';
+import { loadHeartbeatConfigForAgent } from '../src/heartbeat/config.js';
 
 const HELP = `
 Usage:
@@ -27,6 +33,11 @@ Usage:
   arcana cron run <id>                  # run a specific job now
   arcana cron list                      # list jobs
   arcana cron runs [--limit n]          # list recent runs
+  arcana heartbeat serve                # run heartbeat runner loop (Ctrl+C to stop)
+  arcana heartbeat once --agent <id> --session <sid> [--reason r]
+  arcana heartbeat request --agent <id> [--session <sid>] [--reason r]
+  arcana heartbeat enqueue --agent <id> --session <sid> --text <text> [--context c] [--dedupe k] [--wake]
+  arcana heartbeat status               # show heartbeat config per agent
 
 Env:
   OPENAI_API_KEY (or /login in interactive modes)
@@ -97,6 +108,7 @@ async function main(){
   if (cmd === 'web') return webCLI({ args: argv });
   if (cmd === 'wechat') return wechatCLI({ args: argv });
   if (cmd === 'cron') return cronCLI({ args: argv });
+  if (cmd === 'heartbeat') return heartbeatCLI({ args: argv });
   return console.log(HELP);
 }
 
@@ -144,6 +156,129 @@ async function cronCLI({ args }){
     if (!runs.length) console.log('no runs');
     return;
   }
+  return console.log(HELP);
+}
+
+
+async function heartbeatCLI({ args }){
+  const [, , sub, ...rest] = args;
+  const s = String(sub || '').toLowerCase();
+
+  if (s === 'serve'){
+    console.log('[arcana] heartbeat: runner started (Ctrl+C to stop)');
+    startHeartbeatRunner({
+      async onLog(res){
+        try {
+          const ts = new Date().toISOString();
+          const status = res && res.status ? String(res.status) : 'unknown';
+          const agentId = res && res.agentId != null ? String(res.agentId) : '';
+          const sessionId = res && res.sessionId != null ? String(res.sessionId) : '';
+          const reason = res && res.reason != null ? String(res.reason) : '';
+          const delivered = res && res.delivered ? ' delivered=true' : '';
+          const events = typeof res?.eventsProcessed === 'number' ? ' events=' + res.eventsProcessed : '';
+          const line = ts + ' ' + status +
+            (agentId ? ' agentId=' + agentId : '') +
+            (sessionId ? ' sessionId=' + sessionId : '') +
+            (reason ? ' reason=' + reason : '') +
+            delivered +
+            events;
+          console.log(line.trim());
+        } catch {}
+      },
+    });
+    // Keep process alive until interrupted.
+    // eslint-disable-next-line no-constant-condition
+    while (true){
+      // 1 minute sleep to keep event loop active for timers.
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve)=> setTimeout(resolve, 60000));
+    }
+  }
+
+  if (s === 'once'){
+    const agentIdx = rest.indexOf('--agent');
+    const sessionIdx = rest.indexOf('--session');
+    const reasonIdx = rest.indexOf('--reason');
+    const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const reason = reasonIdx >= 0 ? rest[reasonIdx + 1] : undefined;
+
+    const res = await runHeartbeatOnce({ agentId, sessionId, reason });
+    console.log(JSON.stringify(res, null, 2));
+    return;
+  }
+
+  if (s === 'request'){
+    const agentIdx = rest.indexOf('--agent');
+    const sessionIdx = rest.indexOf('--session');
+    const reasonIdx = rest.indexOf('--reason');
+    const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const reason = reasonIdx >= 0 ? rest[reasonIdx + 1] : undefined;
+
+    if (!agentId){
+      return error('arcana heartbeat request --agent <id> [--session <sid>] [--reason <r>]');
+    }
+
+    requestHeartbeatNow({ agentId, sessionId, reason });
+    console.log('[arcana] heartbeat wake requested for agent=' + agentId + (sessionId ? ' session=' + sessionId : '') + (reason ? ' reason=' + reason : ''));
+    return;
+  }
+
+  if (s === 'enqueue'){
+    const agentIdx = rest.indexOf('--agent');
+    const sessionIdx = rest.indexOf('--session');
+    const textIdx = rest.indexOf('--text');
+    const ctxIdx = rest.indexOf('--context');
+    const dedupeIdx = rest.indexOf('--dedupe');
+    const wake = rest.includes('--wake');
+
+    const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const text = textIdx >= 0 ? rest[textIdx + 1] : undefined;
+    const contextKey = ctxIdx >= 0 ? rest[ctxIdx + 1] : undefined;
+    const dedupeKey = dedupeIdx >= 0 ? rest[dedupeIdx + 1] : undefined;
+
+    if (!agentId || !sessionId || !text){
+      return error('arcana heartbeat enqueue --agent <id> --session <sid> --text <text> [--context c] [--dedupe k] [--wake]');
+    }
+
+    const record = await enqueueSystemEvent({ agentId, sessionId, text, contextKey, dedupeKey });
+    console.log(JSON.stringify(record, null, 2));
+
+    if (wake){
+      requestHeartbeatNow({ agentId, sessionId, reason: 'enqueue' });
+      console.log('[arcana] heartbeat wake requested for agent=' + agentId + ' session=' + sessionId + ' reason=enqueue');
+    }
+    return;
+  }
+
+  if (s === 'status'){
+    const agents = await loadAgentsSnapshot();
+    if (!agents.length){
+      console.log('no agents found under ~/.arcana/agents');
+      return;
+    }
+
+    for (const meta of agents){
+      if (!meta || !meta.agentId) continue;
+      const agentId = String(meta.agentId);
+      let cfg = null;
+      try { cfg = await loadHeartbeatConfigForAgent(agentId); } catch { cfg = null; }
+      const enabled = !!(cfg && cfg.enabled !== false);
+      const every = cfg && Object.prototype.hasOwnProperty.call(cfg, 'every') ? cfg.every : null;
+      const interval = every != null ? every : null;
+      const session = cfg && (typeof cfg.targetSessionId === 'string' ? cfg.targetSessionId : (typeof cfg.sessionId === 'string' ? cfg.sessionId : ''));
+      const parts = [];
+      parts.push('agent=' + agentId);
+      parts.push('enabled=' + enabled);
+      if (interval != null) parts.push('every=' + interval);
+      if (session) parts.push('targetSessionId=' + session);
+      console.log(parts.join(' '));
+    }
+    return;
+  }
+
   return console.log(HELP);
 }
 

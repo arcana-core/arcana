@@ -13,6 +13,7 @@ import createMemoryTools from './tools/memory.js';
 import { createAgentMemoryFsTools } from './tools/agent-memory-fs.js';
 import createSubagentsTool from './tools/subagents.js';
 import { createCronTool } from './tools/cron.js';
+import { createHeartbeatTool } from './tools/heartbeat.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname } from 'node:path';
 import { scryptSync, createDecipheriv } from 'node:crypto';
@@ -300,6 +301,7 @@ export async function runWithAgentEnvOverlay(agentHomeRoot, fn){
 }
 
 export async function createArcanaSession(opts={}){
+  const bootstrapContextMode = String(opts.bootstrapContextMode || "").trim().toLowerCase();
   const workspaceRoot = opts.workspaceRoot || opts.cwd || process.cwd();
   const workspaceRootNormalized = String(workspaceRoot || '').split('\\').join('/');
   const sweepKey = String(workspaceRoot || '').trim();
@@ -352,6 +354,7 @@ export async function createArcanaSession(opts={}){
   const memoryTools = createMemoryTools();
   const agentMemoryFsTools = createAgentMemoryFsTools();
   const cronTool = createCronTool();
+  const heartbeatTool = createHeartbeatTool();
   const pkgRoot = arcanaPkgRoot();
   if (!process.env.ARCANA_PKG_ROOT){
     try { process.env.ARCANA_PKG_ROOT = pkgRoot; } catch {}
@@ -368,6 +371,10 @@ export async function createArcanaSession(opts={}){
     contextSessionId = String(opts.sessionId || '');
   }
   if (contextSessionId && contextSessionId.startsWith('agent:arcana:subagent:')){
+    minimalAgentBootstrap = true;
+  }
+
+  if (bootstrapContextMode === 'heartbeat_light' || bootstrapContextMode === 'lightweight'){
     minimalAgentBootstrap = true;
   }
 
@@ -398,6 +405,7 @@ export async function createArcanaSession(opts={}){
     codex,
     subagents,
     cronTool,
+    heartbeatTool,
     ...filteredPlugins,
     ...skillTools,
     webRender,
@@ -414,6 +422,8 @@ export async function createArcanaSession(opts={}){
     cwd: workspaceRoot,
     agentDir: agentHomeRoot,
     agentsFilesOverride: (base)=>{
+      const heartbeatLight = bootstrapContextMode === 'heartbeat_light';
+
       const allBaseFiles = base && Array.isArray(base.agentsFiles) ? base.agentsFiles : [];
       let baseFiles = allBaseFiles;
       if (minimalAgentBootstrap && workspaceRootNormalized){
@@ -430,7 +440,15 @@ export async function createArcanaSession(opts={}){
       for (const f of baseFiles){
         if (f && typeof f.path === 'string') seen.add(f.path);
       }
-      const extra = agentBootstrap && Array.isArray(agentBootstrap.contextFiles) ? agentBootstrap.contextFiles : [];
+      let extra = agentBootstrap && Array.isArray(agentBootstrap.contextFiles) ? agentBootstrap.contextFiles : [];
+      if (heartbeatLight){
+        const heartbeatPath = agentHomeRoot ? join(agentHomeRoot, 'HEARTBEAT.md') : null;
+        if (heartbeatPath){
+          extra = extra.filter((f)=> f && typeof f.path === 'string' && f.path === heartbeatPath);
+        } else {
+          extra = [];
+        }
+      }
       for (const f of extra){
         if (!f || !f.path || seen.has(f.path)) continue;
         merged.push(f);

@@ -969,23 +969,6 @@ function autoResize(){
 }
 input.addEventListener('input', autoResize);
 
-// Legacy send (unused in session mode, retained for completeness)
-async function send(){
-  const text = input.value.trim();
-  if (!text) return;
-  appendMessage('user', text);
-  input.value = '';
-  autoResize();
-  activeAssistant = appendMessage('assistant', '');
-  setTyping(activeAssistant, true);
-  try{
-    const r = await fetch('/api/chat', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ message: text, policy: (document.querySelector('#fullshell') && document.querySelector('#fullshell').checked) ? 'open' : 'restricted' }) });
-    const j = await r.json();
-    if (activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = j.text || '[无响应]'; }
-  }catch(e){ if (activeAssistant) activeAssistant.textContent = '[错误] ' + (((e && e.message) || e)); }
-  finally { messages.scrollTop = messages.scrollHeight; }
-}
-
 // Toggle advanced panel (more) + lazy-load config
 try {
   let loaded = false;
@@ -1173,7 +1156,16 @@ try { qs('timer-save').addEventListener('click', ()=>{ saveTimerSettingsUI().cat
 const CKEY = 'arcana.currentSessionId';
 const AKEY = 'arcana.currentAgentId';
 const LSK_LAST_SEEN = 'arcana.sessions.lastSeen';
+const LSK_BG_SESS_COLLAPSED = 'arcana.sessions.bgCollapsed.v1';
 let currentId = localStorage.getItem(CKEY) || '';
+let bgSessionsCollapsed = (()=>{
+  try{
+    const v = localStorage.getItem(LSK_BG_SESS_COLLAPSED);
+    if (v === '0' || v === 'false') return false;
+    if (v === '1' || v === 'true') return true;
+  } catch {}
+  return true;
+})();
 let streamingId = '';
 const typing = new Map(); // sessionId -> boolean
 let agents = [];
@@ -1413,9 +1405,26 @@ async function loadAgents(){
 function renderSessionList(items){
   const box = qs('session-list'); if (!box) return;
   box.innerHTML = '';
-  for (const it of (items||[])){
+  const list = Array.isArray(items) ? items.slice() : [];
+  const normal = [];
+  const background = [];
+  for (const it of list){
+    if (!it) continue;
+    const titleRaw = it.title || '';
+    const t = String(titleRaw || '');
+    const isCronRun = t.slice(0, 10) === '[cron-run]';
+    const isCronAgentTurn = t.startsWith('Cron Agent Turn #');
+    if (isCronRun || isCronAgentTurn){
+      background.push(it);
+    } else {
+      normal.push(it);
+    }
+  }
+
+  function renderOne(it, extraClass){
     const div = document.createElement('div');
-    div.className = (it.id===currentId) ? 'sess-item active' : 'sess-item';
+    const baseCls = (it.id===currentId) ? 'sess-item active' : 'sess-item';
+    div.className = extraClass ? (baseCls + ' ' + extraClass) : baseCls;
     div.dataset.id = it.id;
     const unread = isSessionUnread(it);
     const unreadDot = unread ? '<span class=sess-unread-dot></span>' : '';
@@ -1479,7 +1488,36 @@ function renderSessionList(items){
     });
     div.appendChild(del);
     div.addEventListener('click', async ()=>{ await openSession(it.id) });
-    box.appendChild(div);
+    return div;
+  }
+
+  for (const it of normal){
+    box.appendChild(renderOne(it));
+  }
+
+  if (background.length){
+    const header = document.createElement('div');
+    header.className = 'sess-bg-header';
+    const label = document.createElement('span');
+    label.className = 'sess-bg-title';
+    label.textContent = 'Background (' + background.length + ')';
+    const toggle = document.createElement('span');
+    toggle.className = 'sess-bg-toggle';
+    toggle.textContent = bgSessionsCollapsed ? '+' : '-';
+    header.appendChild(label);
+    header.appendChild(toggle);
+    header.addEventListener('click', ()=>{
+      bgSessionsCollapsed = !bgSessionsCollapsed;
+      try{ localStorage.setItem(LSK_BG_SESS_COLLAPSED, bgSessionsCollapsed ? '1' : '0'); } catch {}
+      renderSessionList(items);
+    });
+    box.appendChild(header);
+
+    if (!bgSessionsCollapsed){
+      for (const it of background){
+        box.appendChild(renderOne(it, 'sess-item-bg'));
+      }
+    }
   }
 }
 
@@ -1595,9 +1633,7 @@ async function sendWithSession(){
   finally { messages.scrollTop = messages.scrollHeight; }
 }
 
-// Hook send to session mode
-try { sendBtn.removeEventListener('click', send) } catch {}
-try { input.removeEventListener('keydown', ()=>{}) } catch {}
+// Hook send button + Enter to session mode
 sendBtn.addEventListener('click', ()=>{ sendWithSession().catch(()=>{}) });
 input.addEventListener('keydown', (e)=>{ if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendWithSession().catch(()=>{}) } });
 // Stop button -> hard abort current run

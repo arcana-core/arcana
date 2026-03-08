@@ -1,0 +1,15 @@
+.DS_Store
+
+node_modules/
+artifacts/
+.arcana/
+.cache/
+.tmp/
+.tmp_openclaw/
+tmp-*/
+tmp-pw-*/
+
+*.log
+*.tmp
+*.swp
+

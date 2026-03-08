@@ -184,15 +184,12 @@ async function compactSessionIfNeeded({ sessionId, agentId, workspaceRoot, agent
     const comp = settings && settings.compaction && typeof settings.compaction === 'object' ? settings.compaction : {};
     const thresholdTokensRaw = comp.thresholdTokens;
     const fallbackBytesRaw = comp.fallbackBytes;
-    const fallbackCharsLegacyRaw = comp.fallbackChars;
     const keepRecentRaw = comp.keepRecentMessages;
     const thresholdTokensVal = Number(thresholdTokensRaw);
     const fallbackBytesVal = Number(fallbackBytesRaw);
-    const fallbackCharsLegacyVal = Number(fallbackCharsLegacyRaw);
     const keepRecentVal = Number(keepRecentRaw);
     const thresholdTokens = (Number.isFinite(thresholdTokensVal) && thresholdTokensVal > 0) ? thresholdTokensVal : 200000;
-    let fallbackBytes = (Number.isFinite(fallbackBytesVal) && fallbackBytesVal > 0) ? fallbackBytesVal : 600000;
-    if ((!fallbackBytes || fallbackBytes <= 0) && Number.isFinite(fallbackCharsLegacyVal) && fallbackCharsLegacyVal > 0) fallbackBytes = fallbackCharsLegacyVal;
+    const fallbackBytes = (Number.isFinite(fallbackBytesVal) && fallbackBytesVal > 0) ? fallbackBytesVal : 600000;
     const keepRecentMessages = (Number.isFinite(keepRecentVal) && keepRecentVal > 0) ? keepRecentVal : 50;
 
     let sessionObj = loadSession(sessionId, { agentId });

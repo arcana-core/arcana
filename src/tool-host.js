@@ -197,6 +197,19 @@ async function handleWebRender(id, params){
     }
     return reply(id, true, { content:[{ type:'text', text:'closed' }], details:{ ok:true } });
   }
+  if (action === 'click') {
+    const r = await PW.click({
+      selector: params?.selector,
+      text: params?.text,
+      nth: (typeof params?.nth === 'number') ? params.nth : undefined,
+      timeoutMs: params?.timeoutMs,
+    });
+    let label = '';
+    if (r.selector) label = 'selector ' + r.selector;
+    else if (r.text) label = 'text ' + r.text;
+    const text = label ? ('clicked ' + label) : 'clicked';
+    return reply(id, true, { content:[{ type:'text', text }], details:r });
+  }
   if (action === 'navigate') { const r = await PW.navigate(params?.url, { waitUntil: params?.waitUntil }); return reply(id, true, { content:[{ type:'text', text: 'navigated ' + r.url }], details:r }); }
   if (action === 'snapshot') { const r = await PW.extract({ maxChars: params?.maxChars||20000 }); const wrapped = '[external:web_render]\n' + r.text; return reply(id, true, { content:[{ type:'text', text: wrapped }], details: { url: r.url, title: r.title, tookMs: r.tookMs } }); }
   return reply(id, false, { message: 'unknown_action' });

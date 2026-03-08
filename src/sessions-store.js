@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
@@ -24,49 +24,12 @@ function normalizeAgentId(raw){
   }
 }
 
-let defaultMigrationChecked = false;
-
-// Best-effort one-time migration from legacy session folders into
-// ~/.arcana/agents/default/sessions. We do not scan across agents.
-function migrateLegacySessionsForDefault(targetDir){
-  if (defaultMigrationChecked) return; defaultMigrationChecked = true;
-  try {
-    // If target already has sessions, skip migration
-    try {
-      const names = readdirSync(targetDir).filter((n) => n.endsWith('.json'));
-      if (names.length) return;
-    } catch {}
-
-    const legacyRoots = [
-      arcanaHomePath('sessions'),                // legacy global ~/.arcana/sessions
-      join(arcanaPkgRoot(), '.sessions'),        // arcana/.sessions when running from repo
-      join(process.cwd(), '.sessions'),          // project root .sessions (if any)
-    ];
-
-    for (const root of legacyRoots){
-      if (!existsSync(root)) continue;
-      let migrated = 0;
-      try {
-        const names = readdirSync(root).filter((n) => n.endsWith('.json'));
-        for (const name of names){
-          const src = join(root, name);
-          const dst = join(targetDir, name);
-          if (existsSync(dst)) continue;
-          try { copyFileSync(src, dst); migrated++; } catch {}
-        }
-      } catch {}
-      if (migrated > 0) return; // stop after first legacy root with files
-    }
-  } catch {}
-}
-
 // Session store directory: ~/.arcana/agents/<agentId>/sessions
 function sessionsDir(agentIdRaw){
   const baseHome = ensureArcanaHomeDir();
   const agentId = normalizeAgentId(agentIdRaw);
   const d = join(baseHome, 'agents', agentId, 'sessions');
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
-  if (agentId === DEFAULT_AGENT_ID) migrateLegacySessionsForDefault(d);
   return d;
 }
 

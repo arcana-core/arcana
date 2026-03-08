@@ -5,14 +5,18 @@ import * as pw from "../pw-runtime.js";
 
 export function createWebRenderTool(){
   const Params = Type.Object({
-    action: Type.String({ description: 'start|status|navigate|snapshot|open|close' }),
+    action: Type.String({ description: 'start|status|navigate|snapshot|open|close|click' }),
     url: Type.Optional(Type.String()),
     waitUntil: Type.Optional(Type.String()),
     maxChars: Type.Optional(Type.Number()),
     headless: Type.Optional(Type.Boolean()),
     engine: Type.Optional(Type.String()),
     userDataDir: Type.Optional(Type.String()),
-    forceRestart: Type.Optional(Type.Boolean())
+    forceRestart: Type.Optional(Type.Boolean()),
+    selector: Type.Optional(Type.String()),
+    text: Type.Optional(Type.String()),
+    nth: Type.Optional(Type.Number()),
+    timeoutMs: Type.Optional(Type.Number())
   });
   return {
     label: "Web Render",
@@ -66,6 +70,17 @@ export function createWebRenderTool(){
       }
       if (action === 'navigate') { const r = await pw.navigate(args.url, { waitUntil: args.waitUntil }); return { content:[{ type:'text', text: `navigated ${r.url}` }], details: r }; }
       if (action === 'snapshot') { const r = await pw.extract({ maxChars: args.maxChars||20000 }); const wrapped = `[external:web_render]\n` + r.text; return { content:[{ type:'text', text: wrapped }], details: { url: r.url, title: r.title, tookMs: r.tookMs } }; }
+      if (action === 'click') {
+        const r = await pw.click({
+          selector: args.selector,
+          text: args.text,
+          nth: (typeof args.nth === 'number') ? args.nth : undefined,
+          timeoutMs: args.timeoutMs,
+        });
+        const label = r.selector ? ('selector ' + r.selector) : (r.text ? ('text ' + r.text) : '');
+        const text = label ? ('clicked ' + label) : 'clicked';
+        return { content:[{ type:'text', text }], details:r };
+      }
       return { content:[{ type:'text', text: 'unknown action' }], details: { ok:false } };
     }
   };

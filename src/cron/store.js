@@ -116,31 +116,6 @@ function settingsPath(options){
   return join(baseDir, 'settings.json');
 }
 
-// If cron/settings.json is missing but legacy timer/settings.json exists
-// for the same agent, copy it once so compaction thresholds carry over.
-function maybeMigrateLegacyCronSettings(env){
-  try {
-    const workspaceRoot = env && env.workspaceRoot;
-    const agentId = env && env.agentId;
-    if (!workspaceRoot) return;
-    const normalized = normalizeAgentId(agentId);
-    if (!normalized) return;
-
-    const cronDir = ensureCronBaseDir(workspaceRoot, normalized);
-    const cronSettings = join(cronDir, 'settings.json');
-    if (existsSync(cronSettings)) return;
-
-    const legacyDir = join(workspaceRoot, '.arcana', 'agents', normalized, 'timer');
-    const legacySettings = join(legacyDir, 'settings.json');
-    if (!existsSync(legacySettings)) return;
-
-    const src = ensureReadInWorkspace(legacySettings, workspaceRoot);
-    const dst = ensureWriteInWorkspace(cronSettings, workspaceRoot);
-    const data = readFileSync(src, 'utf-8');
-    writeFileSync(dst, data, 'utf-8');
-  } catch {}
-}
-
 // Basic lock around jobs.json writes to avoid corruption across concurrent processes.
 // We create .lock with O_EXCL and remove it after the write. If lock exists and is stale (>30s), steal it.
 function acquireLock(timeoutMs = 5000, options){
@@ -183,7 +158,6 @@ export function listJobs(options){
 
 export function loadCronSettings(options){
   const env = resolveAgentContext(options);
-  maybeMigrateLegacyCronSettings(env);
   const p = settingsPath(options);
   const base = { compaction: { ...DEFAULT_CRON_COMPACTION } };
   if (!existsSync(p)) return base;
@@ -194,11 +168,9 @@ export function loadCronSettings(options){
       const src = raw.compaction && typeof raw.compaction === 'object' ? raw.compaction : raw;
       const t = Number(src.thresholdTokens);
       const fb = Number(src.fallbackBytes);
-      const fc = Number(src.fallbackChars);
       const k = Number(src.keepRecentMessages);
       if (Number.isFinite(t) && t > 0) out.compaction.thresholdTokens = t;
       if (Number.isFinite(fb) && fb > 0) { out.compaction.fallbackBytes = fb; }
-      else if (Number.isFinite(fc) && fc > 0) { out.compaction.fallbackBytes = fc; }
       if (Number.isFinite(k) && k > 0) out.compaction.keepRecentMessages = k;
     }
     return out;
@@ -209,7 +181,6 @@ export function loadCronSettings(options){
 
 export function saveCronSettings(settings, options){
   const env = resolveAgentContext(options);
-  maybeMigrateLegacyCronSettings(env);
   const p = settingsPath(options);
   const tmp = p + '.tmp';
   const current = loadCronSettings(options) || { compaction: { ...DEFAULT_CRON_COMPACTION } };
@@ -226,11 +197,9 @@ export function saveCronSettings(settings, options){
 
   const t = pickNumber(srcComp.thresholdTokens);
   const fb = pickNumber(srcComp.fallbackBytes);
-  const fcLegacy = pickNumber(srcComp.fallbackChars);
   const k = pickNumber(srcComp.keepRecentMessages);
   if (t != null) nextComp.thresholdTokens = t;
   if (fb != null) nextComp.fallbackBytes = fb;
-  else if (fcLegacy != null && (fb == null)) nextComp.fallbackBytes = fcLegacy;
   if (k != null) nextComp.keepRecentMessages = k;
 
   const finalSettings = { compaction: nextComp };
@@ -266,10 +235,17 @@ function normalizeSessionTarget(raw){
 function normalizeDelivery(raw){
   const base = raw && typeof raw === 'object' ? raw : {};
   const modeRaw = base.mode != null ? String(base.mode).trim().toLowerCase() : 'none';
-  const mode = modeRaw === 'announce' ? 'announce' : 'none';
+  let mode = 'none';
+  if (modeRaw === 'announce') mode = 'announce';
+  else if (modeRaw === 'feishu_reply') mode = 'feishu_reply';
   const out = { mode };
   const sid = base.sessionId != null ? String(base.sessionId).trim() : '';
   if (sid) out.sessionId = sid;
+  const mid = base.messageId != null ? String(base.messageId).trim() : '';
+  if (mid) out.messageId = mid;
+  if (Object.prototype.hasOwnProperty.call(base, 'replyInThread')){
+    out.replyInThread = Boolean(base.replyInThread);
+  }
   return out;
 }
 

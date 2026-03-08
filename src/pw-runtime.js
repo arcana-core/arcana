@@ -90,6 +90,32 @@ export async function extract(opts={}){
   return { url: _page.url(), title: result.title, text: result.body, tookMs: Date.now()-startTs };
 }
 
+export async function click(opts={}){
+  await start();
+  if (!_page) throw new Error("Playwright page not started");
+  const selector = (opts && typeof opts.selector === "string" && opts.selector.trim()) ? opts.selector.trim() : undefined;
+  const text = (opts && typeof opts.text === "string" && opts.text.trim()) ? opts.text.trim() : undefined;
+  if (!selector && !text) throw new Error("click requires selector or text");
+  const nth = (typeof opts.nth === "number" && opts.nth >= 0) ? Math.floor(opts.nth) : 0;
+  const timeoutMs = (typeof opts.timeoutMs === "number" && opts.timeoutMs > 0) ? opts.timeoutMs : 30000;
+  let target;
+  if (selector){
+    target = _page.locator(selector).nth(nth);
+  } else {
+    target = _page.getByText(text, { exact:false }).nth(nth);
+  }
+  await target.click({ timeout: timeoutMs });
+  return {
+    ok: true,
+    selector,
+    text,
+    nth,
+    timeoutMs,
+    url: (_page && _page.url) ? _page.url() : undefined,
+  };
+}
+
+
 // Evaluate arbitrary function in page context (internal helper for plugins)
 export async function evaluate(fn, arg){
   await start();
@@ -120,4 +146,4 @@ export async function close(){
 // Back-compat alias if callers prefer 
 export const stop = close;
 
-export default { ensure, start, navigate, extract, evaluate, status, close, stop };
+export default { ensure, start, navigate, extract, evaluate, status, close, stop, click };
