@@ -24,7 +24,7 @@ Arcana now separates **agent home** from **workspace root**.
     - Persona / long‑term context (user-editable):
       - `AGENTS.md`
       - `MEMORY.md`
-      - optional `SOUL.md`, `USER.md`, `TOOLS.md`
+      - optional `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`, `HEARTBEAT.md`
     - Agent‑scoped memory & skills:
       - `memory/` (daily logs, reflections, SOPs)
       - `skills/`
@@ -46,8 +46,11 @@ $ARCANA_HOME/
       AGENTS.md
       MEMORY.md
       SOUL.md
+      IDENTITY.md
       USER.md
       TOOLS.md
+      BOOTSTRAP.md
+      HEARTBEAT.md
       services.ini
       memory/
       skills/
@@ -72,7 +75,7 @@ Arcana treats each agent as an isolated unit along four axes:
 
 - **Persona**
   - Each agent has its own persona and behavior prompts under its agent home:
-    - `SOUL.md`, `USER.md`, `TOOLS.md`, `AGENTS.md`, plus optional `APPEND_SYSTEM.md`.
+    - `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`, `HEARTBEAT.md`, `AGENTS.md`, plus optional `APPEND_SYSTEM.md`.
   - When a session is created, Arcana prefers persona files from **agent home**, with a fallback to workspace‑local files for backward compatibility.
 
 - **Memory**
@@ -184,7 +187,7 @@ Sessions are stored **per agent** under the agent home.
   - On first use, the server calls `ensureDefaultAgentExists()` which:
     - Picks a `workspaceRoot` (from `ARCANA_WORKSPACE`, config workspace_root/workspaceRoot, or `process.cwd()`).
     - Creates `$ARCANA_HOME/agents/default/agent.json` pointing at that workspace.
-    - Seeds `AGENTS.md`, `MEMORY.md`, `SOUL.md`, `USER.md`, `TOOLS.md`, `memory/`, `skills/`, `.agents/skills/`, and a commented `services.ini` example.
+    - Seeds `AGENTS.md`, `MEMORY.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, `BOOTSTRAP.md`, `HEARTBEAT.md`, `memory/`, `skills/`, `.agents/skills/`, and a commented `services.ini` example.
     - If `$ARCANA_HOME/agents/default/` does not exist but there are existing agents, copies the newest agent home (by `createdAt` in `agent.json`, with a fallback to the file's creation/modification time) into `$ARCANA_HOME/agents/default/` once and rewrites `agent.json.agentId` to "default" so existing persona, memory, and sessions carry over.
 
 ## Sessions API

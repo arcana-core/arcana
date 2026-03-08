@@ -66,10 +66,14 @@ export function createProxyBashTool(client){
 
 export function createProxyWebRenderTool(client){
   const Params = Type.Object({
-    action: Type.String({ description: "start|status|navigate|snapshot" }),
+    action: Type.String({ description: "start|status|navigate|snapshot|open|close" }),
     url: Type.Optional(Type.String()),
     waitUntil: Type.Optional(Type.String()),
     maxChars: Type.Optional(Type.Number()),
+    headless: Type.Optional(Type.Boolean()),
+    engine: Type.Optional(Type.String()),
+    userDataDir: Type.Optional(Type.String()),
+    forceRestart: Type.Optional(Type.Boolean()),
     timeout: Type.Optional(Type.Number()),
   });
   return {
@@ -88,7 +92,8 @@ export function createProxyWebRenderTool(client){
       if (signal?.aborted) { try { await client.cancelActiveCall(); } catch {} return toError(new Error('cancelled')); }
       const onAbort = async () => { try { await client.cancelActiveCall(); } catch {} };
       const action = String(args?.action||"").toLowerCase();
-      const callOpts = _callTimeoutOpts((action === "start" || action === "status") ? WEB_SHORT_TIMEOUT_MS : WEB_TIMEOUT_MS, (action === "start" || action === "status") ? 0 : (args && args.timeout));
+      const isShort = (action === "start" || action === "status" || action === "open" || action === "close");
+      const callOpts = _callTimeoutOpts(isShort ? WEB_SHORT_TIMEOUT_MS : WEB_TIMEOUT_MS, isShort ? 0 : (args && args.timeout));
       try {
         signal?.addEventListener("abort", onAbort, { once: true });
         try {

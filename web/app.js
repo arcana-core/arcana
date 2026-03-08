@@ -1019,7 +1019,7 @@ async function loadTimerSettingsUI(){
     if ((fb === '' || fb == null) && (fcLegacy || fcLegacy === 0)) fb = fcLegacy;
     if (qs('timer-threshold-tokens')) qs('timer-threshold-tokens').value = (t || t === 0) ? String(t) : '';
     if (qs('timer-fallback-bytes')) qs('timer-fallback-bytes').value = (fb || fb === 0) ? String(fb) : '';
-  }catch(e){ appendLog('[timer] 读取定时器设置失败'); }
+  }catch(e){ appendLog('[cron] 读取定时器设置失败'); }
 }
 
 async function loadConfigUI(){
@@ -1122,9 +1122,9 @@ async function saveTimerSettingsUI(){
     const body = { agentId: aid, settings: { compaction: comp } };
     const r = await fetch('/api/timer-settings', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
     const j = await r.json();
-    if (!r.ok || !j.ok){ appendLog('[timer] 保存定时器设置失败'); return; }
-    appendLog('[timer] 已保存定时器设置');
-  }catch(e){ appendLog('[timer] 保存定时器设置失败'); }
+    if (!r.ok || !j.ok){ appendLog('[cron] 保存定时器设置失败'); return; }
+    appendLog('[cron] 已保存定时器设置');
+  }catch(e){ appendLog('[cron] 保存定时器设置失败'); }
 }
 
 async function runDoctorUI(){

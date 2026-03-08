@@ -13,8 +13,8 @@
     "doctor": "node ./bin/arcana.js doctor",
     "support-bundle": "node ./bin/arcana.js support-bundle",
     "web:search": "node ./bin/arcana.js web search",
-    "timer:once": "node ./bin/arcana.js timer once",
-    "timer:serve": "node ./bin/arcana.js timer serve"
+    "cron:once": "node ./bin/arcana.js cron once",
+    "cron:serve": "node ./bin/arcana.js cron serve"
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.54.0",

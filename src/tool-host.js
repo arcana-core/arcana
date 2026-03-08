@@ -18,7 +18,7 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 
 // Lazy import to avoid loading Playwright unless actually used
 let pw; // populated on first web_* call
@@ -154,8 +154,49 @@ async function handleBash(id, params){
 async function handleWebRender(id, params){
   const action = String(params?.action||'').toLowerCase();
   const PW = await ensurePW();
-  if (action === 'start') { await PW.start(); return reply(id, true, { content:[{ type:'text', text:'started' }], details:{ ok:true } }); }
-  if (action === 'status') { return reply(id, true, { content:[{ type:'text', text:'ok' }], details:{ ok:true } }); }
+  if (action === 'start') {
+    const opts = {
+      headless: (typeof params?.headless === 'boolean') ? params.headless : undefined,
+      engine: params?.engine,
+      userDataDir: params?.userDataDir,
+      forceRestart: Boolean(params?.forceRestart),
+    };
+    await PW.start(opts);
+    const s = (PW.status ? PW.status() : { started: true });
+    return reply(id, true, { content:[{ type:'text', text:'started' }], details:s });
+  }
+  if (action === 'status') {
+    const s = (PW.status ? PW.status() : { started: false });
+    return reply(id, true, { content:[{ type:'text', text:'status' }], details:s });
+  }
+  if (action === 'open') {
+    let userDataDir = params?.userDataDir || undefined;
+    if (!userDataDir){
+      const defaultUserDataDir = join(process.cwd(), '.cache', 'web_render_profile');
+      if (!existsSync(defaultUserDataDir)) mkdirSync(defaultUserDataDir, { recursive: true });
+      userDataDir = defaultUserDataDir;
+    }
+    await PW.start({
+      headless: false,
+      engine: params?.engine,
+      userDataDir,
+      forceRestart: Boolean(params?.forceRestart),
+    });
+    let r = null;
+    if (params?.url){
+      r = await PW.navigate(params.url, { waitUntil: params?.waitUntil });
+    }
+    const s = (PW.status ? PW.status() : undefined);
+    const details = r || s || { started: true };
+    const text = r && r.url ? ('opened ' + r.url) : 'opened';
+    return reply(id, true, { content:[{ type:'text', text }], details });
+  }
+  if (action === 'close') {
+    if (PW.close) {
+      await PW.close();
+    }
+    return reply(id, true, { content:[{ type:'text', text:'closed' }], details:{ ok:true } });
+  }
   if (action === 'navigate') { const r = await PW.navigate(params?.url, { waitUntil: params?.waitUntil }); return reply(id, true, { content:[{ type:'text', text: 'navigated ' + r.url }], details:r }); }
   if (action === 'snapshot') { const r = await PW.extract({ maxChars: params?.maxChars||20000 }); const wrapped = '[external:web_render]\n' + r.text; return reply(id, true, { content:[{ type:'text', text: wrapped }], details: { url: r.url, title: r.title, tookMs: r.tookMs } }); }
   return reply(id, false, { message: 'unknown_action' });

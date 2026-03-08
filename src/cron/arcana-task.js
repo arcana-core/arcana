@@ -4,7 +4,7 @@ import { createSession, listSessions, appendMessage, loadSession, saveSession, b
 import { createWriteStream } from 'node:fs';
 import { arcanaHomePath } from '../arcana-home.js';
 import { getContext, runWithContext, emit } from '../event-bus.js';
-import { loadTimerSettings } from './store.js';
+import { loadCronSettings } from './store.js';
 
 function tailLines(text, max=100){
   const lines = String(text||'').split('\n');
@@ -25,7 +25,7 @@ function normalizeMediaRef(raw){
       s = s.split(/\s+/)[0];
     }
   }
-  const strip = new Set(['\'', '"', '`', '(', ')', '[', ']', '<', '>', ',', ';']);
+  const strip = new Set(['\'','"','`','(',')','[',']','<','> ',',',';']);
   while (s.length && strip.has(s[0])) {
     s = s.slice(1).trimStart();
   }
@@ -120,7 +120,7 @@ function ensureSessionId({ sessionId, title, agentId, workspaceRoot }){
     const created = createSession({ title: t, workspace: ws, agentId: agent });
     return created.id;
   }
-  const created = createSession({ title: 'Arcana Timer', workspace: ws, agentId: agent });
+  const created = createSession({ title: 'Arcana Cron', workspace: ws, agentId: agent });
   return created.id;
 }
 
@@ -180,7 +180,7 @@ async function summarizeSessionChunk({ workspaceRoot, agentHomeRoot, existingSum
 
 async function compactSessionIfNeeded({ sessionId, agentId, workspaceRoot, agentHomeRoot, deltaTokens }){
   try {
-    const settings = loadTimerSettings({ workspaceRoot, agentId }) || {};
+    const settings = loadCronSettings({ workspaceRoot, agentId }) || {};
     const comp = settings && settings.compaction && typeof settings.compaction === 'object' ? settings.compaction : {};
     const thresholdTokensRaw = comp.thresholdTokens;
     const fallbackBytesRaw = comp.fallbackBytes;
@@ -266,7 +266,7 @@ export async function runArcanaTask({ prompt, sessionId, title, logPath, agentId
   const startedAtMs = Date.now();
   const agentHomeRoot = arcanaHomePath('agents', effectiveAgentId);
   const log = createWriteStream(logPath, { flags: 'w' });
-  const header = 'Arcana timer run at ' + (new Date(startedAtMs).toISOString()) + '\n' + 'sessionId: ' + sid + '\n' + 'agentId: ' + effectiveAgentId + '\n';
+  const header = 'Arcana cron run at ' + (new Date(startedAtMs).toISOString()) + '\n' + 'sessionId: ' + sid + '\n' + 'agentId: ' + effectiveAgentId + '\n';
   try { log.write(header + '\n'); } catch {}
 
   let textBuffer = '';
@@ -374,13 +374,28 @@ export async function runArcanaTask({ prompt, sessionId, title, logPath, agentId
       log.write('Assistant:\n' + textBuffer + '\n');
     } catch {}
 
-    return { ok: true, sessionId: sid, startedAtMs, finishedAtMs, outputTail: tailLines(textBuffer) };
+    return {
+      ok: true,
+      sessionId: sid,
+      startedAtMs,
+      finishedAtMs,
+      outputTail: tailLines(textBuffer),
+      assistantText: textBuffer,
+    };
   } catch (e) {
     const finishedAtMs = Date.now();
     const msg = String(e?.message || e || '');
     const code = (msg === 'timeout') ? 'timeout' : (msg || 'error');
     try { log.write('Error: ' + code + '\n'); } catch {}
-    return { ok: false, sessionId: sid, error: code, startedAtMs, finishedAtMs, outputTail: tailLines(textBuffer) };
+    return {
+      ok: false,
+      sessionId: sid,
+      error: code,
+      startedAtMs,
+      finishedAtMs,
+      outputTail: tailLines(textBuffer),
+      assistantText: textBuffer,
+    };
   } finally {
     try { emit({ type: 'turn_end', sessionId: sid }); } catch {}
     try { log.end(); } catch {}

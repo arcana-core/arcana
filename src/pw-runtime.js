@@ -6,6 +6,7 @@ let _pw;
 let _browser;
 let _context;
 let _page;
+let _lastStartOpts;
 
 const artifactsDir = join(resolveWorkspaceRoot(), "arcana", "artifacts");
 if (!existsSync(artifactsDir)) mkdirSync(artifactsDir, { recursive: true });
@@ -18,27 +19,51 @@ export async function ensure(){
   return _pw;
 }
 
-function pickEngine(pw){
-  const pref = (process.env.ARCANA_PW_ENGINE||"").toLowerCase();
+function pickEngine(pw, explicit){
+  const pref = (explicit || process.env.ARCANA_PW_ENGINE||"").toLowerCase();
   if (pref && pw[pref]) return pref;
   return "chromium"; // default
 }
 
-export async function start(){
-  if (_browser) return; const pw = await ensure();
-  const engine = pickEngine(pw);
-  const headless = String(process.env.ARCANA_PW_HEADLESS||"true").toLowerCase() !== "false";
+export async function start(opts={}){
+  const forceRestart = Boolean(opts && opts.forceRestart);
+  if (_browser && !forceRestart) return;
+  if (_browser && forceRestart) {
+    await close();
+  }
+  const pw = await ensure();
+  const engine = pickEngine(pw, opts.engine);
+  const envHeadless = String(process.env.ARCANA_PW_HEADLESS||"true").toLowerCase() !== "false";
+  const headless = (typeof opts.headless === "boolean") ? opts.headless : envHeadless;
+  let userDataDir = opts.userDataDir || undefined;
   const tryLaunch = async () => {
     const engines = engine === "chromium" ? ["chromium","webkit","firefox"] : [engine,"chromium","webkit","firefox"];
     let lastErr;
+    let usedEngine = null;
     for (const e of engines){
-      try { _browser = await pw[e].launch({ headless }); return; } catch (err) { lastErr = err; }
+      try {
+        if (userDataDir){
+          if (!existsSync(userDataDir)) mkdirSync(userDataDir, { recursive: true });
+          _context = await pw[e].launchPersistentContext(userDataDir, { headless });
+          _browser = _context.browser();
+        } else {
+          _browser = await pw[e].launch({ headless });
+          _context = await _browser.newContext();
+        }
+        usedEngine = e;
+        return usedEngine;
+      } catch (err) {
+        lastErr = err;
+        _browser = null;
+        _context = null;
+      }
     }
     throw lastErr || new Error("All Playwright engines failed to launch");
   };
-  await tryLaunch();
-  _context = await _browser.newContext();
-  _page = await _context.newPage();
+  const usedEngine = await tryLaunch();
+  const pages = (_context && _context.pages) ? _context.pages() : [];
+  _page = (pages && pages.length > 0) ? pages[0] : await _context.newPage();
+  _lastStartOpts = { headless, engine: usedEngine || engine, userDataDir };
 }
 
 export async function navigate(url, opts={}){
@@ -70,6 +95,18 @@ export async function evaluate(fn, arg){
   await start();
   return _page.evaluate(fn, arg);
 }
+
+export function status(){
+  const started = Boolean(_browser);
+  const url = (_page && _page.url) ? _page.url() : undefined;
+  return {
+    started,
+    headless: _lastStartOpts ? _lastStartOpts.headless : undefined,
+    engine: _lastStartOpts ? _lastStartOpts.engine : undefined,
+    userDataDir: _lastStartOpts ? _lastStartOpts.userDataDir : undefined,
+    url,
+  };
+}
 // Gracefully close Playwright resources and clear module globals
 export async function close(){
   // Close in reverse order of creation. Ignore errors to ensure shutdown.
@@ -83,4 +120,4 @@ export async function close(){
 // Back-compat alias if callers prefer 
 export const stop = close;
 
-export default { ensure, start, navigate, extract, evaluate, close, stop };
+export default { ensure, start, navigate, extract, evaluate, status, close, stop };

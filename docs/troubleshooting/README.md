@@ -28,6 +28,7 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
 
 - Playwright launch failed (PLAYWRIGHT_LAUNCH_FAILED)
   - npx playwright install; set ARCANA_PW_ENGINE=chromium|firefox|webkit
+  - To debug with a visible browser, set ARCANA_PW_HEADLESS=false or call the web_render tool with action=open on a machine with a GUI.
 
 - Unexpected automatic memory writes
   - Automatic Tier1 memory triggers are disabled by default.

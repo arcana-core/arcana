@@ -1,4 +1,5 @@
 import { mkdirSync, existsSync, writeFileSync } from "node:fs";
+import { loadAgentTemplate } from "../src/agent-templates.js";
 import { join, resolve, dirname } from "node:path";
 import os from "node:os";
 
@@ -97,25 +98,34 @@ function getBootstrapFiles(agentId, overrides = {}) {
   const safeId = String(agentId || "");
   const { soul, user, tools } = overrides;
 
+  function loadTemplateOrFallback(name, fallback) {
+    try {
+      const tpl = loadAgentTemplate(name);
+      if (tpl && String(tpl).trim()) return tpl;
+    } catch {}
+    return typeof fallback === "function" ? fallback() : String(fallback || "");
+  }
+
   return [
     {
       name: "AGENTS.md",
       required: true,
-      content:
-        "# Agent Home\n\n" +
-        "This directory belongs to agent \"" +
-        safeId +
-        "\".\n" +
-        "Use this file for agent-level rules, routing notes, and shared context.\n",
+      content: loadTemplateOrFallback(
+        "AGENTS.md",
+        () => `# Agent Home
+
+This directory belongs to agent "${safeId}".
+Use this file for agent-level rules, routing notes, and shared context.
+`,
+      ),
     },
     {
       name: "MEMORY.md",
       required: true,
-      content:
-        "# MEMORY\n\n" +
-        "Use this file to capture long-term notes, decisions, and links for agent \"" +
-        safeId +
-        "\".\n",
+      content: `# MEMORY
+
+Use this file to capture long-term notes, decisions, and links for agent "${safeId}".
+`,
     },
     {
       name: "SOUL.md",
@@ -123,8 +133,13 @@ function getBootstrapFiles(agentId, overrides = {}) {
       content:
         typeof soul === "string"
           ? soul
-          : "# SOUL.md - Who You Are\n\n" +
-            "Describe the persona, tone, and boundaries for this agent.\n",
+          : loadTemplateOrFallback(
+              "SOUL.md",
+              () => `# SOUL.md - Who You Are
+
+Describe the persona, tone, and boundaries for this agent.
+`,
+            ),
     },
     {
       name: "USER.md",
@@ -132,8 +147,13 @@ function getBootstrapFiles(agentId, overrides = {}) {
       content:
         typeof user === "string"
           ? user
-          : "# USER.md - Who I Am\n\n" +
-            "Describe the primary user or team this agent serves, plus preferences and constraints.\n",
+          : loadTemplateOrFallback(
+              "USER.md",
+              () => `# USER.md - Who I Am
+
+Describe the primary user or team this agent serves, plus preferences and constraints.
+`,
+            ),
     },
     {
       name: "TOOLS.md",
@@ -141,8 +161,40 @@ function getBootstrapFiles(agentId, overrides = {}) {
       content:
         typeof tools === "string"
           ? tools
-          : "# TOOLS.md - Tools and Capabilities\n\n" +
-            "List important tools, APIs, and workflows this agent should know about.\n",
+          : loadTemplateOrFallback(
+              "TOOLS.md",
+              () => `# TOOLS.md - Tools and Capabilities
+
+List important tools, APIs, and workflows this agent should know about.
+`,
+            ),
+    },
+    {
+      name: "IDENTITY.md",
+      required: false,
+      content: loadTemplateOrFallback(
+        "IDENTITY.md",
+        () => `# IDENTITY.md - Who Am I?
+`,
+      ),
+    },
+    {
+      name: "HEARTBEAT.md",
+      required: false,
+      content: loadTemplateOrFallback(
+        "HEARTBEAT.md",
+        () => `# HEARTBEAT.md
+`,
+      ),
+    },
+    {
+      name: "BOOTSTRAP.md",
+      required: false,
+      content: loadTemplateOrFallback(
+        "BOOTSTRAP.md",
+        () => `# BOOTSTRAP.md - Hello, World
+`,
+      ),
     },
   ];
 }

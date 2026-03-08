@@ -12,7 +12,7 @@ import createNotebookTool from './tools/notebook.js';
 import createMemoryTools from './tools/memory.js';
 import { createAgentMemoryFsTools } from './tools/agent-memory-fs.js';
 import createSubagentsTool from './tools/subagents.js';
-import { createTimerTool } from './tools/timer.js';
+import { createCronTool } from './tools/cron.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname } from 'node:path';
 import { scryptSync, createDecipheriv } from 'node:crypto';
@@ -22,9 +22,10 @@ import { existsSync, readFileSync, promises as fsp } from 'node:fs';
 import { buildArcanaSkillsPrompt, loadArcanaSkills } from './skills.js';
 import { loadSkillTools } from './skill-tools.js';
 import { ensureArcanaSkillsWatcher } from './skills-watch.js';
-import { emit } from './event-bus.js';
+import { emit, getContext } from './event-bus.js';
 import { ensureReadAllowed } from './workspace-guard.js';
 import { resolveAgentHomeRoot } from './agent-guard.js';
+import { buildAgentBootstrapContext } from './agent-bootstrap-context.js';
 import { globSync } from 'glob';
 
 function arcanaPkgRoot(){
@@ -300,6 +301,7 @@ export async function runWithAgentEnvOverlay(agentHomeRoot, fn){
 
 export async function createArcanaSession(opts={}){
   const workspaceRoot = opts.workspaceRoot || opts.cwd || process.cwd();
+  const workspaceRootNormalized = String(workspaceRoot || '').split('\\').join('/');
   const sweepKey = String(workspaceRoot || '').trim();
   if (sweepKey && !sweptToolHostWorkspaces.has(sweepKey)){
     sweptToolHostWorkspaces.add(sweepKey);
@@ -349,12 +351,38 @@ export async function createArcanaSession(opts={}){
   const notebook = createNotebookTool();
   const memoryTools = createMemoryTools();
   const agentMemoryFsTools = createAgentMemoryFsTools();
-  const timerTool = createTimerTool();
+  const cronTool = createCronTool();
   const pkgRoot = arcanaPkgRoot();
   if (!process.env.ARCANA_PKG_ROOT){
     try { process.env.ARCANA_PKG_ROOT = pkgRoot; } catch {}
   }
   const repoRoot = dirname(pkgRoot);
+
+  let minimalAgentBootstrap = false;
+  let contextSessionId = '';
+  try {
+    const ctx = getContext?.();
+    if (ctx && ctx.sessionId) contextSessionId = String(ctx.sessionId || '');
+  } catch {}
+  if (!contextSessionId && opts && typeof opts.sessionId === 'string'){
+    contextSessionId = String(opts.sessionId || '');
+  }
+  if (contextSessionId && contextSessionId.startsWith('agent:arcana:subagent:')){
+    minimalAgentBootstrap = true;
+  }
+
+  let agentBootstrap = { contextFiles: [], hasSoul: false };
+  try {
+    agentBootstrap = buildAgentBootstrapContext(agentHomeRoot, { minimal: minimalAgentBootstrap }) || agentBootstrap;
+  } catch {}
+
+  let hasSoulHint = false;
+  try {
+    if (!minimalAgentBootstrap && agentHomeRoot && existsSync(join(agentHomeRoot, 'SOUL.md'))){
+      hasSoulHint = true;
+    }
+  } catch {}
+
   // Skill-scoped tools (preload definitions; activation controlled by skill gate)
   let arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
   let skillTools = []; let skillToolMap = new Map();
@@ -369,7 +397,7 @@ export async function createArcanaSession(opts={}){
     ...agentMemoryFsTools,
     codex,
     subagents,
-    timerTool,
+    cronTool,
     ...filteredPlugins,
     ...skillTools,
     webRender,
@@ -384,13 +412,42 @@ export async function createArcanaSession(opts={}){
   let skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
   const loader = new DefaultResourceLoader({
     cwd: workspaceRoot,
+    agentDir: agentHomeRoot,
+    agentsFilesOverride: (base)=>{
+      const allBaseFiles = base && Array.isArray(base.agentsFiles) ? base.agentsFiles : [];
+      let baseFiles = allBaseFiles;
+      if (minimalAgentBootstrap && workspaceRootNormalized){
+        baseFiles = allBaseFiles.filter((f)=>{
+          if (!f || !f.path) return false;
+          const p = String(f.path).split('\\').join('/');
+          if (!p) return false;
+          if (p === workspaceRootNormalized) return true;
+          return p.startsWith(workspaceRootNormalized + '/');
+        });
+      }
+      const merged = [...baseFiles];
+      const seen = new Set();
+      for (const f of baseFiles){
+        if (f && typeof f.path === 'string') seen.add(f.path);
+      }
+      const extra = agentBootstrap && Array.isArray(agentBootstrap.contextFiles) ? agentBootstrap.contextFiles : [];
+      for (const f of extra){
+        if (!f || !f.path || seen.has(f.path)) continue;
+        merged.push(f);
+      }
+      return { agentsFiles: merged };
+    },
     appendSystemPromptOverride: (base)=>{
       const extras = [
         join(repoRoot, '.pi', 'APPEND_SYSTEM.md'),
         join(pkgRoot, '.pi', 'APPEND_SYSTEM.md'),
         join(resolveArcanaHome(), 'APPEND_SYSTEM.md'),
       ].map(readIfExists).filter(Boolean);
-      // Append skills prompt after APPEND_SYSTEM.md blocks
+      const soulLine = hasSoulHint
+        ? 'If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.'
+        : '';
+      if (soulLine) extras.push(soulLine);
+      // Append skills prompt after APPEND_SYSTEM.md blocks and SOUL hint
       if (skillsPrompt && skillsPrompt.trim()) extras.push(skillsPrompt);
       const merged = [...(base||[])];
       for (const s of extras){ if (s && !merged.includes(s)) merged.push(s); }

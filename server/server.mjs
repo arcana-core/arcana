@@ -24,7 +24,9 @@ import {
   saveSession as ssSave,
 } from '../src/sessions-store.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
-import { loadTimerSettings as timerLoadSettings, saveTimerSettings as timerSaveSettings, acquireSessionTurnLock, releaseSessionTurnLock } from '../src/timer/store.js';
+import { loadAgentTemplate } from '../src/agent-templates.js';
+import { 
+  loadCronSettings as cronLoadSettings, saveCronSettings as cronSaveSettings, acquireSessionTurnLock, releaseSessionTurnLock } from '../src/cron/store.js';
 // Tier1 memory triggers (direct daily append)
 
 
@@ -342,22 +344,43 @@ function seedAgentHomeBootstrap(agentHomeDir, agentId){
       writeFileSync(p, content, 'utf-8');
     } catch {}
   }
-  writeIfMissing('AGENTS.md',
+  function loadTemplateOrFallback(name, fallback){
+    try {
+      const tpl = loadAgentTemplate(name);
+      if (tpl && String(tpl).trim()) return tpl;
+    } catch {}
+    return typeof fallback === 'function' ? fallback() : String(fallback || '');
+  }
+  writeIfMissing('AGENTS.md', loadTemplateOrFallback('AGENTS.md', () => (
     '# Agent Home\n\n' +
     'This directory belongs to agent "' + safeId + '".\n' +
-    'Use this file for agent-level rules, routing notes, and shared context.\n');
+    'Use this file for agent-level rules, routing notes, and shared context.\n'
+  )));
   writeIfMissing('MEMORY.md',
     '# MEMORY\n\n' +
-    'Use this file to capture long-term notes, decisions, and links for agent "' + safeId + '".\n');
-  writeIfMissing('SOUL.md',
+    'Use this file to capture long-term notes, decisions, and links for agent "' + safeId + '".\n'
+  );
+  writeIfMissing('SOUL.md', loadTemplateOrFallback('SOUL.md', () => (
     '# SOUL.md - Who You Are\n\n' +
-    'Describe the persona, tone, and boundaries for this agent.\n');
-  writeIfMissing('USER.md',
+    'Describe the persona, tone, and boundaries for this agent.\n'
+  )));
+  writeIfMissing('USER.md', loadTemplateOrFallback('USER.md', () => (
     '# USER.md - Who I Am\n\n' +
-    'Describe the primary user or team this agent serves, plus preferences and constraints.\n');
-  writeIfMissing('TOOLS.md',
+    'Describe the primary user or team this agent serves, plus preferences and constraints.\n'
+  )));
+  writeIfMissing('TOOLS.md', loadTemplateOrFallback('TOOLS.md', () => (
     '# TOOLS.md - Tools and Capabilities\n\n' +
-    'List important tools, APIs, and workflows this agent should know about.\n');
+    'List important tools, APIs, and workflows this agent should know about.\n'
+  )));
+  writeIfMissing('IDENTITY.md', loadTemplateOrFallback('IDENTITY.md', () => (
+    '# IDENTITY.md - Who Am I?\n'
+  )));
+  writeIfMissing('HEARTBEAT.md', loadTemplateOrFallback('HEARTBEAT.md', () => (
+    '# HEARTBEAT.md\n'
+  )));
+  writeIfMissing('BOOTSTRAP.md', loadTemplateOrFallback('BOOTSTRAP.md', () => (
+    '# BOOTSTRAP.md - Hello, World\n'
+  )));
 
   const memDir = join(agentHomeDir, 'memory');
   const skillsDir = join(agentHomeDir, 'skills');
@@ -2706,10 +2729,10 @@ async function handleGetTimerSettings(req, res) {
     const agentId = agentIdParam || DEFAULT_AGENT_ID;
     const meta = findAgentMeta(agentId) || ensureDefaultAgentExists();
     const ws = (meta && meta.workspaceRoot) ? meta.workspaceRoot : workspaceRoot;
-    const settings = timerLoadSettings({ agentId, workspaceRoot: ws });
+    const settings = cronLoadSettings({ agentId, workspaceRoot: ws });
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, settings }));
   } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'timer_settings_read_failed', message: e?.message || String(e) }));
+    res.writeHead(500, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'cron_settings_read_failed', message: e?.message || String(e) }));
   }
 }
 
@@ -2727,10 +2750,10 @@ async function handlePostTimerSettings(req, res) {
     const meta = findAgentMeta(agentId) || ensureDefaultAgentExists();
     const ws = (meta && meta.workspaceRoot) ? meta.workspaceRoot : workspaceRoot;
     const settingsRaw = body && body.settings && typeof body.settings === 'object' ? body.settings : {};
-    const settings = timerSaveSettings(settingsRaw, { agentId, workspaceRoot: ws });
+    const settings = cronSaveSettings(settingsRaw, { agentId, workspaceRoot: ws });
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, settings }));
   } catch (e) {
-    res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'timer_settings_write_failed', message: e?.message || String(e) }));
+    res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'cron_settings_write_failed', message: e?.message || String(e) }));
   }
 }
 
@@ -2984,8 +3007,8 @@ function createRequestHandler() {
     if (req.method === 'POST' && url.pathname === '/api/config') { await handlePostConfig(req, res); return; }
     if (req.method === 'GET' && url.pathname === '/api/agent-config') { await handleGetAgentConfig(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/agent-config') { await handlePostAgentConfig(req, res); return; }
-    if (req.method === 'GET' && url.pathname === '/api/timer-settings') { await handleGetTimerSettings(req, res); return; }
-    if (req.method === 'POST' && url.pathname === '/api/timer-settings') { await handlePostTimerSettings(req, res); return; }
+    if (req.method === 'GET' && (url.pathname === '/api/timer-settings' || url.pathname === '/api/cron-settings')) { await handleGetTimerSettings(req, res); return; }
+    if (req.method === 'POST' && (url.pathname === '/api/timer-settings' || url.pathname === '/api/cron-settings')) { await handlePostTimerSettings(req, res); return; }
     if (req.method === 'GET' && url.pathname === '/api/tool-output') { await handleGetToolOutput(req, res); return; }
 
     await serveStatic(req, res);

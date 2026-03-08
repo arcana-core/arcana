@@ -5,8 +5,8 @@ import { runDoctor, printDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
 import { webCLI } from '../src/cli-web.js';
 import { wechatCLI } from '../src/cli-wechat.js';
-import { runDueOnce, serveLoop, runJobById } from '../src/timer/runner.js';
-import { listJobSummaries as timerList, listRuns as timerListRuns } from '../src/timer/store.js';
+import { runDueOnce, serveLoop, runJobById } from '../src/cron/runner.js';
+import { listJobSummaries as cronList, listRuns as cronListRuns } from '../src/cron/store.js';
 
 const HELP = `
 Usage:
@@ -22,11 +22,11 @@ Usage:
   arcana wechat draft --title ... --content-file <html> --thumb-media-id <id> [--author ... --digest ...]
   arcana wechat publish --media-id <id> [--wait] [--timeout-sec n]
   arcana wechat publish-file --title ... --content-file <html> --thumb-media-id <id> [--wait]
-  arcana timer once                      # run due jobs once and exit
-  arcana timer serve                     # run scheduler loop (Ctrl+C to stop)
-  arcana timer run <id>                  # run a specific job now
-  arcana timer list                      # list jobs
-  arcana timer runs [--limit n]          # list recent runs
+  arcana cron once                      # run due jobs once and exit
+  arcana cron serve                     # run scheduler loop (Ctrl+C to stop)
+  arcana cron run <id>                  # run a specific job now
+  arcana cron list                      # list jobs
+  arcana cron runs [--limit n]          # list recent runs
 
 Env:
   OPENAI_API_KEY (or /login in interactive modes)
@@ -96,13 +96,13 @@ async function main(){
   if (cmd === 'support-bundle') return supportBundle(argv);
   if (cmd === 'web') return webCLI({ args: argv });
   if (cmd === 'wechat') return wechatCLI({ args: argv });
-  if (cmd === 'timer') return timerCLI({ args: argv });
+  if (cmd === 'cron') return cronCLI({ args: argv });
   return console.log(HELP);
 }
 
 main().catch((e)=>{ console.error('[arcana] failed:', e?.message||e); process.exit(1); });
 
-async function timerCLI({ args }){
+async function cronCLI({ args }){
   const [, , sub, ...rest] = args;
   const s = String(sub||'').toLowerCase();
   if (s === 'once'){
@@ -114,20 +114,20 @@ async function timerCLI({ args }){
     return;
   }
   if (s === 'serve'){
-    console.log('[arcana] timer: serve loop (Ctrl+C to stop)');
+    console.log('[arcana] cron: serve loop (Ctrl+C to stop)');
     await serveLoop({ intervalMs: 1000, workspaceRoot: process.cwd() });
     return;
   }
   if (s === 'run'){
     const id = rest[0];
-    if (!id) return error('arcana timer run <id>');
+    if (!id) return error('arcana cron run <id>');
     const r = await runJobById(id, { workspaceRoot: process.cwd() });
     if (r && r.skipped) console.log('[arcana] skipped', r.reason||'');
     else console.log('[arcana] run', id, r && r.ok ? 'ok' : 'error');
     return;
   }
   if (s === 'list'){
-    const items = timerList({ workspaceRoot: process.cwd() });
+    const items = cronList({ workspaceRoot: process.cwd() });
     for (const j of items){
       console.log(j.id + '\t' + (j.enabled?'on':'off') + '\t' + j.schedule.type + ':' + j.schedule.value + (j.schedule.timezone?('('+j.schedule.timezone+')'):'') + '\t' + (j.nextRunAtMs?new Date(j.nextRunAtMs).toISOString():'n/a') + '\t' + j.title);
     }
@@ -137,7 +137,7 @@ async function timerCLI({ args }){
   if (s === 'runs'){
     const idx = Math.max(0, args.indexOf('--limit'));
     const limit = idx > -1 ? parseInt(args[idx+1]||'50', 10) : 50;
-    const runs = timerListRuns({ limit: Number.isFinite(limit) ? limit : 50 }, { workspaceRoot: process.cwd() });
+    const runs = cronListRuns({ limit: Number.isFinite(limit) ? limit : 50 }, { workspaceRoot: process.cwd() });
     for (const r of runs){
       console.log(r.jobId + '\t' + (r.ok?'ok':'err') + '\t' + new Date(r.startedAtMs).toISOString() + '\t' + (r.title||''));
     }
