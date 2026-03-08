@@ -20,7 +20,7 @@ Configure a provider (example: OpenAI)
 
 Optional behavior flags
 - Enable automatic Tier1 memory triggers (tool_fail + user_issue): set ARCANA_MEMORY_TRIGGERS=true
-- SOP extraction after tool failures is enabled by default; disable with ARCANA_SOP_EXTRACTION=false
+- Disable pre-compaction memory flush (memory write before history compaction): set ARCANA_MEMORY_FLUSH=false
 
 Quickstart
 - Health check: node ./bin/arcana.js doctor

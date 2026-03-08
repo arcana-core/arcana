@@ -23,7 +23,6 @@ import {
   buildHistoryPreludeText as ssPrelude,
   saveSession as ssSave,
 } from '../src/sessions-store.js';
-import { buildSopExtractionPrompt } from '../src/memory-reflection.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
 import { loadTimerSettings as timerLoadSettings, saveTimerSettings as timerSaveSettings, acquireSessionTurnLock, releaseSessionTurnLock } from '../src/timer/store.js';
 // Tier1 memory triggers (direct daily append)
@@ -209,8 +208,8 @@ function envFlagDefaultTrue(name){
     return true;
   } catch { return true; }
 }
-const SOP_EXTRACTION_ENABLED = envFlagDefaultTrue('ARCANA_SOP_EXTRACTION');
 
+const MEMORY_FLUSH_ENABLED = envFlagDefaultTrue('ARCANA_MEMORY_FLUSH');
 function mergeAgentConfig(globalCfg, agentCfg){
   const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
   const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
@@ -515,7 +514,6 @@ let skillNames = [];
 // Apply execution policy to a session by toggling active tools.
 // - Always enable safe read-only tools: read, grep, find, ls
 // - Enable bash only when policy === "open"
-// - Always remove edit/write tools
 // - Preserve any currently active custom/extension tools
 function applyExecPolicyToSession(sess, policy) {
   try {
@@ -523,8 +521,6 @@ function applyExecPolicyToSession(sess, policy) {
     ['read','grep','find','ls'].forEach((t) => desired.add(t));
     if (String(policy || '').toLowerCase() === 'open') desired.add('bash');
     else desired.delete('bash');
-    desired.delete('edit');
-    desired.delete('write');
     const list = Array.from(desired);
     sess.setActiveToolsByName?.(list);
     // Keep a copy for diagnostics broadcast on new SSE connections
@@ -535,16 +531,12 @@ function applyExecPolicyToSession(sess, policy) {
 
 // Per-session (id+policy+cwd) sessions used by /api/chat2
 
-// Reflection/SOP extraction infra (per workspace)
-const DEDUPE_SOP_TTL_MS = 24*60*60*1000;
-const dedupeSop = new Map(); // key -> lastSeenMs
-const reflectionSessionsByWs = new Map(); // ws -> session
+// Internal reflection sessions (per workspace)
 // Tier1 trigger dedupe (per workspace/session) — keep small TTL; best effort
 const DEDUPE_TRIGGER_TTL_MS = 10*60*1000; // 10 minutes
 const dedupeUserIssue = new Map(); // key -> lastSeenMs
 const dedupeUserCorrection = new Map(); // key -> lastSeenMs
 const dedupeToolFail = new Map(); // key -> lastSeenMs
-const reflectionQueueByWs = new Map(); // ws -> Promise chain
 const chatSessions = new Map();
 const bridgedById = new WeakSet();
 // Map sessionId -> Map(skillName -> toolNames[])
@@ -644,6 +636,7 @@ function isContextOverflowErrorMessage(msg){
 
 // History compaction state (per workspace + agent)
 const historyCompressionSessionsByKey = new Map(); // key: agentId|ws -> session
+const memoryFlushSessionsByKey = new Map(); // key: agentId|ws -> session
 const HISTORY_COMPACT_KEEP_RECENT_MESSAGES = 40;
 const HISTORY_COMPACT_SUMMARY_CHAR_BUDGET = 20000;
 
@@ -657,6 +650,20 @@ async function ensureHistoryCompressionSession(ws, agentId, agentHomeDir){
     const sess = created.session;
     try { sess.setActiveToolsByName?.([]); } catch {}
     historyCompressionSessionsByKey.set(key, sess);
+    return sess;
+  } catch { return null; }
+}
+
+async function ensureMemoryFlushSession(ws, agentId, agentHomeDir){
+  try {
+    const w = String(ws || workspaceRoot || '');
+    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    const key = effectiveAgentId + '|' + w;
+    if (memoryFlushSessionsByKey.has(key)) return memoryFlushSessionsByKey.get(key);
+    const created = await createArcanaSession({ workspaceRoot: w, agentHomeRoot: agentHomeDir, execPolicy: 'restricted' });
+    const sess = created.session;
+    try { sess.setActiveToolsByName?.(['memory_search','memory_get','memory_write','memory_edit']); } catch {}
+    memoryFlushSessionsByKey.set(key, sess);
     return sess;
   } catch { return null; }
 }
@@ -752,6 +759,58 @@ async function summarizeOlderMessagesForCompaction({ ws, agentId, agentHomeDir, 
   }
 }
 
+async function runPreCompactionMemoryFlush({ ws, agentId, agentHomeDir, sessionId, summaryText, recentMessages }){
+  if (!MEMORY_FLUSH_ENABLED) return;
+  try {
+    const w = String(ws || workspaceRoot || '');
+    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    const summary = String(summaryText || '').trim();
+    const recent = Array.isArray(recentMessages) ? recentMessages : [];
+    if (!summary && !recent.length) return;
+    await runWithContext({ sessionId, agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: w }, async () => {
+      const sess = await ensureMemoryFlushSession(w, effectiveAgentId, agentHomeDir);
+      if (!sess) return;
+      try { await sess.newSession?.(); } catch {}
+      let recentExcerpt = '';
+      try {
+        if (recent.length){
+          const obj = { messages: recent };
+          recentExcerpt = ssPrelude(obj) || '';
+          const maxChars = 4000;
+          if (recentExcerpt && recentExcerpt.length > maxChars) recentExcerpt = recentExcerpt.slice(0, maxChars);
+        }
+      } catch {}
+      let ts = '';
+      try {
+        const now = new Date();
+        ts = now.toISOString();
+      } catch {
+        try { ts = String(new Date()); } catch { ts = ''; }
+      }
+      let prompt = '';
+      prompt += 'You are managing durable long-term memory for this agent.\n';
+      prompt += 'Before older conversation history is compacted, review the summary and recent messages below.\n';
+      prompt += 'Decide what should be written to persistent memory so future sessions can benefit.\n';
+      prompt += 'You may only write to MEMORY.md and memory/*.md under the agent home, using the tools memory_write and memory_edit.\n';
+      prompt += 'Prefer appending raw notes to a daily file under memory/YYYY-MM-DD.md and keeping concise summaries in MEMORY.md.\n';
+      prompt += 'Do not write to any other files.\n\n';
+      if (ts) {
+        prompt += 'Current local timestamp: ' + ts + '\n\n';
+      }
+      if (summary) {
+        prompt += '[Summary of older messages]\n';
+        prompt += summary + '\n\n';
+      }
+      if (recentExcerpt) {
+        prompt += '[Recent messages excerpt]\n';
+        prompt += recentExcerpt + '\n\n';
+      }
+      prompt += 'Think briefly, then call memory_write/memory_edit tools to update memory as needed.\n';
+      try { await sess.prompt(prompt); } catch {}
+    });
+  } catch {}
+}
+
 async function compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir }){
   const sid = String(sessionId || '').trim();
   const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
@@ -772,6 +831,9 @@ async function compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHo
       try { broadcast({ type: 'history_compact_end', sessionId: sid, agentId: effectiveAgentId, keepRecentMessages: keep, compacted: false }); } catch {}
       return { compacted: false };
     }
+    try {
+      await runPreCompactionMemoryFlush({ ws, agentId: effectiveAgentId, agentHomeDir, sessionId: sid, summaryText: text, recentMessages: recent });
+    } catch {}
     const summaryMessage = { role: 'assistant', text: '[Conversation Summary] ' + text, ts: nowIso() };
     obj = ssLoad(sid, { agentId: effectiveAgentId }) || obj || { id: sid, agentId: effectiveAgentId, messages: [] };
     const curMsgs = Array.isArray(obj.messages) ? obj.messages : [];
@@ -1560,10 +1622,10 @@ async function ensurePolicySession(policy) {
 async function ensureSessionFor(sessionId, policy, cwdForSession, agentId, agentHomeDir) {
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   const ws = cwdForSession || workspaceRoot || '';
-  const key = String(sessionId || 'default') + '|' + pol + '|' + String(ws || '');
+  const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+  const key = effectiveAgentId + '|' + String(sessionId || 'default') + '|' + pol + '|' + String(ws || '');
   if (chatSessions.has(key)) return chatSessions.get(key);
 
-  const effectiveAgentId = agentId || DEFAULT_AGENT_ID;
   const ctx = {
     sessionId: String(sessionId || 'default'),
     agentId: effectiveAgentId,
@@ -1597,72 +1659,7 @@ function seenRecentlyTtl(map, key, ttlMs){
   } catch { return false }
 }
 
-async function ensureReflectionSession(ws, agentHomeDir){
-  try {
-    const key = String(ws || workspaceRoot || '');
-    if (reflectionSessionsByWs.has(key)) return reflectionSessionsByWs.get(key);
-    const created = await createArcanaSession({ workspaceRoot: key, agentHomeRoot: agentHomeDir, execPolicy: 'restricted' });
-    const sess = created.session;
-    try { sess.setActiveToolsByName?.(['read','grep','find','ls','memory_search','memory_get']); } catch {}
-    reflectionSessionsByWs.set(key, sess);
-    return sess;
-  } catch { return null }
-}
-
 function hash(s){ try { return createHash('sha1').update(String(s||'')).digest('hex'); } catch { return String(s||'') } }
-
-function scheduleSopExtraction({ ws, sessionId, agentId, toolName, safeArgs, errTextRaw }){
-  try {
-    if (!SOP_EXTRACTION_ENABLED) return;
-    const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
-    const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
-    const w = String(ws || workspaceRoot || '');
-    const key = effectiveAgentId + '|' + w + '|' + String(toolName || '?') + '|' + hash(String(safeArgs || '') + '|' + String(errTextRaw || ''));
-    if (seenRecentlyTtl(dedupeSop, key, DEDUPE_SOP_TTL_MS)) return; // dedupe within TTL
-
-    const prev = reflectionQueueByWs.get(w) || Promise.resolve();
-    let chain = prev.then(async () => {
-      try {
-        await runWithContext({ sessionId, agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: w }, async () => {
-          const sess = await ensureReflectionSession(w, agentHomeDir);
-          if (!sess) return;
-          const prompt = buildSopExtractionPrompt({ toolName, argsJson: safeArgs, errorText: errTextRaw });
-          let sopText = '';
-          const unsub = sess.subscribe((ev) => {
-            try {
-              if (ev && ev.type === 'message_end' && ev.message && ev.message.role === 'assistant'){
-                const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-                const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-                if (text) sopText = text;
-              }
-            } catch {}
-          });
-          try { await sess.prompt(prompt); } catch {}
-          try { unsub && unsub(); } catch {}
-          if (sopText) {
-            let normalized = '';
-            try {
-              const trimmed = String(sopText || '').trim();
-              if (trimmed) {
-                const parts = trimmed.split(/\r?\n/);
-                if (parts.length && /^sop:/i.test(parts[0].trim())) {
-                  parts.shift();
-                }
-                normalized = parts.join('\n').trim();
-              }
-            } catch {}
-            if (normalized) {
-              appendToAgentLongtermMemory({ agentHomeDir, heading: 'sop:' + String(toolName || '?'), content: normalized });
-            }
-          }
-        });
-      } catch {}
-      finally { try { broadcast({ type: 'memory_trigger', kind: 'sop_extract', toolName, sessionId }); } catch {} }
-    });
-    chain = chain.catch(() => {});
-    reflectionQueueByWs.set(w, chain);
-  } catch {}
-}
 
 function activateToolsForSkill({ sess, sessionId, skillName, policy }){
   try {
@@ -1762,7 +1759,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
   const effectiveAgentHome = agentHomeDir || arcanaHomePath('agents', effectiveAgentId);
   const effectiveWorkspace = String(ws || workspaceRoot || '');
   try { initSessionUsageFromStore({ agentId: effectiveAgentId, sessionId }); } catch {}
-  const toolArgsByCallId = new Map(); // toolCallId -> args snapshot for SOP context
+  const toolArgsByCallId = new Map(); // toolCallId -> args snapshot for failure context
   sess.subscribe((ev) => {
     try {
       const t = ev && ev.type ? String(ev.type) : '';
@@ -1809,7 +1806,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
       }
       if (t === 'tool_execution_end') {
         let errorSummary = '';
-        // Best-effort SOP extraction on tool failures (deduped + serialized per workspace)
+        // Best-effort failure capture for optional memory triggers
         if (String(ev.toolName||'') === "codex"){
           const sidKey = String(sessionId||"default");
           const t = Number((ev && ev.result && ev.result.details && ev.result.details.usage && (ev.result.details.usage.totalTokens || ev.result.details.usage.total_tokens)) || 0) || 0;
@@ -1852,7 +1849,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
 
             errorSummary = errTextRaw;
 
-            // Tier1: direct daily memory append of the failure (deduped), keep SOP extraction infra intact
+            // Tier1: direct daily memory append of the failure (deduped)
             try {
               if (MEMORY_TRIGGERS_ENABLED) {
                 const dedupeKey = String(sessionId || 'default') + '|' + hash(String(ev?.toolName || '?') + '|' + safeArgs + '|' + errTextRaw);
@@ -1868,9 +1865,6 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
               }
             } catch {}
 
-            if (SOP_EXTRACTION_ENABLED) {
-              scheduleSopExtraction({ ws: effectiveWorkspace, sessionId, agentId: effectiveAgentId, toolName: ev?.toolName || '?', safeArgs, errTextRaw });
-            }
           }
         } catch {}
         const endIsErr = !!(ev?.isError || ev?.error || (ev?.result && ((ev.result.details && ev.result.details.ok===false) || ev.result.error)));
@@ -2468,15 +2462,72 @@ async function handleAbort(req, res) {
     if (!agentId) agentId = DEFAULT_AGENT_ID;
     if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
 
-    const ctx = resolveSessionContext(sessionId, agentId);
-    const ws = ctx.workspaceRoot || workspaceRoot;
-    const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
-    const sess = await ensureSessionFor(sessionId, policy, ws, ctx.agentId, ctx.agentHomeDir);
-    applyExecPolicyToSession(sess, policy);
+    const hardAbortOne = (sess) => {
+      if (!sess) return false;
+      try { sess.abortRetry?.(); } catch {}
+      try { sess.clearQueue?.(); } catch {}
+      try { sess.agent?.abort?.(); } catch {}
+      try { sess._arcanaToolHostClient?.cancelActiveCall?.(); } catch {}
 
-    try { await runWithContext({ sessionId, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => sess.abort()); } catch {}
+      // Fallback: if the agent is not exposed, trigger the session-level abort
+      // but do not await it (it may wait for idle).
+      try {
+        if (!sess.agent?.abort && typeof sess.abort === 'function') {
+          const p = sess.abort();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        }
+      } catch {}
+      return true;
+    };
+
+    let abortedCount = 0;
+    const seen = new Set();
+
+    // Abort all in-memory chat2 sessions with the same sessionId, regardless of
+    // policy/workspace. This fixes cases where the UI started a session with a
+    // custom workspace, but /api/abort used the agent's default workspace.
+    try {
+      const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+      for (const [key, sess] of chatSessions.entries()) {
+        const parts = String(key || '').split('|');
+        const aidPart = parts[0] || '';
+        const sidPart = parts[1] || '';
+        if (aidPart !== effectiveAgentId) continue;
+        if (sidPart !== sessionId) continue;
+        if (!sess || seen.has(sess)) continue;
+        seen.add(sess);
+        if (hardAbortOne(sess)) abortedCount += 1;
+      }
+    } catch {}
+
+    // If nothing was found in-memory, best-effort locate/create likely session
+    // instances for known workspace candidates and abort them.
+    if (abortedCount === 0) {
+      try {
+        const ctx = resolveSessionContext(sessionId, agentId);
+        const wsFromBody = String(body.workspace || body.workspaceRoot || '').trim();
+        const wsFromStore = String(ctx.session?.workspace || '').trim();
+        const wsFromAgent = String(ctx.workspaceRoot || workspaceRoot || '').trim();
+        const wsCandidates = [wsFromBody, wsFromStore, wsFromAgent].filter((v, i, arr) => v && arr.indexOf(v) === i);
+        const policies = ['restricted', 'open'];
+        for (const ws of wsCandidates) {
+          for (const pol of policies) {
+            try {
+              const sess = await ensureSessionFor(sessionId, pol, ws, ctx.agentId, ctx.agentHomeDir);
+              if (sess && !seen.has(sess)) {
+                seen.add(sess);
+                if (hardAbortOne(sess)) abortedCount += 1;
+              } else {
+                hardAbortOne(sess);
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
     try { broadcast({ type: 'abort_done', sessionId }); } catch {}
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, aborted: abortedCount }));
   } catch (e) {
     res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'abort_failed', message: e?.message || String(e) }));
   }

@@ -32,7 +32,7 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
 - Unexpected automatic memory writes
   - Automatic Tier1 memory triggers are disabled by default.
   - To re-enable, set ARCANA_MEMORY_TRIGGERS=true for tool_fail/user_issue daily appends.
-  - SOP extraction runs are enabled by default; disable with ARCANA_SOP_EXTRACTION=false.
+  - History compaction runs a silent pre-compaction memory flush by default; disable with ARCANA_MEMORY_FLUSH=false.
 
 Support Bundle
 - Run: node ./bin/arcana.js support-bundle --out ./tmp/arcana-support

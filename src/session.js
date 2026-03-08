@@ -10,6 +10,7 @@ import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractToo
 import createCodexSubagentTool from './tools/codex-subagent.js';
 import createNotebookTool from './tools/notebook.js';
 import createMemoryTools from './tools/memory.js';
+import { createAgentMemoryFsTools } from './tools/agent-memory-fs.js';
 import createSubagentsTool from './tools/subagents.js';
 import { createTimerTool } from './tools/timer.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
@@ -347,6 +348,7 @@ export async function createArcanaSession(opts={}){
   const codex = createCodexSubagentTool();
   const notebook = createNotebookTool();
   const memoryTools = createMemoryTools();
+  const agentMemoryFsTools = createAgentMemoryFsTools();
   const timerTool = createTimerTool();
   const pkgRoot = arcanaPkgRoot();
   if (!process.env.ARCANA_PKG_ROOT){
@@ -364,6 +366,7 @@ export async function createArcanaSession(opts={}){
   const buildCustomTools = () => ([
     notebook,
     ...memoryTools,
+    ...agentMemoryFsTools,
     codex,
     subagents,
     timerTool,
@@ -509,6 +512,11 @@ export async function createArcanaSession(opts={}){
 
   createdSession = created && created.session ? created.session : null;
 
+  // Attach the tool-host client to the session so server-side abort can hard-cancel active tool calls.
+  try {
+    if (createdSession && !createdSession._arcanaToolHostClient) createdSession._arcanaToolHostClient = toolHost;
+  } catch {}
+
   // Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
   try {
     const prov = providerName || (model && model.provider) || '';
@@ -524,8 +532,6 @@ export async function createArcanaSession(opts={}){
     ['read','grep','find','ls'].forEach((t) => desired.add(t));
     if (execPolicy === 'open') desired.add('bash');
     else desired.delete('bash');
-    desired.delete('edit');
-    desired.delete('write');
     created.session?.setActiveToolsByName?.(Array.from(desired));
   } catch {}
 

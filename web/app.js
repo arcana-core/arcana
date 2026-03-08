@@ -1607,7 +1607,9 @@ try {
     try{
       const sid = getCurrentSessionId(); if (!sid) return;
       const aid = currentAgentId || DEFAULT_AGENT_ID;
-      await fetch('/api/abort', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid, agentId: aid }) });
+      const ws = (!hasAgents || !currentAgentId) ? String(currentWorkspace || '').trim() : '';
+      const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
+      await fetch('/api/abort', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid, agentId: aid, workspace: ws || undefined, policy }) });
     } catch {}
   });
 } catch {}
