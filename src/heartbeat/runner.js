@@ -203,14 +203,20 @@ export function startHeartbeatRunner({ loadAgents, onLog } = {}) {
 
   const initialLoadPromise = refreshAgents();
 
-  const disposeWakeHandler = setHeartbeatWakeHandler(async ({ agentId, sessionId, reason } = {}) => {
+  const disposeWakeHandler = setHeartbeatWakeHandler(async ({ agentId, sessionId, sessionKey, reason } = {}) => {
     const safeAgentId = agentId == null ? '' : String(agentId);
-    const safeSessionId = sessionId == null ? undefined : String(sessionId);
+    const safeSessionKey = sessionKey == null ? '' : String(sessionKey);
+    const safeSessionId = sessionId == null ? '' : String(sessionId);
     const startedAtMs = nowMs();
 
     let result;
     try {
-      result = await runHeartbeatOnce({ agentId: safeAgentId, sessionId: safeSessionId, reason });
+      result = await runHeartbeatOnce({
+        agentId: safeAgentId,
+        sessionId: safeSessionId || undefined,
+        sessionKey: safeSessionKey || undefined,
+        reason,
+      });
     } catch (error) {
       const message = error && error.message ? String(error.message) : String(error);
       result = {
@@ -236,7 +242,7 @@ export function startHeartbeatRunner({ loadAgents, onLog } = {}) {
       lastRunMs: finishedAtMs,
       lastStatus: result && result.status ? String(result.status) : 'unknown',
       lastReason: result && result.reason != null ? String(result.reason) : (prev.lastReason ?? null),
-    };
+      };
 
     if (safeAgentId) {
       stateByAgentId.set(safeAgentId, nextState);
@@ -244,12 +250,12 @@ export function startHeartbeatRunner({ loadAgents, onLog } = {}) {
 
     if (typeof onLog === 'function') {
       try {
-        await onLog({
-          ...result,
-          agentId: result && result.agentId != null ? result.agentId : (safeAgentId || null),
+          await onLog({
+            ...result,
+            agentId: result && result.agentId != null ? result.agentId : (safeAgentId || null),
           sessionId: result && result.sessionId != null ? result.sessionId : (safeSessionId || null),
           reason: reason ?? (result ? result.reason : undefined),
-          startedAtMs,
+            startedAtMs,
           finishedAtMs,
         });
       } catch {

@@ -2,6 +2,7 @@ import { createArcanaSession } from '../session.js';
 import { runWithContext } from '../event-bus.js';
 import { arcanaHomePath } from '../arcana-home.js';
 import { appendMessage } from '../sessions-store.js';
+import { resolveSessionIdForKey } from '../session-key-store.js';
 import { acquireSessionTurnLock, releaseSessionTurnLock } from '../cron/store.js';
 import { loadAgentsSnapshot } from '../agents-snapshot.js';
 import { loadHeartbeatConfigForAgent } from './config.js';
@@ -191,8 +192,9 @@ async function resolveAgentMeta(requestedAgentId) {
   return { meta, reason: null };
 }
 
-export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRoot, ackMaxChars } = {}) {
+export async function runHeartbeatOnce({ agentId, sessionId, sessionKey, reason, workspaceRoot, ackMaxChars } = {}) {
   const requestedAgentId = normalizeId(agentId);
+  const requestedSessionKey = normalizeId(sessionKey);
   const requestedSessionId = normalizeId(sessionId);
   const triggerReason = normalizeId(reason);
   const requestedWorkspaceRoot = normalizeId(workspaceRoot);
@@ -200,7 +202,8 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
   const startedAtMs = Date.now();
 
   let effectiveAgentId = requestedAgentId;
-  let targetSessionId = requestedSessionId;
+  let targetSessionKey = requestedSessionKey || requestedSessionId;
+  let backingSessionId = requestedSessionId || '';
   let effectiveWorkspaceRoot = requestedWorkspaceRoot;
   let lockPath = null;
   let lockOptions = null;
@@ -215,11 +218,11 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       const runStatus = safeResult.status || undefined;
       const runReason = typeof safeResult.reason === 'string' ? safeResult.reason : undefined;
       const storeAgentId = safeResult.agentId != null ? safeResult.agentId : (effectiveAgentId || null);
-      const storeSessionId = safeResult.sessionId != null ? safeResult.sessionId : (targetSessionId || null);
+      const storeSessionKey = safeResult.sessionKey != null ? safeResult.sessionKey : (targetSessionKey || null);
 
       updateHeartbeatAfterRun({
         agentId: storeAgentId,
-        sessionId: storeSessionId,
+        sessionKey: storeSessionKey,
         workspaceRoot: effectiveWorkspaceRoot,
         reason: triggerReason || undefined,
         runStatus,
@@ -241,7 +244,8 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
         status: 'skipped',
         reason: metaReason || 'agent_unavailable',
         agentId: effectiveAgentId || null,
-        sessionId: targetSessionId || null,
+        sessionKey: targetSessionKey || null,
+        sessionId: backingSessionId || null,
       });
     }
 
@@ -255,21 +259,43 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       heartbeatConfig = null;
     }
 
-    if (!targetSessionId && heartbeatConfig && typeof heartbeatConfig === 'object') {
-      const cfgSession =
-        typeof heartbeatConfig.targetSessionId === 'string'
+    if (!targetSessionKey && heartbeatConfig && typeof heartbeatConfig === 'object') {
+      const cfgKey =
+        typeof heartbeatConfig.targetSessionKey === 'string'
+          ? heartbeatConfig.targetSessionKey
+          : typeof heartbeatConfig.targetSessionId === 'string'
           ? heartbeatConfig.targetSessionId
           : typeof heartbeatConfig.sessionId === 'string'
           ? heartbeatConfig.sessionId
           : '';
-      targetSessionId = normalizeId(cfgSession);
+      targetSessionKey = normalizeId(cfgKey);
     }
 
-    if (!targetSessionId) {
+    if (!backingSessionId && targetSessionKey) {
+      try {
+        const resolved = await resolveSessionIdForKey({
+          agentId: effectiveAgentId,
+          sessionKey: targetSessionKey,
+          title: 'Heartbeat',
+          workspaceRoot: effectiveWorkspaceRoot,
+        });
+        if (resolved && resolved.sessionId) {
+          backingSessionId = String(resolved.sessionId);
+          if (!effectiveAgentId && resolved.agentId) {
+            effectiveAgentId = String(resolved.agentId);
+          }
+        }
+      } catch {
+        // fall through to missing_target_session handling
+      }
+    }
+
+    if (!targetSessionKey) {
       return recordRunResult({
         status: 'skipped',
         reason: 'missing_target_session',
         agentId: effectiveAgentId,
+        sessionKey: null,
         sessionId: null,
       });
     }
@@ -281,7 +307,8 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
           status: 'skipped',
           reason: 'quiet_hours',
           agentId: effectiveAgentId,
-          sessionId: targetSessionId,
+          sessionKey: targetSessionKey,
+          sessionId: backingSessionId || null,
         });
       }
     }
@@ -295,29 +322,31 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
 
     lockOptions = { agentId: effectiveAgentId, workspaceRoot: effectiveWorkspaceRoot };
     try {
-      lockPath = acquireSessionTurnLock(targetSessionId, lockOptions);
+      lockPath = acquireSessionTurnLock(backingSessionId, lockOptions);
     } catch {
       return recordRunResult({
         status: 'error',
         reason: 'acquire_turn_lock_failed',
         agentId: effectiveAgentId,
-        sessionId: targetSessionId,
+        sessionKey: targetSessionKey,
+        sessionId: backingSessionId || null,
       }, 'acquire_turn_lock_failed');
     }
 
     if (!lockPath) {
       return recordRunResult({
         status: 'skipped',
-        reason: 'requests_in_flight',
+        reason: 'requests-in-flight',
         agentId: effectiveAgentId,
-        sessionId: targetSessionId,
+        sessionKey: targetSessionKey,
+        sessionId: backingSessionId || null,
       });
     }
 
     try {
       pendingEvents = await peekSystemEvents({
         agentId: effectiveAgentId,
-        sessionId: targetSessionId,
+        sessionId: backingSessionId,
         workspaceRoot: effectiveWorkspaceRoot,
         limit: 20,
       });
@@ -326,7 +355,8 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
         status: 'error',
         reason: 'peek_system_events_failed',
         agentId: effectiveAgentId,
-        sessionId: targetSessionId,
+        sessionKey: targetSessionKey,
+        sessionId: backingSessionId || null,
       }, 'peek_system_events_failed');
     }
 
@@ -359,12 +389,15 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       // Best-effort only; treat failures as "no heartbeat file".
     }
 
-    if (triggerReason === 'interval' && pendingEvents.length === 0 && heartbeatExists && heartbeatEmpty) {
+    const noPendingEvents = Array.isArray(pendingEvents) && pendingEvents.length === 0;
+    const isPassiveReason = !triggerReason || triggerReason === 'interval' || triggerReason === 'retry';
+    if (noPendingEvents && (!heartbeatExists || heartbeatEmpty) && isPassiveReason) {
       return recordRunResult({
         status: 'skipped',
-        reason: 'empty_heartbeat_file',
+        reason: 'no_work',
         agentId: effectiveAgentId,
-        sessionId: targetSessionId,
+        sessionKey: targetSessionKey,
+        sessionId: backingSessionId || null,
       });
     }
 
@@ -372,7 +405,7 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       events: pendingEvents,
       heartbeatText,
       triggerReason,
-      targetSessionId,
+      targetSessionId: backingSessionId,
     });
 
     const heartbeatSessionId = 'agent:arcana:heartbeat:' + Date.now();
@@ -434,7 +467,7 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       if (body) {
         const payload = '[heartbeat]\n\n' + body;
         try {
-          appendMessage(targetSessionId, { role: 'assistant', text: payload, agentId: effectiveAgentId });
+          appendMessage(backingSessionId, { role: 'assistant', text: payload, agentId: effectiveAgentId });
           delivered = true;
         } catch {
           // Best-effort delivery; keep delivered=false on failure.
@@ -444,7 +477,7 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
 
     if (lastEventId != null && delivered) {
       try {
-        await ackSystemEvents({ agentId: effectiveAgentId, sessionId: targetSessionId, workspaceRoot: effectiveWorkspaceRoot, upToId: lastEventId });
+        await ackSystemEvents({ agentId: effectiveAgentId, sessionId: backingSessionId, workspaceRoot: effectiveWorkspaceRoot, upToId: lastEventId });
       } catch {
         // Ack failures should not flip status to failed; heartbeat already ran.
       }
@@ -454,7 +487,8 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       status: 'ok',
       reason: triggerReason || '',
       agentId: effectiveAgentId,
-      sessionId: targetSessionId,
+      sessionKey: targetSessionKey,
+      sessionId: backingSessionId || null,
       delivered,
       assistantText: rawAssistant,
       eventsProcessed: Array.isArray(pendingEvents) ? pendingEvents.length : 0,
@@ -465,7 +499,8 @@ export async function runHeartbeatOnce({ agentId, sessionId, reason, workspaceRo
       status: 'error',
       reason: message,
       agentId: effectiveAgentId || null,
-      sessionId: targetSessionId || null,
+      sessionKey: targetSessionKey || null,
+      sessionId: backingSessionId || null,
     }, message);
   } finally {
     if (lockPath && lockOptions) {

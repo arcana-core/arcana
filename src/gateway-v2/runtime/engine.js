@@ -1,0 +1,308 @@
+import { nowMs } from '../util.js';
+
+export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runnerRegistry, trace, wsHub } = {}){
+  const runInLane = typeof lane === 'function'
+    ? lane
+    : (lane && typeof lane.runInLane === 'function' ? lane.runInLane : null);
+
+  if (typeof runInLane !== 'function'){
+    throw new Error('lane_function_required');
+  }
+
+  const getState = stateStore && typeof stateStore.getState === 'function'
+    ? stateStore.getState
+    : null;
+  const patchState = stateStore && typeof stateStore.patchState === 'function'
+    ? stateStore.patchState
+    : null;
+
+  if (!getState || !patchState){
+    throw new Error('state_store_missing');
+  }
+
+  const runners = runnerRegistry instanceof Map ? runnerRegistry : new Map();
+
+  async function resolveRunnerConfig(agentId, sessionKey){
+    const aId = agentId || 'default';
+    const sKey = sessionKey || 'session';
+
+    let runnerState;
+    try {
+      runnerState = await getState({ agentId: aId, sessionKey: sKey, scope: 'runner' });
+    } catch {
+      runnerState = { value: null, version: 0, updatedAtMs: 0 };
+    }
+
+    const value = runnerState && runnerState.value ? runnerState.value : null;
+    let enabled;
+    if (value && Object.prototype.hasOwnProperty.call(value, 'enabled')){
+      enabled = !!value.enabled;
+    } else {
+      enabled = undefined;
+    }
+
+    let runnerId = value && typeof value.runnerId === 'string' ? value.runnerId.trim() : '';
+    let gatewayRunnerId = '';
+    try {
+      const gatewayState = await getState({ agentId: aId, sessionKey: sKey, scope: 'gateway' });
+      const gv = gatewayState && gatewayState.value;
+      const desired = gv && typeof gv.runnerId === 'string' ? gv.runnerId.trim() : '';
+      if (desired) gatewayRunnerId = desired;
+    } catch {}
+
+    if (!runnerId) runnerId = gatewayRunnerId || 'reactor';
+    const effectiveEnabled = (enabled === undefined) ? true : enabled;
+
+    return { aId, sKey, runnerState, runnerValue: value || {}, runnerId, enabled: effectiveEnabled };
+  }
+
+  async function startRunner({ agentId, sessionKey, runnerId } = {}){
+    const aId = agentId || 'default';
+    const sKey = sessionKey || 'session';
+    let rid = runnerId && String(runnerId).trim();
+
+    if (!rid){
+      try {
+        const gatewayState = await getState({ agentId: aId, sessionKey: sKey, scope: 'gateway' });
+        const gv = gatewayState && gatewayState.value;
+        const desired = gv && typeof gv.runnerId === 'string' ? gv.runnerId.trim() : '';
+        if (desired) rid = desired;
+      } catch {}
+    }
+
+    if (!rid) rid = 'reactor';
+    if (!runners.has(rid) && runners.has('reactor')){
+      rid = 'reactor';
+    }
+
+    const result = await patchState({
+      agentId: aId,
+      sessionKey: sKey,
+      scope: 'runner',
+      expectedVersion: null,
+      mutator: (prev) => ({ ...(prev || {}), enabled: true, runnerId: rid }),
+    });
+
+    try {
+      if (scheduler && typeof scheduler.requestWake === 'function'){
+        scheduler.requestWake({ agentId: aId, sessionKey: sKey, priority: 10, reason: 'runner.start', delayMs: 0 });
+      }
+    } catch {}
+
+    return {
+      ok: true,
+      state: {
+        value: result.value,
+        version: result.version,
+        updatedAtMs: result.updatedAtMs,
+      },
+    };
+  }
+
+  async function stopRunner({ agentId, sessionKey } = {}){
+    const aId = agentId || 'default';
+    const sKey = sessionKey || 'session';
+
+    const result = await patchState({
+      agentId: aId,
+      sessionKey: sKey,
+      scope: 'runner',
+      expectedVersion: null,
+      mutator: (prev) => ({ ...(prev || {}), enabled: false }),
+    });
+
+    return {
+      ok: true,
+      state: {
+        value: result.value,
+        version: result.version,
+        updatedAtMs: result.updatedAtMs,
+      },
+    };
+  }
+
+  async function getRunnerStatus({ agentId, sessionKey } = {}){
+    const aId = agentId || 'default';
+    const sKey = sessionKey || 'session';
+
+    let runnerState;
+    try {
+      runnerState = await getState({ agentId: aId, sessionKey: sKey, scope: 'runner' });
+    } catch {
+      runnerState = { value: null, version: 0, updatedAtMs: 0 };
+    }
+
+    const value = runnerState && runnerState.value ? runnerState.value : null;
+    let enabled;
+    if (value && Object.prototype.hasOwnProperty.call(value, 'enabled')){
+      enabled = !!value.enabled;
+    } else {
+      enabled = undefined;
+    }
+
+    let runnerId = value && typeof value.runnerId === 'string' ? value.runnerId.trim() : '';
+    let gatewayRunnerId = '';
+    try {
+      const gatewayState = await getState({ agentId: aId, sessionKey: sKey, scope: 'gateway' });
+      const gv = gatewayState && gatewayState.value;
+      const desired = gv && typeof gv.runnerId === 'string' ? gv.runnerId.trim() : '';
+      if (desired) gatewayRunnerId = desired;
+    } catch {}
+
+    const effectiveRunnerId = runnerId || gatewayRunnerId || 'reactor';
+    const effectiveEnabled = (enabled === undefined) ? true : enabled;
+
+    return {
+      ok: true,
+      runner: {
+        agentId: aId,
+        sessionKey: sKey,
+        configuredRunnerId: runnerId || null,
+        effectiveRunnerId,
+        enabled: effectiveEnabled,
+        version: runnerState.version,
+        updatedAtMs: runnerState.updatedAtMs,
+      },
+    };
+  }
+
+  async function tick({ agentId, sessionKey, reason } = {}){
+    const aId = agentId || 'default';
+    const sKey = sessionKey || 'session';
+    const laneKey = ['engine', aId, sKey];
+
+    const run = async () => {
+      const cfg = await resolveRunnerConfig(aId, sKey);
+      const runnerId = cfg.runnerId;
+      const enabled = cfg.enabled;
+      const runner = runners.get(runnerId) || runners.get('reactor');
+
+      if (!runner || !enabled){
+        return { ok: true, skipped: true, reason: enabled ? 'no_runner' : 'disabled', runnerId };
+      }
+
+      const startTsMs = nowMs();
+      let spanCtx = null;
+
+      try {
+        if (trace && typeof trace.emitSpan === 'function'){
+          try {
+            spanCtx = await trace.emitSpan({
+              name: 'turn.started',
+              attributes: {
+                agentId: aId,
+                sessionKey: sKey,
+                runnerId,
+                reason: reason || 'wake',
+              },
+            });
+          } catch {}
+        }
+        if (wsHub && typeof wsHub.broadcast === 'function'){
+          try {
+            wsHub.broadcast({
+              type: 'turn.started',
+              agentId: aId,
+              sessionKey: sKey,
+              runnerId,
+              reason: reason || 'wake',
+              tsMs: startTsMs,
+            });
+          } catch {}
+        }
+      } catch {}
+
+      let ok = false;
+      let result;
+
+      try {
+        const ctx = {
+          agentId: aId,
+          sessionKey: sKey,
+          wsHub,
+          trace,
+          inbox,
+          outbox,
+          scheduler,
+          stateStore,
+          lane: runInLane,
+          reason,
+          runnerState: cfg.runnerValue,
+        };
+
+        result = await runner.run(ctx);
+        ok = !!(result && Object.prototype.hasOwnProperty.call(result, 'ok') ? result.ok : true);
+
+        if (result && Array.isArray(result.outputs) && result.outputs.length && outbox && typeof outbox.deliverOutputs === 'function'){
+          try {
+            await outbox.deliverOutputs({
+              agentId: aId,
+              sessionKey: sKey,
+              outputs: result.outputs,
+              runnerId,
+              reason,
+            });
+          } catch {}
+        }
+
+        const nextDelayRaw = result && result.nextWakeDelayMs;
+        const nextDelay = (typeof nextDelayRaw === 'number' && Number.isFinite(nextDelayRaw) && nextDelayRaw > 0)
+          ? nextDelayRaw
+          : null;
+        if (nextDelay && scheduler && typeof scheduler.requestWake === 'function' && cfg.enabled){
+          try {
+            scheduler.requestWake({
+              agentId: aId,
+              sessionKey: sKey,
+              priority: 1,
+              reason: 'runner.nextWake',
+              delayMs: nextDelay,
+            });
+          } catch {}
+        }
+      } catch (e) {
+        ok = false;
+        throw e;
+      } finally {
+        const endTsMs = nowMs();
+        if (trace && typeof trace.emitSpan === 'function'){
+          try {
+            await trace.emitSpan({
+              name: 'turn.ended',
+              traceId: spanCtx && spanCtx.traceId ? spanCtx.traceId : undefined,
+              parentSpanId: spanCtx && spanCtx.spanId ? spanCtx.spanId : undefined,
+              attributes: {
+                agentId: aId,
+                sessionKey: sKey,
+                runnerId,
+                ok,
+                reason: reason || 'wake',
+              },
+            });
+          } catch {}
+        }
+        if (wsHub && typeof wsHub.broadcast === 'function'){
+          try {
+            wsHub.broadcast({
+              type: 'turn.ended',
+              agentId: aId,
+              sessionKey: sKey,
+              runnerId,
+              ok,
+              tsMs: endTsMs,
+            });
+          } catch {}
+        }
+      }
+
+      return { ok, result, runnerId };
+    };
+
+    return runInLane(laneKey, run);
+  }
+
+  return { startRunner, stopRunner, getRunnerStatus, tick };
+}
+
+export default { createEngine };
+

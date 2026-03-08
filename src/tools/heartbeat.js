@@ -8,7 +8,7 @@ import { peekSystemEvents } from '../system-events/store.js';
 export function createHeartbeatTool() {
   const Params = Type.Object({
     action: Type.String({ description: 'status|enable|disable|request_now|run_once' }),
-    sessionId: Type.Optional(Type.String({ description: 'Override session id (defaults to current context)' })),
+    sessionId: Type.Optional(Type.String({ description: 'Override session key (defaults to current context session id)' })),
     reason: Type.Optional(Type.String({ description: 'Reason for request_now or run_once' })),
   });
 
@@ -55,7 +55,7 @@ export function createHeartbeatTool() {
         let pendingEvents = 0;
         if (sessionId) {
           try {
-            const events = await peekSystemEvents({ agentId, sessionId, limit: 20 });
+            const events = await peekSystemEvents({ agentId, sessionKey: sessionId, limit: 20 });
             if (Array.isArray(events)) pendingEvents = events.length;
           } catch {
             pendingEvents = 0;
@@ -120,8 +120,8 @@ export function createHeartbeatTool() {
       if (action === 'request_now') {
         const reason = typeof args.reason === 'string' && args.reason.trim() ? args.reason : undefined;
         try {
-          requestHeartbeatNow({ reason, agentId, sessionId });
-          const text = 'heartbeat wake requested: agent=' + agentId + (sessionId ? ' session=' + sessionId : '');
+          requestHeartbeatNow({ reason, agentId, sessionKey: sessionId || undefined });
+          const text = 'heartbeat wake requested: agent=' + agentId + (sessionId ? ' sessionKey=' + sessionId : '');
           return {
             content: [{ type: 'text', text }],
             details: {

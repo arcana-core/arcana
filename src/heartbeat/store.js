@@ -22,7 +22,7 @@ function normalizeAgentId(raw) {
   }
 }
 
-function normalizeSessionId(raw) {
+function normalizeSessionKey(raw) {
   try {
     const s = String(raw || '').trim();
     if (!s) return null;
@@ -97,14 +97,15 @@ function writeState(options = {}, state) {
   writeFileSync(ensureWriteInWorkspace(path, workspaceRoot), data, 'utf-8');
 }
 
-function ensureTarget(state, sessionId) {
-  const sid = normalizeSessionId(sessionId);
-  if (!sid) return null;
+function ensureTarget(state, sessionKey) {
+  const skey = normalizeSessionKey(sessionKey);
+  if (!skey) return null;
   const targets = state.targets || [];
-  let t = targets.find((x) => x && x.sessionId === sid);
+  let t = targets.find((x) => x && (x.sessionKey === skey || x.sessionId === skey));
   if (!t) {
     t = {
-      sessionId: sid,
+      sessionKey: skey,
+      sessionId: skey,
       enabled: true,
       ackMaxChars: undefined,
       intervalMs: undefined,
@@ -115,23 +116,28 @@ function ensureTarget(state, sessionId) {
     };
     targets.push(t);
     state.targets = targets;
+  } else {
+    if (!t.sessionKey) t.sessionKey = skey;
+    t.sessionId = t.sessionKey;
   }
   return t;
 }
 
-export function getHeartbeatTarget({ agentId, sessionId, workspaceRoot } = {}) {
+export function getHeartbeatTarget({ agentId, sessionId, sessionKey, workspaceRoot } = {}) {
+  const key = sessionKey != null ? sessionKey : sessionId;
   const opts = { agentId, workspaceRoot };
   const state = readState(opts);
-  const t = ensureTarget(state, sessionId);
+  const t = ensureTarget(state, key);
   if (!t) return null;
   writeState(opts, state);
   return { ...t };
 }
 
-export function setHeartbeatEnabled({ agentId, sessionId, workspaceRoot, enabled } = {}) {
+export function setHeartbeatEnabled({ agentId, sessionId, sessionKey, workspaceRoot, enabled } = {}) {
+  const key = sessionKey != null ? sessionKey : sessionId;
   const opts = { agentId, workspaceRoot };
   const state = readState(opts);
-  const t = ensureTarget(state, sessionId);
+  const t = ensureTarget(state, key);
   if (!t) return null;
   t.enabled = enabled !== false;
   writeState(opts, state);
@@ -140,6 +146,7 @@ export function setHeartbeatEnabled({ agentId, sessionId, workspaceRoot, enabled
 
 export function updateHeartbeatAfterRun({
   agentId,
+  sessionKey,
   sessionId,
   workspaceRoot,
   reason,
@@ -151,7 +158,8 @@ export function updateHeartbeatAfterRun({
 } = {}) {
   const opts = { agentId, workspaceRoot };
   const state = readState(opts);
-  const t = ensureTarget(state, sessionId);
+  const key = sessionKey != null ? sessionKey : sessionId;
+  const t = ensureTarget(state, key);
   if (!t) return null;
   t.lastRunAtMs = typeof finishedAtMs === 'number' && Number.isFinite(finishedAtMs) ? finishedAtMs : nowMs();
   t.lastStatus = runStatus || t.lastStatus || undefined;
@@ -169,15 +177,18 @@ export function listHeartbeatTargets({ workspaceRoot } = {}) {
     if (!existsSync(agentsDir)) return out;
     for (const name of readdirSync(agentsDir)) {
       const agentId = normalizeAgentId(name);
-      const base = join(agentsDir, name, 'heartbeat', 'targets.json');
       try {
         const state = readState({ workspaceRoot: root, agentId });
         for (const t of state.targets || []) {
-          if (!t || !t.sessionId) continue;
+          if (!t) continue;
+          const key = t.sessionKey || t.sessionId;
+          const skey = normalizeSessionKey(key);
+          if (!skey) continue;
           out.push({
             workspaceRoot: root,
             agentId,
-            sessionId: t.sessionId,
+            sessionKey: skey,
+            sessionId: skey,
             enabled: t.enabled !== false,
             lastRunAtMs: typeof t.lastRunAtMs === 'number' ? t.lastRunAtMs : null,
             lastStatus: t.lastStatus || undefined,

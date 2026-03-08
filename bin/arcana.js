@@ -13,6 +13,8 @@ import { requestHeartbeatNow } from '../src/heartbeat/wake.js';
 import { enqueueSystemEvent } from '../src/system-events/store.js';
 import { loadAgentsSnapshot } from '../src/agents-snapshot.js';
 import { loadHeartbeatConfigForAgent } from '../src/heartbeat/config.js';
+import { startLivestreamShowrunner } from '../src/livestream/showrunner.js';
+import { startGatewayV2 } from '../server/gateway.mjs';
 
 const HELP = `
 Usage:
@@ -34,10 +36,12 @@ Usage:
   arcana cron list                      # list jobs
   arcana cron runs [--limit n]          # list recent runs
   arcana heartbeat serve                # run heartbeat runner loop (Ctrl+C to stop)
-  arcana heartbeat once --agent <id> --session <sid> [--reason r]
-  arcana heartbeat request --agent <id> [--session <sid>] [--reason r]
-  arcana heartbeat enqueue --agent <id> --session <sid> --text <text> [--context c] [--dedupe k] [--wake]
+  arcana heartbeat once --agent <id> --session <sessionKey> [--reason r]
+  arcana heartbeat request --agent <id> [--session <sessionKey>] [--reason r]
+  arcana heartbeat enqueue --agent <id> --session <sessionKey> --text <text> [--context c] [--dedupe k] [--wake]
   arcana heartbeat status               # show heartbeat config per agent
+  arcana livestream serve --room <roomId> [--agent <agentId>] [--tick-ms <n>] [--session <sid>] [--tts-provider <p>] [--tts-play 0|1] [--subtitle 0|1]  # run livestream showrunner loop
+  arcana gateway serve [--port <n>]     # run gateway v2 HTTP+WS server
 
 Env:
   OPENAI_API_KEY (or /login in interactive modes)
@@ -109,10 +113,93 @@ async function main(){
   if (cmd === 'wechat') return wechatCLI({ args: argv });
   if (cmd === 'cron') return cronCLI({ args: argv });
   if (cmd === 'heartbeat') return heartbeatCLI({ args: argv });
+  if (cmd === 'livestream') return livestreamCLI({ args: argv });
+  if (cmd === 'gateway') return gatewayCLI({ args: argv });
   return console.log(HELP);
 }
 
 main().catch((e)=>{ console.error('[arcana] failed:', e?.message||e); process.exit(1); });
+
+async function livestreamCLI({ args }){
+  const [, , sub, ...rest] = args;
+  const s = String(sub || '').toLowerCase();
+
+  if (s === 'serve'){
+    const roomIdx = rest.indexOf('--room');
+    const agentIdx = rest.indexOf('--agent');
+    const tickIdx = rest.indexOf('--tick-ms');
+    const sessionIdx = rest.indexOf('--session');
+    const providerIdx = rest.indexOf('--tts-provider');
+    const playIdx = rest.indexOf('--tts-play');
+    const subtitleIdx = rest.indexOf('--subtitle');
+
+    const roomId = roomIdx >= 0 ? rest[roomIdx + 1] : undefined;
+    const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+    const tickRaw = tickIdx >= 0 ? rest[tickIdx + 1] : undefined;
+    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const ttsProvider = providerIdx >= 0 ? rest[providerIdx + 1] : undefined;
+    const ttsPlayRaw = playIdx >= 0 ? rest[playIdx + 1] : undefined;
+    const subtitleRaw = subtitleIdx >= 0 ? rest[subtitleIdx + 1] : undefined;
+
+    if (!roomId){
+      return error('arcana livestream serve --room <roomId> [--agent <agentId>] [--tick-ms <n>] [--session <sid>] [--tts-provider <p>] [--tts-play 0|1] [--subtitle 0|1]');
+    }
+
+    let tickMs;
+    if (tickRaw != null && tickRaw !== undefined){
+      const n = Number(tickRaw);
+      if (Number.isFinite(n) && n > 0) tickMs = n;
+    }
+
+    let ttsPlay;
+    if (ttsPlayRaw != null && ttsPlayRaw !== undefined){
+      const v = String(ttsPlayRaw).toLowerCase();
+      if (v === '1' || v === 'true' || v === 'yes') ttsPlay = true;
+      else if (v === '0' || v === 'false' || v === 'no') ttsPlay = false;
+    }
+
+    let subtitle;
+    if (subtitleRaw != null && subtitleRaw !== undefined){
+      const v = String(subtitleRaw).toLowerCase();
+      if (v === '1' || v === 'true' || v === 'yes') subtitle = true;
+      else if (v === '0' || v === 'false' || v === 'no') subtitle = false;
+    }
+
+    console.log('[arcana] livestream: serve loop (Ctrl+C to stop)');
+    await startLivestreamShowrunner({
+      roomId,
+      agentId,
+      tickMs,
+      sessionId,
+      ttsProvider,
+      ttsPlay,
+      subtitle,
+    });
+    return;
+  }
+
+  return console.log(HELP);
+}
+
+async function gatewayCLI({ args }){
+  const [, sub, ...rest] = args;
+  const s = String(sub || '').toLowerCase();
+
+  if (s === 'serve'){
+    const portIdx = rest.indexOf('--port');
+    let port;
+    if (portIdx >= 0 && rest[portIdx + 1]){
+      const raw = Number(rest[portIdx + 1]);
+      if (Number.isFinite(raw) && raw > 0) port = raw;
+    }
+    console.log('[arcana] gateway v2: serve loop (Ctrl+C to stop)');
+    await startGatewayV2({ port });
+    return;
+  }
+
+  return console.log(HELP);
+}
+
 
 async function cronCLI({ args }){
   const [, , sub, ...rest] = args;
@@ -200,10 +287,10 @@ async function heartbeatCLI({ args }){
     const sessionIdx = rest.indexOf('--session');
     const reasonIdx = rest.indexOf('--reason');
     const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
-    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const sessionKey = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
     const reason = reasonIdx >= 0 ? rest[reasonIdx + 1] : undefined;
 
-    const res = await runHeartbeatOnce({ agentId, sessionId, reason });
+    const res = await runHeartbeatOnce({ agentId, sessionKey, reason });
     console.log(JSON.stringify(res, null, 2));
     return;
   }
@@ -213,15 +300,15 @@ async function heartbeatCLI({ args }){
     const sessionIdx = rest.indexOf('--session');
     const reasonIdx = rest.indexOf('--reason');
     const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
-    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const sessionKey = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
     const reason = reasonIdx >= 0 ? rest[reasonIdx + 1] : undefined;
 
     if (!agentId){
-      return error('arcana heartbeat request --agent <id> [--session <sid>] [--reason <r>]');
+      return error('arcana heartbeat request --agent <id> [--session <sessionKey>] [--reason <r>]');
     }
 
-    requestHeartbeatNow({ agentId, sessionId, reason });
-    console.log('[arcana] heartbeat wake requested for agent=' + agentId + (sessionId ? ' session=' + sessionId : '') + (reason ? ' reason=' + reason : ''));
+    requestHeartbeatNow({ agentId, sessionKey, reason });
+    console.log('[arcana] heartbeat wake requested for agent=' + agentId + (sessionKey ? ' sessionKey=' + sessionKey : '') + (reason ? ' reason=' + reason : ''));
     return;
   }
 
@@ -234,21 +321,21 @@ async function heartbeatCLI({ args }){
     const wake = rest.includes('--wake');
 
     const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
-    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
+    const sessionKey = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
     const text = textIdx >= 0 ? rest[textIdx + 1] : undefined;
     const contextKey = ctxIdx >= 0 ? rest[ctxIdx + 1] : undefined;
     const dedupeKey = dedupeIdx >= 0 ? rest[dedupeIdx + 1] : undefined;
 
-    if (!agentId || !sessionId || !text){
-      return error('arcana heartbeat enqueue --agent <id> --session <sid> --text <text> [--context c] [--dedupe k] [--wake]');
+    if (!agentId || !sessionKey || !text){
+      return error('arcana heartbeat enqueue --agent <id> --session <sessionKey> --text <text> [--context c] [--dedupe k] [--wake]');
     }
 
-    const record = await enqueueSystemEvent({ agentId, sessionId, text, contextKey, dedupeKey });
+    const record = await enqueueSystemEvent({ agentId, sessionKey, text, contextKey, dedupeKey });
     console.log(JSON.stringify(record, null, 2));
 
     if (wake){
-      requestHeartbeatNow({ agentId, sessionId, reason: 'enqueue' });
-      console.log('[arcana] heartbeat wake requested for agent=' + agentId + ' session=' + sessionId + ' reason=enqueue');
+      requestHeartbeatNow({ agentId, sessionKey, reason: 'enqueue' });
+      console.log('[arcana] heartbeat wake requested for agent=' + agentId + ' sessionKey=' + sessionKey + ' reason=enqueue');
     }
     return;
   }

@@ -47,22 +47,32 @@ export function applyProviderEnv(cfg) {
   const base = cfg.base_url?.trim();
 
   if (provider === "openai") {
-    if (key && !process.env.OPENAI_API_KEY) process.env.OPENAI_API_KEY = key;
+    if (key) process.env.OPENAI_API_KEY = key;
     if (base) {
       process.env.OPENAI_BASE_URL = base;      // common convention
       process.env.OPENAI_API_BASE = base;      // alt convention
+    } else {
+      delete process.env.OPENAI_BASE_URL;
+      delete process.env.OPENAI_API_BASE;
     }
   } else if (provider === "openrouter") {
-    if (key && !process.env.OPENROUTER_API_KEY) process.env.OPENROUTER_API_KEY = key;
+    if (key) process.env.OPENROUTER_API_KEY = key;
     if (base) process.env.OPENROUTER_BASE_URL = base;
+    else delete process.env.OPENROUTER_BASE_URL;
   } else if (provider === "xai") {
-    if (key && !process.env.XAI_API_KEY) process.env.XAI_API_KEY = key;
+    if (key) process.env.XAI_API_KEY = key;
   } else if (provider === "anthropic") {
-    if (key && !process.env.ANTHROPIC_API_KEY) process.env.ANTHROPIC_API_KEY = key;
+    if (key) process.env.ANTHROPIC_API_KEY = key;
+    if (base) process.env.ANTHROPIC_BASE_URL = base;
+    else delete process.env.ANTHROPIC_BASE_URL;
   } else if (provider === "google") {
-    // Google AI Studio (Generative Language API)
-    if (key && !process.env.GOOGLE_API_KEY) process.env.GOOGLE_API_KEY = key;
+    // Google AI Studio — pi-ai reads GEMINI_API_KEY; set both for compatibility
+    if (key) {
+      process.env.GEMINI_API_KEY = key;
+      process.env.GOOGLE_API_KEY = key;
+    }
     if (base) process.env.GOOGLE_API_BASE = base; // optional; most setups use default
+    else delete process.env.GOOGLE_API_BASE;
   } else {
     // Fallback: expose as ARCANA_GENERIC_* for potential custom provider wiring later
     if (key) process.env.ARCANA_GENERIC_API_KEY = key;
@@ -89,7 +99,7 @@ export function resolveModelFromConfig(cfg){
 export function inferProviderFromEnv(){
   const p = (process.env.ARCANA_PROVIDER||"").trim().toLowerCase();
   if (p) return p;
-  if (process.env.GOOGLE_API_KEY) return "google";
+  if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) return "google";
   if (process.env.OPENAI_API_KEY) return "openai";
   if (process.env.ANTHROPIC_API_KEY) return "anthropic";
   if (process.env.OPENROUTER_API_KEY) return "openrouter";

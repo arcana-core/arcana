@@ -1,6 +1,7 @@
 import { createArcanaSession } from '../session.js';
 import { resolveWorkspaceRoot } from '../workspace-guard.js';
 import { createSession, listSessions, appendMessage, loadSession, saveSession, buildHistoryPreludeText } from '../sessions-store.js';
+import { resolveSessionIdForKey, setSessionIdForKey } from '../session-key-store.js';
 import { createWriteStream } from 'node:fs';
 import { arcanaHomePath } from '../arcana-home.js';
 import { getContext, runWithContext, emit } from '../event-bus.js';
@@ -102,26 +103,62 @@ function buildBoundedHistoryPrelude(sessionObj){
   return text;
 }
 
-function ensureSessionId({ sessionId, title, agentId, workspaceRoot }){
-  const t = String(title||'').trim();
-  const id = String(sessionId||'').trim();
+async function ensureSessionId({ sessionId, sessionKey, title, agentId, workspaceRoot }){
+  const t = String(title || '').trim();
+  const id = String(sessionId || '').trim();
+  const key = sessionKey != null ? String(sessionKey).trim() : '';
   const ws = String(workspaceRoot || '').trim() || resolveWorkspaceRoot();
   const agent = agentId;
+
+  let resolvedId = '';
+
   if (id) {
-    const s = loadSession(id, { agentId: agent });
-    if (s) return s.id;
+    try {
+      const s = loadSession(id, { agentId: agent });
+      if (s && s.id) {
+        resolvedId = String(s.id);
+      }
+    } catch {}
   }
-  if (t) {
+
+  if (!resolvedId && key) {
+    try {
+      const fromKey = await resolveSessionIdForKey({
+        agentId: agent,
+        sessionKey: key,
+        title: t || 'Arcana Cron',
+        workspaceRoot: ws,
+      });
+      if (fromKey && fromKey.sessionId) {
+        resolvedId = String(fromKey.sessionId);
+      }
+    } catch {}
+  }
+
+  if (!resolvedId && t) {
     try {
       const arr = listSessions(agent);
-      const hit = arr.find((s)=> String(s.title||'').trim().toLowerCase() === t.toLowerCase());
-      if (hit) return hit.id;
+      const hit = arr.find((s)=> String(s.title || '').trim().toLowerCase() === t.toLowerCase());
+      if (hit && hit.id) {
+        resolvedId = String(hit.id);
+      }
     } catch {}
-    const created = createSession({ title: t, workspace: ws, agentId: agent });
-    return created.id;
   }
-  const created = createSession({ title: 'Arcana Cron', workspace: ws, agentId: agent });
-  return created.id;
+
+  if (!resolvedId) {
+    const created = createSession({ title: t || 'Arcana Cron', workspace: ws, agentId: agent });
+    if (created && created.id) {
+      resolvedId = String(created.id);
+    }
+  }
+
+  if (resolvedId && id && key) {
+    try {
+      await setSessionIdForKey({ agentId: agent, sessionKey: key, sessionId: resolvedId });
+    } catch {}
+  }
+
+  return resolvedId;
 }
 
 function extractUsageTotals(u){
@@ -253,13 +290,13 @@ async function compactSessionIfNeeded({ sessionId, agentId, workspaceRoot, agent
   }
 }
 
-export async function runArcanaTask({ prompt, sessionId, title, logPath, agentId, timeoutMs }){
+export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logPath, agentId, timeoutMs }){
   const ctx = getContext?.() || null;
   const rawTimeout = Number(timeoutMs);
   const effectiveTimeoutMs = (Number.isFinite(rawTimeout) && rawTimeout > 0) ? rawTimeout : 0;
   const workspaceRoot = (ctx && ctx.workspaceRoot) ? ctx.workspaceRoot : resolveWorkspaceRoot();
   const effectiveAgentId = agentId || (ctx && ctx.agentId) || 'default';
-  const sid = ensureSessionId({ sessionId, title, agentId: effectiveAgentId, workspaceRoot });
+  const sid = await ensureSessionId({ sessionId, sessionKey, title, agentId: effectiveAgentId, workspaceRoot });
   const startedAtMs = Date.now();
   const agentHomeRoot = arcanaHomePath('agents', effectiveAgentId);
   const log = createWriteStream(logPath, { flags: 'w' });

@@ -4,6 +4,29 @@ const input = document.querySelector('#input');
 const sendBtn = document.querySelector('#send');
 let activeAssistant = null; // current assistant bubble to stream text into
 
+const GATEWAY_V2_SESSION_KEY_LS = 'arcana.v2.sessionKey.v1';
+let gatewayV2Enabled = false;
+let gatewayV2Detected = false;
+let gatewayV2ProbePromise = null;
+let gatewayV2SessionKey = '';
+let gatewayV2Ws = null;
+const gatewayV2Pending = new Map();
+
+function ensureGatewayV2SessionKey(){
+  try{
+    let key = '';
+    try { key = localStorage.getItem(GATEWAY_V2_SESSION_KEY_LS) || ''; } catch {}
+    if (!key){
+      let rand = '';
+      try { rand = Math.random().toString(36).slice(2, 10); } catch { rand = String(Date.now() || '0'); }
+      key = 'sess-' + rand;
+      try { localStorage.setItem(GATEWAY_V2_SESSION_KEY_LS, key); } catch {}
+    }
+    return key;
+  } catch { return 'session'; }
+}
+
+
 // --- Session-bound, layered Logs ---
 const LOG_CAP = 400; // per session per tab
 const logStore = new Map(); // sessionId -> { main:[], tools:[], subagents:[] }
@@ -1554,7 +1577,7 @@ async function openSession(id){
   try { renderLiveInfoFor(id); } catch {}
   try {
     if (toolStreamEnabled){
-      setupSseConnection();
+      try { ensureTransportReady().catch(()=>{}); } catch{}
     }
   } catch{}
 }
@@ -1633,9 +1656,60 @@ async function sendWithSession(){
   finally { messages.scrollTop = messages.scrollHeight; }
 }
 
+async function sendWithGatewayV2(){
+  const text = input.value.trim();
+  if (!text) return;
+  const mode = await ensureTransportReady();
+  if (!gatewayV2Enabled || mode !== 'v2'){
+    await sendWithSession();
+    return;
+  }
+  const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+  try { gatewayV2SessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey(); } catch {}
+  appendMessage('user', text);
+  input.value = '';
+  autoResize();
+  const bubble = appendMessage('assistant', '');
+  activeAssistant = bubble;
+  setTyping(bubble, true);
+  messages.scrollTop = messages.scrollHeight;
+  try{
+    const body = { agentId, sessionKey: gatewayV2SessionKey, text };
+    const r = await fetch('/v2/turn', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+    let j = null;
+    try { j = await r.json(); } catch {}
+    if (!r.ok || !j || !j.ok || !j.event){
+      setTyping(bubble, false);
+      bubble.textContent = !r.ok ? ('[error] HTTP ' + r.status) : '[error] Bad response';
+      return;
+    }
+    const ev = j.event || {};
+    const evId = ev.eventId ? String(ev.eventId) : '';
+    if (evId){
+      gatewayV2Pending.set(evId, bubble);
+    } else {
+      setTyping(bubble, false);
+    }
+  } catch(e){
+    setTyping(bubble, false);
+    bubble.textContent = '[error] ' + (((e && e.message) || e));
+  } finally {
+    messages.scrollTop = messages.scrollHeight;
+  }
+}
+
+async function handleSend(){
+  const mode = await ensureTransportReady();
+  if (mode === 'v2'){
+    await sendWithGatewayV2();
+  } else {
+    await sendWithSession();
+  }
+}
+
 // Hook send button + Enter to session mode
-sendBtn.addEventListener('click', ()=>{ sendWithSession().catch(()=>{}) });
-input.addEventListener('keydown', (e)=>{ if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendWithSession().catch(()=>{}) } });
+sendBtn.addEventListener('click', ()=>{ handleSend().catch(()=>{}) });
+input.addEventListener('keydown', (e)=>{ if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); handleSend().catch(()=>{}) } });
 // Stop button -> hard abort current run
 try {
   const stopBtn = document.querySelector('#stop');
@@ -1651,6 +1725,128 @@ try {
 } catch {}
 
 // SSE: single connection; filter UI updates by sessionId
+async function ensureTransportReady(){
+  try{
+    if (gatewayV2Detected){
+      if (gatewayV2Enabled){
+        try { if (!gatewayV2SessionKey) gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
+        try { setupGatewayV2WebSocket(); } catch {}
+        return 'v2';
+      }
+      try {
+        if (!window.__arcana_sse_initialized){
+          setupSseConnection();
+          try { window.__arcana_sse_initialized = true; } catch {}
+        }
+      } catch {}
+      return 'legacy';
+    }
+    if (gatewayV2ProbePromise){
+      try { return await gatewayV2ProbePromise; } catch { return 'legacy'; }
+    }
+    gatewayV2ProbePromise = (async ()=>{
+      let isV2 = false;
+      try{
+        const r = await fetch('/v2/health', { method:'GET' });
+        if (r && r.ok){
+          let j = null;
+          try { j = await r.json(); } catch {}
+          if (j && j.ok && String(j.kind || '') === 'gateway-v2'){
+            isV2 = true;
+          }
+        }
+      } catch {}
+      gatewayV2Detected = true;
+      gatewayV2Enabled = isV2;
+      if (isV2){
+        try { gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
+        try { setupGatewayV2WebSocket(); } catch {}
+        return 'v2';
+      }
+      try {
+        if (!window.__arcana_sse_initialized){
+          setupSseConnection();
+          try { window.__arcana_sse_initialized = true; } catch {}
+        }
+      } catch {}
+      return 'legacy';
+    })();
+    try { return await gatewayV2ProbePromise; } catch { return 'legacy'; }
+  } catch { return 'legacy'; }
+}
+
+function setupGatewayV2WebSocket(){
+  try{
+    if (!gatewayV2Enabled) return;
+    if (gatewayV2Ws && gatewayV2Ws.readyState === 1) return;
+    let url = '';
+    try{
+      const loc = window.location;
+      const proto = (loc.protocol === 'https:') ? 'wss:' : 'ws:';
+      url = proto + '//' + loc.host + '/v2/stream';
+    } catch{
+      url = '/v2/stream';
+    }
+    let ws;
+    try { ws = new WebSocket(url); } catch { return; }
+    gatewayV2Ws = ws;
+    ws.onmessage = (ev)=>{
+      try {
+        const payload = JSON.parse(ev.data);
+        handleGatewayV2Envelope(payload);
+      } catch {}
+    };
+    ws.onclose = ()=>{
+      try{
+        if (!gatewayV2Enabled) return;
+        setTimeout(()=>{ try { setupGatewayV2WebSocket(); } catch {} }, 1000);
+      } catch {}
+    };
+    ws.onerror = ()=>{};
+  } catch {}
+}
+
+function handleGatewayV2Envelope(payload){
+  try{
+    if (!payload || typeof payload !== 'object') return;
+    if (payload.type === 'event.appended'){
+      const ev = payload.event;
+      if (!ev || typeof ev !== 'object') return;
+      const evType = ev.type;
+      if (!evType) return;
+      const agentId = ev.agentId || DEFAULT_AGENT_ID;
+      const sessionKey = ev.sessionKey || '';
+      const currentAgent = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+      const expectedKey = gatewayV2SessionKey || ensureGatewayV2SessionKey();
+      if (agentId !== currentAgent) return;
+      if (sessionKey && expectedKey && sessionKey !== expectedKey) return;
+      if (evType === 'assistant_message'){
+        const data = ev.data || {};
+        const replyId = data && data.replyToEventId ? String(data.replyToEventId) : '';
+        const text = data && data.text ? String(data.text) : '';
+        let bubble = null;
+        if (replyId && gatewayV2Pending.has(replyId)){
+          bubble = gatewayV2Pending.get(replyId) || null;
+          gatewayV2Pending.delete(replyId);
+        }
+        if (!bubble){
+          bubble = appendMessage('assistant', '');
+        }
+        setTyping(bubble, false);
+        if (text){
+          bubble.textContent = text;
+        }
+        messages.scrollTop = messages.scrollHeight;
+        return;
+      }
+      if (evType === 'message'){
+        return;
+      }
+    }
+  } catch {}
+}
+
+
 const TOOL_STREAM_LS_KEY = 'arcana.toolStreamEnabled.v1';
 let toolStreamEnabled = (()=>{ try{ const v = localStorage.getItem(TOOL_STREAM_LS_KEY); return v === '1' || v === 'true'; } catch{ return false } })();
 
@@ -1744,6 +1940,7 @@ async function fetchSelectedToolOutput(){
 
 function setupSseConnection(){
   try {
+    if (gatewayV2Enabled) return;
     try { if (window.__arcana_global_es){ try { window.__arcana_global_es.close() } catch {} window.__arcana_global_es = null } } catch {}
     const es = new EventSource(buildEventsUrl()); window.__arcana_global_es = es;
     es.onmessage = (ev)=>{
@@ -2102,7 +2299,7 @@ try{
     btn.addEventListener('click', ()=>{ fetchSelectedToolOutput().catch(()=>{}); });
   }
 } catch{}
-setupSseConnection();
+try { ensureTransportReady().catch(()=>{}); } catch{}
 
 // Sidebar actions
 const newBtn = qs('new-session');

@@ -23,6 +23,7 @@ import {
   buildHistoryPreludeText as ssPrelude,
   saveSession as ssSave,
 } from '../src/sessions-store.js';
+import { getSessionIdForKey, resolveSessionIdForKey, setSessionIdForKey } from '../src/session-key-store.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
 import { loadAgentTemplate } from '../src/agent-templates.js';
 import { 
@@ -524,6 +525,37 @@ function resolveSessionContext(sessionId, explicitAgentId){
   const ws = agent && agent.workspaceRoot ? agent.workspaceRoot : workspaceRoot;
   const agentHomeDir = agent && agent.agentHomeDir ? agent.agentHomeDir : arcanaHomePath('agents', agentId);
   return { session: obj, agent, agentId, agentHomeDir, workspaceRoot: ws };
+}
+
+async function resolveBackingSessionId({ agentId, sessionId, sessionKey, title, workspaceRoot: wsArg, createIfMissing } = {}){
+  try {
+    const sid = String(sessionId || '').trim();
+    if (sid) return sid;
+    const key = String(sessionKey || '').trim();
+    if (!key) return '';
+    const agentIdNorm = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    const ws = String(wsArg || workspaceRoot || '').trim();
+    if (createIfMissing){
+      const info = await resolveSessionIdForKey({ agentId: agentIdNorm, sessionKey: key, title, workspaceRoot: ws });
+      const outId = info && info.sessionId ? String(info.sessionId || '').trim() : '';
+      return outId || '';
+    }
+    const existing = await getSessionIdForKey({ agentId: agentIdNorm, sessionKey: key });
+    const outId = existing ? String(existing || '').trim() : '';
+    return outId || '';
+  } catch {
+    return '';
+  }
+}
+
+async function maybePersistKeyMapping({ agentId, sessionKey, sessionId } = {}){
+  try {
+    const sid = String(sessionId || '').trim();
+    const key = String(sessionKey || '').trim();
+    if (!sid || !key) return;
+    const agentIdNorm = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    await setSessionIdForKey({ agentId: agentIdNorm, sessionKey: key, sessionId: sid });
+  } catch {}
 }
 
 
@@ -2148,6 +2180,7 @@ async function handleEvents(req, res) {
   await ensurePolicySession('restricted');
   let includeToolStream = false;
   let toolStreamSessionId = '';
+  let toolStreamSessionKey = '';
   try {
     const url = new URL(req.url, 'http://localhost');
     const v = (url.searchParams.get('toolStream') || '').toLowerCase();
@@ -2156,7 +2189,15 @@ async function handleEvents(req, res) {
     }
     const sid = String(url.searchParams.get('toolStreamSessionId') || '').trim();
     if (sid) toolStreamSessionId = sid;
+    const sk = String(url.searchParams.get('toolStreamSessionKey') || '').trim();
+    if (sk) toolStreamSessionKey = sk;
   } catch {}
+  if (!toolStreamSessionId && toolStreamSessionKey){
+    try {
+      const resolved = await resolveBackingSessionId({ sessionKey: toolStreamSessionKey, createIfMissing: false });
+      if (resolved) toolStreamSessionId = resolved;
+    } catch {}
+  }
   const meta = getSseMeta(res);
   meta.includeToolStream = includeToolStream;
   meta.toolStreamSessionId = toolStreamSessionId;
@@ -2179,6 +2220,7 @@ async function handleChat2(req, res) {
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
     let agentId = String(body.agentId || '').trim();
     let sessionId = String(body.sessionId || '').trim();
+    const sessionKey = String(body.sessionKey || '').trim();
 
     if (!message) {
       res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' }));
@@ -2197,6 +2239,17 @@ async function handleChat2(req, res) {
     const agentHomeDir = agent.agentHomeDir || agent.agentDir || arcanaHomePath('agents', agentId);
 
     let initialSession = null;
+    if (!sessionId && sessionKey) {
+      const resolvedId = await resolveBackingSessionId({
+        agentId,
+        sessionId,
+        sessionKey,
+        title: 'Arcana Web',
+        workspaceRoot: ws,
+        createIfMissing: true,
+      });
+      sessionId = String(resolvedId || '').trim();
+    }
     if (!sessionId) {
       const created = ssCreate({ title: '新会话', agentId });
       sessionId = created.id;
@@ -2224,6 +2277,12 @@ async function handleChat2(req, res) {
     applyExecPolicyToSession(sess, policy);
 
     const ctxBase = { sessionId, agentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws };
+
+    try {
+      if (sessionKey) {
+        await maybePersistKeyMapping({ agentId, sessionKey, sessionId });
+      }
+    } catch {}
 
     // If user explicitly invoked a skill via a skill block (/skill:name), activate its tools
     try {
@@ -2427,7 +2486,8 @@ async function handleAbort(req, res) {
   try {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    const sessionId = String(body.sessionId || '').trim();
+    let sessionId = String(body.sessionId || '').trim();
+    const sessionKey = String(body.sessionKey || '').trim();
     let agentId = '';
     try {
       if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
@@ -2435,6 +2495,12 @@ async function handleAbort(req, res) {
       }
     } catch {}
     if (!agentId) agentId = DEFAULT_AGENT_ID;
+    if (!sessionId && sessionKey){
+      try {
+        const resolvedId = await resolveBackingSessionId({ agentId, sessionKey, createIfMissing: false });
+        sessionId = String(resolvedId || '').trim();
+      } catch {}
+    }
     if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
 
     const hardAbortOne = (sess) => {
@@ -2514,7 +2580,8 @@ async function handleSteer(req, res) {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
     const message = String(body.message || '').trim();
-    const sessionId = String(body.sessionId || '').trim();
+    let sessionId = String(body.sessionId || '').trim();
+    const sessionKey = String(body.sessionKey || '').trim();
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
     let agentId = '';
     try {
@@ -2524,6 +2591,12 @@ async function handleSteer(req, res) {
     } catch {}
     if (!agentId) agentId = DEFAULT_AGENT_ID;
     if (!message) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' })); return; }
+    if (!sessionId && sessionKey){
+      try {
+        const resolvedId = await resolveBackingSessionId({ agentId, sessionKey, createIfMissing: false });
+        sessionId = String(resolvedId || '').trim();
+      } catch {}
+    }
     if (!sessionId) { res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_sessionId' })); return; }
 
     // Build prelude from existing session before appending the current user message
@@ -2553,7 +2626,15 @@ async function handleLocalFile(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost');
     const p = url.searchParams.get('path') || '';
-    const sid = String(url.searchParams.get('sessionId') || '').trim();
+    const sidRaw = String(url.searchParams.get('sessionId') || '').trim();
+    const skRaw = String(url.searchParams.get('sessionKey') || '').trim();
+    let sid = sidRaw;
+    if (!sid && skRaw){
+      try {
+        const resolvedId = await resolveBackingSessionId({ sessionKey: skRaw, createIfMissing: false });
+        sid = String(resolvedId || '').trim();
+      } catch {}
+    }
     const ctx = resolveSessionContext(sid || undefined);
     const ws = ctx.workspaceRoot || workspaceRoot;
     const filePath = runWithContext({ sessionId: sid || undefined, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => ensureReadAllowed(p));
@@ -2580,7 +2661,15 @@ function resetSessions() { try { sessionsByPolicy.clear(); chatSessions.clear();
 async function handleDoctor(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost');
-    const sid = String(url.searchParams.get('sessionId') || '').trim();
+    const sidRaw = String(url.searchParams.get('sessionId') || '').trim();
+    const skRaw = String(url.searchParams.get('sessionKey') || '').trim();
+    let sid = sidRaw;
+    if (!sid && skRaw){
+      try {
+        const resolvedId = await resolveBackingSessionId({ sessionKey: skRaw, createIfMissing: false });
+        sid = String(resolvedId || '').trim();
+      } catch {}
+    }
     const ctx = resolveSessionContext(sid || undefined);
     const ws = ctx.workspaceRoot || workspaceRoot;
     const result = await runWithContext({ sessionId: sid || undefined, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => runDoctor({ cwd: ws }));
@@ -2594,7 +2683,15 @@ async function handleSupportBundle(req, res) {
   try {
     const bufs = []; for await (const c of req) bufs.push(c);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf-8')) : {};
-    const sid = String(body.sessionId || '').trim();
+    const sidRaw = String(body.sessionId || '').trim();
+    const skRaw = String(body.sessionKey || '').trim();
+    let sid = sidRaw;
+    if (!sid && skRaw){
+      try {
+        const resolvedId = await resolveBackingSessionId({ sessionKey: skRaw, createIfMissing: false });
+        sid = String(resolvedId || '').trim();
+      } catch {}
+    }
     const ctx = resolveSessionContext(sid || undefined);
     const ws = ctx.workspaceRoot || workspaceRoot;
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -2829,7 +2926,15 @@ async function handleGetToolOutput(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost');
     const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
-    const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+    const sidRaw = String(url.searchParams.get('sessionId') || '').trim();
+    const skRaw = String(url.searchParams.get('sessionKey') || '').trim();
+    let sessionId = sidRaw;
+    if (!sessionId && skRaw){
+      try {
+        const resolvedId = await resolveBackingSessionId({ sessionKey: skRaw, createIfMissing: false });
+        sessionId = String(resolvedId || '').trim();
+      } catch {}
+    }
     const toolCallId = String(url.searchParams.get('toolCallId') || '').trim();
     const tailRaw = String(url.searchParams.get('tailBytes') || '').trim();
     const agentId = agentIdParam || DEFAULT_AGENT_ID;

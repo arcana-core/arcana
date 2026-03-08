@@ -12,11 +12,11 @@ let timerDueAt = null;
 let timerKind = null; // "normal" | "retry" | null
 
 function normalizeId(value) {
-  return value == null ? '' : String(value);
+  return value == null ? '' : String(value).trim();
 }
 
-function makeKey(agentId, sessionId) {
-  return `${agentId}::${sessionId}`;
+function makeTargetKey(agentId, sessionKey) {
+  return `${agentId}::${sessionKey}`;
 }
 
 function normalizeReason(reason) {
@@ -26,15 +26,18 @@ function normalizeReason(reason) {
 
 function reasonPriority(reason) {
   const r = String(reason || '').toLowerCase();
-  if (r === 'retry') return 3;
-  if (r === 'interval') return 2;
-  return 1;
+  if (r.startsWith('action:')) return 3; // ACTION
+  if (r === 'interval') return 1; // INTERVAL
+  if (r === 'retry') return 0; // RETRY
+  return 2; // DEFAULT
 }
 
-function queuePendingWake({ reason, agentId, sessionId, requestedAt }) {
+function queuePendingWake({ reason, agentId, sessionKey, sessionId, requestedAt }) {
   const normalizedAgentId = normalizeId(agentId);
+  const effectiveSessionKey = sessionKey != null ? sessionKey : sessionId;
+  const normalizedSessionKey = normalizeId(effectiveSessionKey);
   const normalizedSessionId = normalizeId(sessionId);
-  const key = makeKey(normalizedAgentId, normalizedSessionId);
+  const key = makeTargetKey(normalizedAgentId, normalizedSessionKey);
 
   const normalizedReason = normalizeReason(reason);
   const priority = reasonPriority(normalizedReason);
@@ -47,6 +50,7 @@ function queuePendingWake({ reason, agentId, sessionId, requestedAt }) {
     priority,
     requestedAt: ts,
     agentId: normalizedAgentId,
+    sessionKey: normalizedSessionKey,
     sessionId: normalizedSessionId,
   };
 
@@ -134,17 +138,21 @@ function schedule(coalesceMs, kind = 'normal') {
     try {
       for (const pending of batch) {
         const payload = {};
+        const sessionKey = pending.sessionKey != null ? pending.sessionKey : '';
+        const sessionId = pending.sessionId != null ? pending.sessionId : '';
         if (pending.reason != null) payload.reason = pending.reason;
         if (pending.agentId != null) payload.agentId = pending.agentId;
-        if (pending.sessionId != null) payload.sessionId = pending.sessionId;
+        payload.sessionKey = sessionKey;
+        if (sessionId) payload.sessionId = sessionId;
 
         try {
           const result = await active(payload);
-          if (result && result.status === 'skipped' && result.reason === 'requests_in_flight') {
+          const reason = result && typeof result.reason === 'string' ? result.reason : '';
+          if (result && result.status === 'skipped' && (reason === 'requests-in-flight' || reason === 'requests_in_flight')) {
             queuePendingWake({
               reason: 'retry',
               agentId: pending.agentId,
-              sessionId: pending.sessionId,
+              sessionKey,
             });
             schedule(RETRY_DELAY_MS, 'retry');
           }
@@ -153,7 +161,7 @@ function schedule(coalesceMs, kind = 'normal') {
           queuePendingWake({
             reason: 'retry',
             agentId: pending.agentId,
-            sessionId: pending.sessionId,
+            sessionKey,
           });
           schedule(RETRY_DELAY_MS, 'retry');
         }
@@ -218,11 +226,12 @@ export function setHeartbeatWakeHandler(next) {
 }
 
 export function requestHeartbeatNow(options = {}) {
-  const { reason, agentId, sessionId, coalesceMs } = options;
+  const { reason, agentId, sessionKey, sessionId, coalesceMs } = options;
 
   queuePendingWake({
     reason,
     agentId,
+    sessionKey,
     sessionId,
   });
 

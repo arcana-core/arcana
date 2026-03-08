@@ -52,6 +52,18 @@ function pickFallbackModel(provider){
 
 function normalizeOpenAIBase(base){ return String(base||'').trim(); }
 
+function normalizeAnthropicBase(base){
+  let s = String(base || '').trim();
+  if (!s) return '';
+  // Strip trailing slashes
+  s = s.replace(/\/+$/g, '');
+  // If the URL ends with '/v1', remove that segment so the
+  // Anthropic SDK can safely append '/v1/messages' without
+  // producing '/v1/v1/messages'.
+  if (s.toLowerCase().endsWith('/v1')) s = s.slice(0, -3);
+  return s;
+}
+
 function mergeAgentConfig(globalCfg, agentCfg){
   const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
   const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
@@ -335,6 +347,9 @@ export async function createArcanaSession(opts={}){
   }
   const baseOverride = normalizeOpenAIBase(cfg?.base_url || process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || '');
   if (baseOverride && model && model.provider === 'openai') model = { ...model, baseUrl: baseOverride };
+
+  const anthropicBaseOverride = normalizeAnthropicBase(cfg?.base_url || process.env.ANTHROPIC_BASE_URL || '');
+  if (anthropicBaseOverride && model && model.provider === 'anthropic') model = { ...model, baseUrl: anthropicBaseOverride };
 
   // Create tool-host client and proxy tools. We always register a proxy 'bash'
   // tool, but activation is controlled by execPolicy via setActiveToolsByName.

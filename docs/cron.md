@@ -22,8 +22,8 @@ Job schema (high level)
 - payload:
   - exec: { kind:"exec", command:string }
   - agentTurn: { kind:"agentTurn", prompt:string, timeoutMs?:number }
-- sessionTarget: "main" | "isolated" (default main for agentTurn)
-- delivery: { mode:"none"|"announce", sessionId?:string }
+- sessionTarget: "main" | "isolated" (default "isolated" for agentTurn jobs created via the in-chat cron tool when sessionTarget/delivery are omitted)
+- delivery: { mode:"none"|"announce"|"feishu_reply", sessionId?:string, messageId?:string, replyInThread?:boolean }
 
 Payload semantics
 - exec
@@ -34,11 +34,14 @@ Payload semantics
   - Runs an Arcana agent prompt as a background turn.
   - sessionTarget === "main":
     - Runs directly inside delivery.sessionId.
-    - delivery.sessionId defaults to the current chat sessionId when the job is created via the cron tool.
+    - delivery.sessionId defaults to the current chat sessionId when the job is created via the cron tool and sessionTarget or delivery is explicitly provided.
     - Per-session turn locks are used to avoid overlapping turns with interactive chat in the same session.
   - sessionTarget === "isolated":
-    - Each run creates a fresh isolated session (title based on the job title + timestamp).
+    - Each run creates a fresh isolated session (title based on the job title + timestamp), with a "[cron-run]" prefix in the session title so it appears as a background session in the web UI.
     - When delivery.mode == "announce" and delivery.sessionId is set, the tail of the assistant text is appended as an assistant message into the delivery session (best effort, also protected by a per-session turn lock).
+  - Defaults for agentTurn jobs created via the in-chat cron tool:
+    - If both sessionTarget and delivery are omitted, sessionTarget defaults to "isolated", delivery.mode defaults to "announce", and delivery.sessionId defaults to a per-agent "[cron-inbox]" session (falling back to the current chat session when the inbox cannot be created).
+    - When the source chat session has Feishu session metadata recorded by the Feishu bridge (including a Feishu message id) and both sessionTarget and delivery are omitted, sessionTarget defaults to "isolated" and delivery defaults to replying back to that Feishu thread using mode="feishu_reply" (with replyInThread=true).
   - timeoutMs (per payload) overrides the default cron agentTurn timeout; when omitted, the default is taken from the ARCANA_CRON_ARCANA_TIMEOUT_MS environment variable (or 60000 ms if unset).
 
 Storage

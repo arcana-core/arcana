@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../arcana-home.js';
+import { resolveSessionIdForKey } from '../session-key-store.js';
 
 // JSON-backed system events store, persisted under Arcana home.
 // Path per agent+session:
@@ -154,8 +155,8 @@ function coerceLimit(limitRaw) {
 }
 
 // Public API
-// enqueueSystemEvent({ agentId, sessionId, text, contextKey, dedupeKey, event })
-// - Requires agentId and sessionId.
+// enqueueSystemEvent({ agentId, sessionId, sessionKey, text, contextKey, dedupeKey, event })
+// - Requires agentId and (sessionId or sessionKey).
 // - If event object is provided, derives text/contextKey/dedupeKey from it when missing.
 // - Dedupe rules:
 //   * If dedupeKey exists and last event with that key was within 60s, skip.
@@ -164,11 +165,40 @@ function coerceLimit(limitRaw) {
 
 export async function enqueueSystemEvent(options = {}) {
   const opts = { ...(options || {}) };
-  if (!opts.agentId || !opts.sessionId) {
-    throw new Error('enqueueSystemEvent requires agentId and sessionId');
+  const rawAgentId = opts.agentId;
+  let rawSessionId = opts.sessionId;
+  const rawSessionKey = opts.sessionKey;
+  const workspaceRoot = opts.workspaceRoot;
+
+  let agentId = rawAgentId;
+  let sessionId = rawSessionId;
+
+  if (!sessionId && typeof rawSessionKey === 'string' && rawSessionKey.trim()) {
+    try {
+      const resolved = await resolveSessionIdForKey({
+        agentId: rawAgentId,
+        sessionKey: rawSessionKey,
+        title: 'System Events',
+        workspaceRoot,
+      });
+      if (resolved && resolved.sessionId) {
+        sessionId = String(resolved.sessionId);
+        if (!agentId && resolved.agentId) {
+          agentId = String(resolved.agentId);
+        }
+      }
+    } catch {
+      // fall through to error path below
+    }
   }
 
-  let { text, contextKey, dedupeKey, event } = opts;
+  if (!agentId || !sessionId) {
+    throw new Error('enqueueSystemEvent requires agentId and (sessionId or sessionKey)');
+  }
+
+  const storeOpts = { ...opts, agentId, sessionId };
+
+  let { text, contextKey, dedupeKey, event } = storeOpts;
   const now = Date.now();
 
   const ev = event && typeof event === 'object' ? event : undefined;
@@ -194,7 +224,7 @@ export async function enqueueSystemEvent(options = {}) {
     throw new Error('enqueueSystemEvent requires text or event');
   }
 
-  const state = await readState(opts);
+  const state = await readState(storeOpts);
 
   // Simple dedupe by dedupeKey within 60s.
   if (dedupeKeyStr) {
@@ -246,18 +276,47 @@ export async function enqueueSystemEvent(options = {}) {
     }
   }
 
-  await writeState(opts, state);
+  await writeState(storeOpts, state);
   return record;
 }
 
 export async function peekSystemEvents(options = {}) {
   const opts = { ...(options || {}) };
-  if (!opts.agentId || !opts.sessionId) {
-    throw new Error('peekSystemEvents requires agentId and sessionId');
+  const rawAgentId = opts.agentId;
+  let rawSessionId = opts.sessionId;
+  const rawSessionKey = opts.sessionKey;
+  const workspaceRoot = opts.workspaceRoot;
+
+  let agentId = rawAgentId;
+  let sessionId = rawSessionId;
+
+  if (!sessionId && typeof rawSessionKey === 'string' && rawSessionKey.trim()) {
+    try {
+      const resolved = await resolveSessionIdForKey({
+        agentId: rawAgentId,
+        sessionKey: rawSessionKey,
+        title: 'System Events',
+        workspaceRoot,
+      });
+      if (resolved && resolved.sessionId) {
+        sessionId = String(resolved.sessionId);
+        if (!agentId && resolved.agentId) {
+          agentId = String(resolved.agentId);
+        }
+      }
+    } catch {
+      // fall through to error path below
+    }
   }
 
-  const limit = coerceLimit(opts.limit);
-  const state = await readState(opts);
+  if (!agentId || !sessionId) {
+    throw new Error('peekSystemEvents requires agentId and (sessionId or sessionKey)');
+  }
+
+  const storeOpts = { ...opts, agentId, sessionId };
+
+  const limit = coerceLimit(storeOpts.limit);
+  const state = await readState(storeOpts);
   const ackedId = Number.isFinite(state.ackedThroughId) && state.ackedThroughId >= 0 ? state.ackedThroughId : 0;
   const pending = state.events.filter((item) => typeof item.id === 'number' && item.id > ackedId);
 
@@ -267,11 +326,40 @@ export async function peekSystemEvents(options = {}) {
 
 export async function ackSystemEvents(options = {}) {
   const opts = { ...(options || {}) };
-  if (!opts.agentId || !opts.sessionId) {
-    throw new Error('ackSystemEvents requires agentId and sessionId');
+  const rawAgentId = opts.agentId;
+  let rawSessionId = opts.sessionId;
+  const rawSessionKey = opts.sessionKey;
+  const workspaceRoot = opts.workspaceRoot;
+
+  let agentId = rawAgentId;
+  let sessionId = rawSessionId;
+
+  if (!sessionId && typeof rawSessionKey === 'string' && rawSessionKey.trim()) {
+    try {
+      const resolved = await resolveSessionIdForKey({
+        agentId: rawAgentId,
+        sessionKey: rawSessionKey,
+        title: 'System Events',
+        workspaceRoot,
+      });
+      if (resolved && resolved.sessionId) {
+        sessionId = String(resolved.sessionId);
+        if (!agentId && resolved.agentId) {
+          agentId = String(resolved.agentId);
+        }
+      }
+    } catch {
+      // fall through to error path below
+    }
   }
 
-  const state = await readState(opts);
+  if (!agentId || !sessionId) {
+    throw new Error('ackSystemEvents requires agentId and (sessionId or sessionKey)');
+  }
+
+  const storeOpts = { ...opts, agentId, sessionId };
+
+  const state = await readState(storeOpts);
   if (!state.events.length) {
     return {
       ackedThroughId: state.ackedThroughId,
@@ -279,8 +367,8 @@ export async function ackSystemEvents(options = {}) {
   }
 
   let targetId;
-  if (typeof opts.upToId === 'number' && Number.isFinite(opts.upToId)) {
-    targetId = opts.upToId;
+  if (typeof storeOpts.upToId === 'number' && Number.isFinite(storeOpts.upToId)) {
+    targetId = storeOpts.upToId;
   } else {
     const last = state.events[state.events.length - 1];
     targetId = typeof last.id === 'number' ? last.id : state.ackedThroughId;
@@ -289,7 +377,7 @@ export async function ackSystemEvents(options = {}) {
   if (targetId > state.ackedThroughId) {
     state.ackedThroughId = targetId;
     state.events = state.events.filter((item) => typeof item.id === 'number' && item.id > state.ackedThroughId);
-    await writeState(opts, state);
+    await writeState(storeOpts, state);
   }
 
   return {

@@ -41,7 +41,7 @@ function sanitizeConfig(cfg){
 
 function envSummary(){
   const out = {};
-  const keep = ['ARCANA_WORKSPACE','ARCANA_PROVIDER','ARCANA_MODEL','ARCANA_THINKING','ARCANA_EXEC_POLICY','ARCANA_PW_ENGINE','ARCANA_MEMORY_TRIGGERS','OPENAI_BASE_URL','OPENAI_API_BASE'];
+  const keep = ['ARCANA_WORKSPACE','ARCANA_PROVIDER','ARCANA_MODEL','ARCANA_THINKING','ARCANA_EXEC_POLICY','ARCANA_PW_ENGINE','ARCANA_MEMORY_TRIGGERS','OPENAI_BASE_URL','OPENAI_API_BASE','ANTHROPIC_BASE_URL'];
   for (const k of keep){ if (process.env[k]) out[k] = k.includes('WORKSPACE') ? redactPath(process.env[k]) : String(process.env[k]); }
   // API keys are summarized as present/not present only
   out.keys_present = {
