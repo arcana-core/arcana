@@ -3,7 +3,7 @@ import { loadHeartbeatConfigForAgent } from './config.js';
 import { runHeartbeatOnce } from './run-once.js';
 import { setHeartbeatWakeHandler, requestHeartbeatNow } from './wake.js';
 
-const DEFAULT_INTERVAL_MS = 60000;
+const DEFAULT_INTERVAL_MS = 1800000; // 30 minutes, matching OpenClaw default
 
 function nowMs() {
   return Date.now();

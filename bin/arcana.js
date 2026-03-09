@@ -253,6 +253,7 @@ async function heartbeatCLI({ args }){
 
   if (s === 'serve'){
     console.log('[arcana] heartbeat: runner started (Ctrl+C to stop)');
+    console.warn('[arcana] Note: heartbeat runner now starts automatically with `arcana web`. This standalone command is kept for debugging.');
     startHeartbeatRunner({
       async onLog(res){
         try {

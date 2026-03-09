@@ -26,6 +26,16 @@ function ensureGatewayV2SessionKey(){
   } catch { return 'session'; }
 }
 
+// --- Quota warning helper (alert once) ---
+let __arcana_storageQuotaWarned = false;
+function warnStorageQuota(){
+  try{
+    if (__arcana_storageQuotaWarned) return;
+    __arcana_storageQuotaWarned = true;
+    alert('本地存储空间已满。请删除不需要的会话来释放空间。');
+  } catch {}
+}
+
 
 // --- Session-bound, layered Logs ---
 const LOG_CAP = 400; // per session per tab
@@ -277,7 +287,7 @@ function scheduleSaveToolPanel(sessionId){
         } catch {}
         if (!root || typeof root !== 'object') root = {};
         root[sid] = payload;
-        try{ localStorage.setItem(TOOL_PANELS_KEY, JSON.stringify(root)); } catch {}
+        try{ localStorage.setItem(TOOL_PANELS_KEY, JSON.stringify(root)); } catch(e){ try{ warnStorageQuota(); } catch{} }
       } catch {}
     }, TOOL_PANELS_SAVE_DEBOUNCE_MS);
     toolPanelSaveTimers.set(sid, handle);
@@ -310,7 +320,7 @@ function scheduleSaveMainLogs(sessionId){
         } catch {}
         if (!root || typeof root !== 'object') root = {};
         root[sid] = lines;
-        try{ localStorage.setItem(MAIN_LOGS_KEY, JSON.stringify(root)); } catch {}
+        try{ localStorage.setItem(MAIN_LOGS_KEY, JSON.stringify(root)); } catch(e){ try{ warnStorageQuota(); } catch{} }
       } catch {}
     }, MAIN_LOGS_SAVE_DEBOUNCE_MS);
     mainLogsSaveTimers.set(sid, handle);
@@ -1180,7 +1190,8 @@ const CKEY = 'arcana.currentSessionId';
 const AKEY = 'arcana.currentAgentId';
 const LSK_LAST_SEEN = 'arcana.sessions.lastSeen';
 const LSK_BG_SESS_COLLAPSED = 'arcana.sessions.bgCollapsed.v1';
-let currentId = localStorage.getItem(CKEY) || '';
+let currentId = '';
+try { currentId = localStorage.getItem(CKEY) || '' } catch {}
 let bgSessionsCollapsed = (()=>{
   try{
     const v = localStorage.getItem(LSK_BG_SESS_COLLAPSED);
@@ -1206,7 +1217,11 @@ const globalLiveInfo = {
 const liveInfoBySession = new Map(); // sessionId -> snapshot
 
 function nowIso(){ return new Date().toISOString() }
-function setCurrent(id){ currentId = id; localStorage.setItem(CKEY, id); try { window.__arcana_currentSessionId = id } catch {} }
+function setCurrent(id){
+  currentId = id;
+  try { localStorage.setItem(CKEY, id) } catch(e){ try{ warnStorageQuota(); } catch{} }
+  try { window.__arcana_currentSessionId = id } catch {}
+}
 
 // Per-session lastSeen tracking (for unread indicators)
 let lastSeenBySession = {};
@@ -1364,7 +1379,7 @@ async function setCurrentAgent(id){
   } catch {}
 
   if (!hasAgents){
-    refreshList().catch(()=>{});
+  requestRefreshList();
     return;
   }
 
@@ -1451,11 +1466,13 @@ function renderSessionList(items){
     div.dataset.id = it.id;
     const unread = isSessionUnread(it);
     const unreadDot = unread ? '<span class=sess-unread-dot></span>' : '';
-    const runningSpinner = typing.get(it.id) ? '<span class=sess-running-spinner></span>' : '';
+    const running = !!typing.get(it.id);
+    const runningSpinner = running ? '<span class=sess-running-spinner></span>' : '';
     const title = (it.title||'新会话');
     const metaTime = it.updatedAt ? ('<span class=meta>' + new Date(it.updatedAt).toLocaleString() + '</span>') : '';
     const metaWs = it.workspace ? ('<span class=meta ws>' + it.workspace + '</span>') : '';
-    div.innerHTML = unreadDot + title + runningSpinner + metaTime + metaWs;
+    const prefix = unread ? unreadDot : (running ? runningSpinner : '');
+    div.innerHTML = prefix + title + metaTime + metaWs;
     const del = document.createElement('button');
     del.className = 'del'; del.textContent = '删'; del.title = '删除会话';
     del.addEventListener('click', async (ev)=>{
@@ -1467,10 +1484,19 @@ function renderSessionList(items){
         if (!resp || resp.ok !== true){ appendLog('[sessions] delete failed: server rejected'); return }
         try{
           const sid = String(it.id || '');
-          if (sid){
+          if (!sid) { /* nothing to purge */ }
+          else {
+            // Purge in-memory caches
             try{ toolPanels.delete(sid); } catch {}
+            try{ logStore.delete(sid); } catch {}
+            try{ lastWorkspaceBySession.delete(sid); } catch {}
+            try{ liveInfoBySession.delete(sid); } catch {}
+            try{ typing.delete(sid); } catch {}
+
+            // Purge persisted per-session data
             try{
               if (typeof localStorage !== 'undefined'){
+                // Tool panels bucket
                 try{
                   const raw = localStorage.getItem(TOOL_PANELS_KEY);
                   if (raw){
@@ -1478,7 +1504,33 @@ function renderSessionList(items){
                     try{ obj = JSON.parse(raw); } catch { obj = null; }
                     if (obj && typeof obj === 'object' && sid in obj){
                       delete obj[sid];
-                      try{ localStorage.setItem(TOOL_PANELS_KEY, JSON.stringify(obj)); } catch {}
+                      try{ localStorage.setItem(TOOL_PANELS_KEY, JSON.stringify(obj)); } catch{}
+                    }
+                  }
+                } catch {}
+
+                // Main logs bucket
+                try{
+                  const raw2 = localStorage.getItem(MAIN_LOGS_KEY);
+                  if (raw2){
+                    let obj2;
+                    try{ obj2 = JSON.parse(raw2); } catch { obj2 = null; }
+                    if (obj2 && typeof obj2 === 'object' && sid in obj2){
+                      delete obj2[sid];
+                      try{ localStorage.setItem(MAIN_LOGS_KEY, JSON.stringify(obj2)); } catch{}
+                    }
+                  }
+                } catch {}
+
+                // Last seen bucket
+                try{
+                  const raw3 = localStorage.getItem(LSK_LAST_SEEN);
+                  if (raw3){
+                    let obj3;
+                    try{ obj3 = JSON.parse(raw3); } catch { obj3 = null; }
+                    if (obj3 && typeof obj3 === 'object' && sid in obj3){
+                      delete obj3[sid];
+                      try{ localStorage.setItem(LSK_LAST_SEEN, JSON.stringify(obj3)); } catch{}
                     }
                   }
                 } catch {}
@@ -1572,7 +1624,7 @@ async function openSession(id){
   renderMessages((obj && Array.isArray(obj.messages)) ? obj.messages : []);
   // Log session workspace only when it changes to avoid duplicate lines when switching
   try { if (obj && obj.workspace) { logWorkspaceIfChanged(id, 'workspace:', obj.workspace); } } catch {}
-  refreshList().catch(()=>{});
+  requestRefreshList();
   try { renderLogsFor(id, activeLogTab) } catch {}
   try { renderLiveInfoFor(id); } catch {}
   try {
@@ -1582,7 +1634,16 @@ async function openSession(id){
   } catch{}
 }
 
-function renderMessages(msgs){ messages.innerHTML = ''; for (const m of (msgs||[])) appendMessage(m.role, m.text); messages.scrollTop = messages.scrollHeight; }
+function renderMessages(msgs){
+  messages.innerHTML = '';
+  for (const m of (msgs||[])){
+    const isHb = m.role === 'assistant' && typeof m.text === 'string' && m.text.startsWith('[heartbeat]');
+    const displayText = isHb ? '💓 ' + m.text.replace(/^\[heartbeat\]\n\n?/, '') : m.text;
+    const bubble = appendMessage(m.role, displayText);
+    if (isHb && bubble) bubble.classList.add('heartbeat-msg');
+  }
+  messages.scrollTop = messages.scrollHeight;
+}
 
 async function refreshList(){
   const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
@@ -1599,6 +1660,30 @@ async function refreshList(){
   } catch {}
   renderSessionList(items);
   return items;
+}
+
+// Coalesced/throttled list refresh for frequent events (SSE typing/text etc.)
+let __arcana_rl_inflight = false;
+let __arcana_rl_timer = null;
+let __arcana_rl_queued = false;
+function requestRefreshList(){
+  try{
+    // If a refresh is in flight, mark queued and return.
+    if (__arcana_rl_inflight){ __arcana_rl_queued = true; return; }
+    // Basic throttle: only allow one dispatch per 400ms.
+    if (__arcana_rl_timer) return;
+    __arcana_rl_timer = setTimeout(async ()=>{
+      __arcana_rl_timer = null;
+      if (__arcana_rl_inflight){ __arcana_rl_queued = true; return; }
+      __arcana_rl_inflight = true;
+      try{ await refreshList(); }
+      catch{ /* noop */ }
+      finally{
+        __arcana_rl_inflight = false;
+        if (__arcana_rl_queued){ __arcana_rl_queued = false; try{ requestRefreshList(); } catch{} }
+      }
+    }, 400);
+  } catch {}
 }
 
 async function ensureSession(){
@@ -1650,7 +1735,7 @@ async function sendWithSession(){
     if (getCurrentSessionId() === sidAtSend || currentId === sidAtSend){
       await openSession(sidAtSend);
     } else {
-      refreshList().catch(()=>{});
+    requestRefreshList();
     }
   } catch(e) { if (activeAssistant) activeAssistant.textContent = '[错误] ' + (((e && e.message) || e)); }
   finally { messages.scrollTop = messages.scrollHeight; }
@@ -1947,10 +2032,6 @@ function setupSseConnection(){
     try{
       const data = JSON.parse(ev.data);
 
-      // Maintain typing dots in the session list (update even for other sessions)
-      if (data.type === 'thinking_start' && data.sessionId){ typing.set(data.sessionId, true); refreshList().catch(()=>{}) }
-      if (data.type === 'thinking_end' && data.sessionId){ typing.delete(data.sessionId); refreshList().catch(()=>{}) }
-
       // Logs panel + lifecycle
       const sid = data.sessionId || currentId;
             if (data.type === 'open_vault'){
@@ -1981,6 +2062,7 @@ function setupSseConnection(){
       }
       if (data.type === 'turn_start'){
         const targetId = data.sessionId || sid;
+        try { if (data.sessionId) { typing.set(data.sessionId, true); try { requestRefreshList(); } catch {} } } catch {}
         try {
           const snap = ensureLiveForSession(targetId);
           if (snap){
@@ -2023,6 +2105,7 @@ function setupSseConnection(){
 
       if (data.type === 'turn_end'){
         const targetId = data.sessionId || sid;
+        try { if (data.sessionId) { typing.delete(data.sessionId); try { requestRefreshList(); } catch {} } } catch {}
         try {
           const snap = ensureLiveForSession(targetId);
           if (snap){
@@ -2058,7 +2141,7 @@ function setupSseConnection(){
         try { markTurnDone(targetId); } catch {}
         // For background sessions, just refresh the list/unread state.
         if (targetId && targetId !== currentId){
-          try { refreshList().catch(()=>{}) } catch {}
+          try { requestRefreshList(); } catch {}
           return;
         }
         try {
@@ -2227,10 +2310,30 @@ function setupSseConnection(){
         return;
       }
 
+      if (data.type === 'heartbeat_message'){
+        // Heartbeat delivered a message to a session.
+        if (data.sessionId && data.sessionId !== currentId){
+          // Another session received a heartbeat — update unread/list.
+          try { requestRefreshList(); } catch {}
+          return;
+        }
+        // Current session received a heartbeat message — append with visual distinction.
+        const hbText = typeof data.text === 'string' ? data.text : '';
+        // Strip the '[heartbeat]\n\n' prefix for display; the label is shown via CSS class.
+        const displayText = hbText.replace(/^\[heartbeat\]\n\n?/, '');
+        if (displayText) {
+          const bubble = appendMessage('assistant', '💓 ' + displayText);
+          if (bubble) bubble.classList.add('heartbeat-msg');
+          messages.scrollTop = messages.scrollHeight;
+          try { if (currentId) markSessionSeen(currentId); } catch {}
+        }
+        return;
+      }
+
       if (data.type === 'assistant_text'){
         // For non-current sessions, refresh list/unread and skip UI updates.
         if (data.sessionId && data.sessionId !== currentId){
-          try { refreshList().catch(()=>{}) } catch {}
+        try { requestRefreshList(); } catch {}
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
@@ -2244,7 +2347,7 @@ function setupSseConnection(){
       if (data.type === 'assistant_image'){
         // For non-current sessions, refresh list/unread and skip UI updates.
         if (data.sessionId && data.sessionId !== currentId){
-          try { refreshList().catch(()=>{}) } catch {}
+          try { requestRefreshList(); } catch {}
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;

@@ -44,3 +44,7 @@ Support Bundle
   - Long-running shell/web tool calls may be cancelled by the tool-host client if they exceed configured limits. Use ARCANA_TOOLHOST_BASH_TIMEOUT_MS and ARCANA_TOOLHOST_WEB_TIMEOUT_MS (milliseconds) to increase or disable timeouts; set either to 0 to disable client-level timeout. Per-call overrides: bash accepts a timeout (seconds); web tools accept an optional timeout (seconds).
   - When a timeout or cancellation happens, the agent now receives an explicit tool error output (not a thrown exception). The tool returns a short text message and details.ok=false with error set to timeout or cancelled so the agent can respond or retry accordingly.
   - Canonical long-term memory for the default agent lives at $ARCANA_HOME/agents/default/MEMORY.md (ARCANA_HOME defaults to ~/.arcana).
+
+- Session history missing or sessions disappear under load
+  - Ensure all Arcana processes share the same ARCANA_HOME (defaults to ~/.arcana). Using different ARCANA_HOME values on the same machine will scatter sessions across multiple directories and make them appear missing.
+  - Older Arcana versions could lose or truncate sessions when multiple agents or processes wrote concurrently. Upgrade to a version with atomic session and session-key writes so concurrent runs keep existing sessions intact.

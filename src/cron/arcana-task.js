@@ -6,6 +6,7 @@ import { createWriteStream } from 'node:fs';
 import { arcanaHomePath } from '../arcana-home.js';
 import { getContext, runWithContext, emit } from '../event-bus.js';
 import { loadCronSettings } from './store.js';
+import { DEFAULT_CONTEXT_POLICY, compactSession } from '../context-manager.js';
 
 function tailLines(text, max=100){
   const lines = String(text||'').split('\n');
@@ -68,39 +69,17 @@ function extractMediaFromAssistantText(text){
 
 function buildBoundedHistoryPrelude(sessionObj){
   if (!sessionObj) return '';
-  const maxMessages = 30;
-  const maxChars = 20000;
   const summaryRaw = typeof sessionObj.summary === 'string' ? sessionObj.summary : '';
-  const summary = summaryRaw.trim();
-
+  const summary = String(summaryRaw || '').trim();
   const msgs = Array.isArray(sessionObj.messages) ? sessionObj.messages : [];
-  let historyText = '';
-  if (msgs.length){
-    const trimmed = { ...sessionObj, messages: msgs.slice(-maxMessages) };
-    historyText = buildHistoryPreludeText(trimmed) || '';
-  }
-
-  let summaryPrefix = '';
-  if (summary){
-    summaryPrefix = '[Summary]\n' + summary + '\n\n';
-  }
-
-  let text = '';
-
-  if (summaryPrefix && historyText){
-    const remaining = maxChars - summaryPrefix.length;
-    if (remaining <= 0){
-      text = summaryPrefix.slice(-maxChars);
-    } else {
-      const boundedHistory = historyText.length > remaining ? historyText.slice(-remaining) : historyText;
-      text = summaryPrefix + boundedHistory;
-    }
-  } else {
-    text = summaryPrefix + historyText;
-    if (text.length > maxChars) text = text.slice(-maxChars);
-  }
-
-  return text;
+  if (!msgs.length && !summary) return '';
+  const preludeObj = { messages: msgs };
+  return buildHistoryPreludeText(preludeObj, {
+    summary,
+    maxMessages: DEFAULT_CONTEXT_POLICY.preludeMaxMessages,
+    maxMessageChars: DEFAULT_CONTEXT_POLICY.preludeMaxMessageChars,
+    maxTotalChars: DEFAULT_CONTEXT_POLICY.preludeMaxTotalChars,
+  }) || '';
 }
 
 async function ensureSessionId({ sessionId, sessionKey, title, agentId, workspaceRoot }){
@@ -275,16 +254,19 @@ async function compactSessionIfNeeded({ sessionId, agentId, workspaceRoot, agent
     const older = msgs.slice(0, splitIndex);
     const recent = msgs.slice(splitIndex);
 
-    const existingSummary = typeof sessionObj.summary === 'string' ? sessionObj.summary : '';
+    // Shared compaction logic persists the summary and keeps recent messages.
+    await compactSession({
+      sessionId,
+      agentId,
+      workspaceRoot,
+      agentHomeDir: agentHomeRoot,
+      keepRecentMessages: keep,
+      policy: DEFAULT_CONTEXT_POLICY,
+      reason: 'cron_threshold',
+    });
 
-    const updatedSummary = await summarizeSessionChunk({ workspaceRoot, agentHomeRoot, existingSummary, olderMessages: older });
-    const finalSummary = String(updatedSummary || '').trim() || existingSummary || '';
-
-    sessionObj.summary = finalSummary;
-    sessionObj.messages = recent;
-    sessionObj.sessionTokens = 0;
-
-    saveSession(sessionObj, { agentId });
+    // Reset tracked session tokens after compaction.
+    sessionObj = loadSession(sessionId, { agentId }) || sessionObj;
   } catch {
     // best-effort only
   }

@@ -28,6 +28,7 @@ import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
 import { loadAgentTemplate } from '../src/agent-templates.js';
 import { 
   loadCronSettings as cronLoadSettings, saveCronSettings as cronSaveSettings, acquireSessionTurnLock, releaseSessionTurnLock } from '../src/cron/store.js';
+import { DEFAULT_CONTEXT_POLICY, buildSessionPrelude, trimUserMessage, compactSession } from '../src/context-manager.js';
 // Tier1 memory triggers (direct daily append)
 
 
@@ -636,7 +637,7 @@ function schedulePersistSessionTokens({ agentId, sessionId, tokens }){
         const obj = ssLoad(sid, { agentId: effectiveAgentId }) || null;
         if (!obj || typeof obj !== 'object') return;
         obj.sessionTokens = latestNum;
-        try { ssSave(obj, { agentId: effectiveAgentId }); } catch {}
+        try { ssSave(obj, { agentId: effectiveAgentId, touchUpdatedAt:false }); } catch {}
       } catch {}
     }, SESSION_TOKENS_PERSIST_DEBOUNCE_MS);
     try { if (handle && typeof handle.unref === 'function') handle.unref(); } catch {}
@@ -2216,7 +2217,7 @@ async function handleChat2(req, res) {
   try {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    const message = String(body.message || '').trim();
+    let message = trimUserMessage(String(body.message || '').trim(), DEFAULT_CONTEXT_POLICY);
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
     let agentId = String(body.agentId || '').trim();
     let sessionId = String(body.sessionId || '').trim();
@@ -2315,7 +2316,7 @@ async function handleChat2(req, res) {
       if (agentId && !historyObj.agentId) { historyObj.agentId = agentId; changed = true; }
       if (changed) { try { ssSave(historyObj, { agentId }); } catch {} }
     }
-    const prelude = ssPrelude(historyObj);
+    const prelude = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY);
 
     // Persist user message after prelude so it is not duplicated in the prompt
     ssAppend(sessionId, { role: 'user', text: message, agentId });
@@ -2360,8 +2361,27 @@ async function handleChat2(req, res) {
         let msg = '';
         try { msg = String(e && (e.message || e)) || ''; } catch { msg = ''; }
         if (msg && isContextOverflowErrorMessage(msg)) {
-          try {
-            await compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir });
+          const steps = Array.isArray(DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps)
+            ? DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps
+            : [DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive || 40, 20, 10, 6];
+          const maxRetriesRaw = Number(DEFAULT_CONTEXT_POLICY.maxOverflowRetries);
+          const maxRetries = (Number.isFinite(maxRetriesRaw) && maxRetriesRaw > 0) ? Math.floor(maxRetriesRaw) : 1;
+
+          for (let i = 0; i < Math.min(maxRetries, steps.length); i++) {
+            const keepRecent = Number(steps[i]) || Number(DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive) || 40;
+            try {
+              await compactSession({
+                sessionId,
+                agentId,
+                workspaceRoot: ws,
+                agentHomeDir,
+                keepRecentMessages: keepRecent,
+                policy: DEFAULT_CONTEXT_POLICY,
+                broadcast,
+                reason: 'steer_overflow',
+              });
+            } catch {}
+
             const updated = ssLoad(sessionId, { agentId });
             let preludeAfter = '';
             if (updated && Array.isArray(updated.messages) && updated.messages.length){
@@ -2371,7 +2391,7 @@ async function handleChat2(req, res) {
               if (last && last.role === 'user') {
                 historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
               }
-              preludeAfter = ssPrelude(historyAfter);
+              preludeAfter = buildSessionPrelude(historyAfter, DEFAULT_CONTEXT_POLICY);
             }
             const retryPayload = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
             try {
@@ -2379,11 +2399,10 @@ async function handleChat2(req, res) {
                 sess.prompt(retryPayload, { streamingBehavior: 'steer', expandPromptTemplates: true })
               );
               try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
+              break;
             } catch {
-              // best-effort for steer overflow retry
+              // best-effort: try again after a more aggressive compaction
             }
-          } catch {
-            // ignore compaction failures for steer path
           }
         }
       }
@@ -2395,12 +2414,18 @@ async function handleChat2(req, res) {
 
     // Normal path: not streaming -> start a new agent turn
     let promptError = null;
-    let attemptedCompaction = false;
+    const steps = Array.isArray(DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps)
+      ? DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps
+      : [DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive || 40, 20, 10, 6];
+    const maxRetriesRaw = Number(DEFAULT_CONTEXT_POLICY.maxOverflowRetries);
+    const maxRetries = (Number.isFinite(maxRetriesRaw) && maxRetriesRaw > 0) ? Math.floor(maxRetriesRaw) : 1;
+    let compactionAttempts = 0;
+
     const turnLockOptions = { agentId, workspaceRoot: ws };
     let turnLockPath = null;
     try {
       try { turnLockPath = acquireSessionTurnLock(sessionId, turnLockOptions); } catch {}
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 1 + maxRetries; attempt++) {
         promptError = null;
         try {
           await runWithContext(ctxBase, () => sess.prompt(payloadMsg));
@@ -2416,10 +2441,22 @@ async function handleChat2(req, res) {
           msg = 'agent_prompt_failed';
         }
 
-        if (!attemptedCompaction && isContextOverflowErrorMessage(msg)) {
-          attemptedCompaction = true;
+        if (isContextOverflowErrorMessage(msg) && compactionAttempts < maxRetries) {
+          const idx = Math.min(compactionAttempts, steps.length - 1);
+          const keepRecent = Number(steps[idx]) || Number(DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive) || 40;
+          compactionAttempts++;
           try {
-            await compactSessionHistoryOnOverflow({ sessionId, agentId, ws, agentHomeDir });
+            await compactSession({
+              sessionId,
+              agentId,
+              workspaceRoot: ws,
+              agentHomeDir,
+              keepRecentMessages: keepRecent,
+              policy: DEFAULT_CONTEXT_POLICY,
+              broadcast,
+              reason: 'overflow_recovery',
+            });
+
             const updated = ssLoad(sessionId, { agentId });
             let preludeAfter = '';
             if (updated && Array.isArray(updated.messages) && updated.messages.length){
@@ -2429,7 +2466,7 @@ async function handleChat2(req, res) {
               if (last && last.role === 'user') {
                 historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
               }
-              preludeAfter = ssPrelude(historyAfter);
+              preludeAfter = buildSessionPrelude(historyAfter, DEFAULT_CONTEXT_POLICY);
             }
             payloadMsg = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
             continue;
@@ -2442,6 +2479,7 @@ async function handleChat2(req, res) {
         break;
       }
     } finally {
+
       try {
         if (turnLockPath) releaseSessionTurnLock(turnLockPath, turnLockOptions);
       } catch {}
@@ -2469,6 +2507,16 @@ async function handleChat2(req, res) {
         const last = msgs.length ? msgs[msgs.length - 1] : null;
         if (persistedCount === 0 || !last || last.role !== 'assistant' || String(last.text || '') !== String(lastAssistantText)) {
           ssAppend(sessionId, { role: 'assistant', text: lastAssistantText, agentId });
+          persistedCount++;
+        }
+      } catch {}
+    } else if (out) {
+      try {
+        const cur = ssLoad(sessionId, { agentId });
+        const msgs = (cur && Array.isArray(cur.messages)) ? cur.messages : [];
+        const last = msgs.length ? msgs[msgs.length - 1] : null;
+        if (!last || last.role !== 'assistant' || String(last.text || '') !== String(out)) {
+          ssAppend(sessionId, { role: 'assistant', text: out, agentId });
           persistedCount++;
         }
       } catch {}
@@ -2579,7 +2627,7 @@ async function handleSteer(req, res) {
   try {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    const message = String(body.message || '').trim();
+    let message = trimUserMessage(String(body.message || '').trim(), DEFAULT_CONTEXT_POLICY);
     let sessionId = String(body.sessionId || '').trim();
     const sessionKey = String(body.sessionKey || '').trim();
     const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
@@ -3082,6 +3130,7 @@ export async function startArcanaWebServer({ port, workspaceRoot: wsRoot } = {})
   const bound = server.address();
   const actualPort = bound && typeof bound.port === 'number' ? bound.port : desiredPort;
   console.log('[arcana:web] http://localhost:' + actualPort + '  (plugins: ' + (pluginFiles ? pluginFiles.length : 0) + ')');
+
   return { server, port: actualPort };
 }
 

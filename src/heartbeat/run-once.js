@@ -1,7 +1,7 @@
 import { createArcanaSession } from '../session.js';
-import { runWithContext } from '../event-bus.js';
+import { runWithContext, emit } from '../event-bus.js';
 import { arcanaHomePath } from '../arcana-home.js';
-import { appendMessage } from '../sessions-store.js';
+import { appendMessage, loadSession, buildHistoryPreludeText } from '../sessions-store.js';
 import { resolveSessionIdForKey } from '../session-key-store.js';
 import { acquireSessionTurnLock, releaseSessionTurnLock } from '../cron/store.js';
 import { loadAgentsSnapshot } from '../agents-snapshot.js';
@@ -162,6 +162,7 @@ function buildHeartbeatPrompt({ events, heartbeatText, triggerReason, targetSess
 
   prompt += 'If there is nothing important to report or no action is needed, respond exactly with: HEARTBEAT_OK.\n';
   prompt += 'If you do have something to say, you may optionally start with HEARTBEAT_OK on the first line, then add a concise message for the human on following lines.\n';
+  prompt += 'IMPORTANT: Do not infer or repeat tasks from prior conversation history unless they are explicitly listed in HEARTBEAT.md. Follow HEARTBEAT.md strictly.\n';
 
   return prompt;
 }
@@ -318,7 +319,7 @@ export async function runHeartbeatOnce({ agentId, sessionId, sessionKey, reason,
       const rawAck = Number(heartbeatConfig.ackMaxChars || heartbeatConfig.ack_max_chars);
       if (Number.isFinite(rawAck) && rawAck > 0) effectiveAckMax = rawAck;
     }
-    if (!effectiveAckMax) effectiveAckMax = 30;
+    if (!effectiveAckMax) effectiveAckMax = 300;
 
     lockOptions = { agentId: effectiveAgentId, workspaceRoot: effectiveWorkspaceRoot };
     try {
@@ -408,17 +409,22 @@ export async function runHeartbeatOnce({ agentId, sessionId, sessionKey, reason,
       targetSessionId: backingSessionId,
     });
 
-    const heartbeatSessionId = 'agent:arcana:heartbeat:' + Date.now();
+    // Load conversation history from the backing session and prepend as context prelude,
+    // so the model can reason about in-progress tasks and resume if needed.
+    const historyObj = loadSession(backingSessionId, { agentId: effectiveAgentId });
+    const historyPrelude = buildHistoryPreludeText(historyObj);
+    const fullPrompt = (historyPrelude ? historyPrelude + '\n\n' : '') + '[Heartbeat Check]\n' + prompt;
+
     const agentHomeRoot = arcanaHomePath('agents', effectiveAgentId);
     let assistantText = '';
 
     await runWithContext(
-      { sessionId: heartbeatSessionId, agentId: effectiveAgentId, agentHomeRoot, workspaceRoot: effectiveWorkspaceRoot },
+      { sessionId: backingSessionId, agentId: effectiveAgentId, agentHomeRoot, workspaceRoot: effectiveWorkspaceRoot },
       async () => {
         const { session } = await createArcanaSession({
           workspaceRoot: effectiveWorkspaceRoot,
           agentHomeRoot,
-          sessionId: heartbeatSessionId,
+          sessionId: backingSessionId,
           bootstrapContextMode: 'heartbeat_light',
         });
 
@@ -445,7 +451,7 @@ export async function runHeartbeatOnce({ agentId, sessionId, sessionKey, reason,
         });
 
         try {
-          await session.prompt(prompt);
+          await session.prompt(fullPrompt);
         } finally {
           try {
             if (typeof unsub === 'function') {
@@ -469,6 +475,13 @@ export async function runHeartbeatOnce({ agentId, sessionId, sessionKey, reason,
         try {
           appendMessage(backingSessionId, { role: 'assistant', text: payload, agentId: effectiveAgentId });
           delivered = true;
+          // Broadcast SSE event so the web UI can show the heartbeat message in real time
+          // without requiring a page refresh.
+          try {
+            emit({ type: 'heartbeat_message', sessionId: backingSessionId, agentId: effectiveAgentId, text: payload });
+          } catch {
+            // SSE broadcast is best-effort; do not fail heartbeat run.
+          }
         } catch {
           // Best-effort delivery; keep delivered=false on failure.
         }

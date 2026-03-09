@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js';
@@ -108,7 +108,9 @@ function writeMapping(agentIdRaw, sessionKeyRaw, sessionIdRaw) {
   };
 
   try {
-    writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
+    const tmp = filePath + '.tmp';
+    writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');
+    renameSync(tmp, filePath);
   } catch {
     // best-effort only
   }
