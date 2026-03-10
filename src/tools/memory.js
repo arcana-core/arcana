@@ -83,7 +83,7 @@ export function createMemoryTools(){
   const memorySearch = {
     label: 'Memory Search',
     name: 'memory_search',
-    description: 'Search MEMORY.md and memory/**/*.md for a substring (no embeddings).',
+    description: 'Search MEMORY.md and memory/**/*.md for a substring.',
     parameters: SearchParams,
     async execute(_id, args){
       const q = String(args.query || '').toLowerCase();

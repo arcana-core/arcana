@@ -848,7 +848,11 @@ async function runPreCompactionMemoryFlush({ ws, agentId, agentHomeDir, sessionI
       prompt += 'Before older conversation history is compacted, review the summary and recent messages below.\n';
       prompt += 'Decide what should be written to persistent memory so future sessions can benefit.\n';
       prompt += 'You may only write to MEMORY.md and memory/*.md under the agent home, using the tools memory_write and memory_edit.\n';
-      prompt += 'Prefer appending raw notes to a daily file under memory/YYYY-MM-DD.md and keeping concise summaries in MEMORY.md.\n';
+      prompt += 'Daily log preference: Append a short entry to memory/YYYY-MM-DD.md capturing: what was done, key results/outcomes, decisions made, and next steps/open loops. Only write to MEMORY.md when content is genuinely stable/durable (e.g., preferences, long-lived decisions).\n';
+      prompt += "Write policy: append-only for daily files (never overwrite or delete prior content). Use memory_edit only for small corrections in today's file. Only write to MEMORY.md when content is genuinely stable/durable (e.g., preferences, long-lived decisions).";
+      prompt += "Safety: never store secrets, tokens/keys, credentials, raw logs, stack traces, or sensitive PII.";
+      prompt += "After writing (or if nothing is worth storing), reply only with NO_REPLY.";
+
       prompt += 'Do not write to any other files.\n\n';
       if (ts) {
         prompt += 'Current local timestamp: ' + ts + '\n\n';
@@ -1671,7 +1675,6 @@ async function ensurePolicySession(policy) {
   model = created.model || model || null;
   skillNames = created.skillNames || skillNames || [];
   try { if (created.skillToolMap) policySkillToolMap.set(pol, created.skillToolMap); } catch {}
-  ensureEventBridge(sess);
   return sess;
 }
 
@@ -1798,19 +1801,7 @@ function extractMediaFromAssistantText(text){
 function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
   if (!sess || bridgedById.has(sess)) return;
   bridgedById.add(sess);
-  // Hook subagent event bus once so codex/subagent streaming logs also reach SSE listeners
-  if (!subagentHooked) {
-    subagentHooked = true;
-    try {
-      eventBus.on('event', (ev) => {
-        try {
-          const t = ev && ev.type ? String(ev.type) : '';
-          if (t && SSE_SKIP_RAW_TYPES.has(t)) return;
-          broadcast(ev);
-        } catch {}
-      });
-    } catch {}
-  }
+  ensureSubagentEventBusBridge();
   const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
   const effectiveAgentHome = agentHomeDir || arcanaHomePath('agents', effectiveAgentId);
   const effectiveWorkspace = String(ws || workspaceRoot || '');
@@ -1819,7 +1810,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
   sess.subscribe((ev) => {
     try {
       const t = ev && ev.type ? String(ev.type) : '';
-          // Tool repeat aggregation (per-session)
+      // Tool repeat aggregation (per-session)
       if (t === 'tool_execution_start') {
         try {
           const key = ev.toolName + '|' + (function (o) {
@@ -1835,7 +1826,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
         try { persistToolMetaToDisk({ agentId: effectiveAgentId, sessionId, toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
         // If the agent is reading a SKILL.md, auto-activate that skill's tools for this session
         try {
-          if (ev.toolName === 'read' && ev.args && ev.args.path && /\bSKILL\.md$/i.test(String(ev.args.path))) {
+          if (ev.toolName === 'read' && ev.args && ev.args.path && /\\bSKILL\\.md$/i.test(String(ev.args.path))) {
             const obj = ssLoad(String(sessionId || '').trim(), { agentId: effectiveAgentId });
             const wsForSkill = (obj && obj.workspace) ? String(obj.workspace) : effectiveWorkspace;
             const pRaw = String(ev.args.path || '');
@@ -1844,8 +1835,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
           }
         } catch {}
       }
-
-      // Forward updates/ends tagged with sessionId
+        // Forward updates/ends tagged with sessionId
       if (t === 'tool_execution_update') {
         try {
           const raw = (typeof ev.partialResult !== 'undefined') ? ev.partialResult : ev.update;
@@ -2053,6 +2043,7 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
 function ensureEventBridge(sess) {
   if (!sess || bridgedSessions.has(sess)) return;
   bridgedSessions.add(sess);
+  ensureSubagentEventBusBridge();
   sess.subscribe((ev) => {
     try {
       if (ev.type === 'turn_start') { try { legacyMediaRefsByTurn.clear(); } catch {} }
@@ -2113,10 +2104,6 @@ function ensureEventBridge(sess) {
         } catch {}
       }
     } catch {}
-    if (!subagentHooked) {
-      subagentHooked = true; try { eventBus.on('event', (ev2) => { broadcast(ev2); }); } catch {}
-    }
-    broadcast(ev);
   });
 }
 
@@ -2179,6 +2166,7 @@ function broadcast(ev) {
 
 async function handleEvents(req, res) {
   await ensurePolicySession('restricted');
+  ensureSubagentEventBusBridge();
   let includeToolStream = false;
   let toolStreamSessionId = '';
   let toolStreamSessionKey = '';
@@ -2276,6 +2264,29 @@ async function handleChat2(req, res) {
 
     const sess = await ensureSessionFor(sessionId, policy, ws, agentId, agentHomeDir);
     applyExecPolicyToSession(sess, policy);
+
+    // Local helpers for robust failure handling
+    const hardAbortSession = (s) => {
+      if (!s) return;
+      try { s.abortRetry?.(); } catch {}
+      try { s.clearQueue?.(); } catch {}
+      try { s.agent?.abort?.(); } catch {}
+      try { s._arcanaToolHostClient?.cancelActiveCall?.(); } catch {}
+      // Fallback: if the agent isn't exposed, try session-level abort (fire-and-forget)
+      try {
+        if (!s.agent?.abort && typeof s.abort === 'function') {
+          const p = s.abort();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        }
+      } catch {}
+    };
+
+    const isPrematureStreamClose = (m) => {
+      try {
+        const t = String(m || '').toLowerCase();
+        return t.includes('sse') && t.includes('response.completed');
+      } catch { return false; }
+    };
 
     const ctxBase = { sessionId, agentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws };
 
@@ -2493,6 +2504,30 @@ async function handleChat2(req, res) {
       } catch {
         msg = 'agent_prompt_failed';
       }
+
+      // Best-effort hard abort to avoid sess.isStreaming getting stuck on failures
+      try { hardAbortSession(sess); } catch {}
+
+      const partial = lastAssistantText || out;
+      if (isPrematureStreamClose(msg)) {
+        if (partial) {
+          try { console.warn('[arcana:chat2] SSE closed prematurely; returning partial text'); } catch {}
+          try { broadcast({ type: 'warning', sessionId, message: 'SSE stream closed before completion; returning partial text.' }); } catch {}
+          // Best-effort: persist partial assistant message to session store (deduped)
+          try {
+            const cur = ssLoad(sessionId, { agentId });
+            const msgs = (cur && Array.isArray(cur.messages)) ? cur.messages : [];
+            const last = msgs.length ? msgs[msgs.length - 1] : null;
+            if (!last || last.role !== 'assistant' || String(last.text || '') !== String(partial)) {
+              ssAppend(sessionId, { role: 'assistant', text: partial, agentId });
+              persistedCount++;
+            }
+          } catch {}
+          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: partial }));
+          return;
+        }
+      }
+
       try { console.error('[arcana:chat2] prompt failed:', msg); } catch {}
       try { broadcast({ type: 'error', sessionId, message: msg }); } catch {}
       res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg }));
@@ -3143,4 +3178,19 @@ if (isDirectRun) {
     ? String(process.env.ARCANA_WORKSPACE).trim()
     : process.cwd();
   startArcanaWebServer({ port: p, workspaceRoot: ws }).catch((e) => { console.error('[arcana:web] failed to start:', e?.stack || e); process.exit(1); });
+}
+
+// Ensure subagent event bus is bridged exactly once with raw-type filtering
+function ensureSubagentEventBusBridge(){
+  if (subagentHooked) return;
+  subagentHooked = true;
+  try {
+    eventBus.on('event', (ev) => {
+      try {
+        const t = ev && ev.type ? String(ev.type) : '';
+        if (t && SSE_SKIP_RAW_TYPES.has(t)) return;
+        broadcast(ev);
+      } catch {}
+    });
+  } catch {}
 }

@@ -12,6 +12,50 @@ let gatewayV2SessionKey = '';
 let gatewayV2Ws = null;
 const gatewayV2Pending = new Map();
 
+// Gateway v2 runner auto-start dedupe cache
+let __v2RunnerLastKey = '';
+let __v2RunnerInFlight = null;
+
+async function ensureV2RunnerStarted(){
+  try{
+    if (!gatewayV2Enabled) return;
+    // ensure session key exists
+    try { if (!gatewayV2SessionKey) gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
+    const sessionKey = String(gatewayV2SessionKey || '');
+    if (!sessionKey) return;
+    const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const key = String(agentId || '') + '|' + sessionKey;
+    if (__v2RunnerLastKey === key){
+      // already attempted for this key; if a start is in-flight, await best-effort
+      if (__v2RunnerInFlight){ try { await __v2RunnerInFlight; } catch {} }
+      return;
+    }
+    __v2RunnerLastKey = key;
+    const body = { agentId, sessionKey, runnerId: 'reactor' };
+    const p = (async ()=>{
+      try{
+        const r = await fetch('/v2/runners/start', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+        if (!r || !r.ok){
+          try{ const preview = r ? await r.clone().text() : ''; appendLog('[v2] runner start failed: HTTP ' + (r ? r.status : '?') + (preview ? (' ' + _collapse(preview)) : '')); } catch { appendLog('[v2] runner start failed: HTTP ' + ((r && r.status) || '?')); }
+          return;
+        }
+        // Try parse JSON, but tolerate non-JSON responses
+        let j = null;
+        try { j = await r.json(); } catch {
+          // Non-JSON is acceptable: just log and return silently
+          // Avoid throwing to keep UX smooth
+          return;
+        }
+        if (!j || j.ok !== true){ appendLog('[v2] runner start failed: server rejected'); }
+      } catch(e){
+        try { appendLog('[v2] runner start failed: ' + (((e && e.message) || e))); } catch {}
+      }
+    })();
+    __v2RunnerInFlight = p;
+    try { await p; } catch {}
+  } catch {}
+}
+
 function ensureGatewayV2SessionKey(){
   try{
     let key = '';
@@ -752,7 +796,8 @@ function renderToolsPanel(sessionId){
   }
   listEl.innerHTML = '';
   const byTurn = new Map(); // turnIndex -> action[]
-  for (const id of panel.order){
+  // Newest-first: iterate action ids in reverse so latest actions render on top
+  for (const id of Array.from(panel.order).slice().reverse()){
     const a = panel.actions.get(id); if (!a) continue;
     const key = typeof a.turnIndex === 'number' ? a.turnIndex : 0;
     if (!byTurn.has(key)) byTurn.set(key, []);
@@ -765,7 +810,8 @@ function renderToolsPanel(sessionId){
   for (const k of byTurn.keys()) allTurnKeysSet.add(k);
   for (const k of tsMap.keys()) allTurnKeysSet.add(k);
   for (const k of usageMap.keys()) allTurnKeysSet.add(k);
-  const sortedTurnKeys = Array.from(allTurnKeysSet).map((k)=>Number(k)).filter((n)=>!Number.isNaN(n)).sort((a,b)=>a-b);
+  // Newest-first: show latest turns first (descending by turn index)
+  const sortedTurnKeys = Array.from(allTurnKeysSet).map((k)=>Number(k)).filter((n)=>!Number.isNaN(n)).sort((a,b)=>b-a);
   for (const turnKey of sortedTurnKeys){
     const group = document.createElement('div');
     group.className = 'tools-turn-group';
@@ -824,9 +870,22 @@ function renderToolsPanel(sessionId){
       header.className = 'tools-card-header';
       const pill = document.createElement('div');
       const cat = a.category || 'other';
-      const pillCls = cat === 'web' ? 'tools-pill tools-pill-web' : cat === 'cli' ? 'tools-pill tools-pill-cli' : cat === 'code' ? 'tools-pill tools-pill-code' : cat === 'integrations' ? 'tools-pill tools-pill-int' : 'tools-pill tools-pill-other';
+      const pillCls =
+        cat === 'web' ? 'tools-pill tools-pill-web' :
+        cat === 'cli' ? 'tools-pill tools-pill-cli' :
+        cat === 'think' ? 'tools-pill tools-pill-think' :
+        cat === 'code' ? 'tools-pill tools-pill-code' :
+        cat === 'integrations' ? 'tools-pill tools-pill-int' :
+        'tools-pill tools-pill-other';
       pill.className = pillCls;
-      pill.textContent = (cat === 'cli' ? 'CLI' : cat === 'web' ? 'WEB' : cat === 'code' ? 'CODE' : cat === 'integrations' ? 'INT' : 'TOOL');
+      pill.textContent = (
+        cat === 'cli' ? 'CLI' :
+        cat === 'web' ? 'WEB' :
+        cat === 'think' ? 'THINK' :
+        cat === 'code' ? 'CODE' :
+        cat === 'integrations' ? 'INT' :
+        'TOOL'
+      );
       const nameEl = document.createElement('div');
       nameEl.className = 'tools-card-name';
       nameEl.textContent = a.toolName || '(unnamed)';
@@ -981,6 +1040,38 @@ function appendMessage(role, text = ''){
   messages.appendChild(wrap);
   messages.scrollTop = messages.scrollHeight;
   return bubble;
+}
+
+function ensureBubbleParts(bubble){
+  if (!bubble) return null;
+  try {
+    if (bubble.__arcanaParts && bubble.__arcanaParts.text && bubble.__arcanaParts.media) return bubble.__arcanaParts;
+  } catch {}
+
+  let textEl = null;
+  let mediaEl = null;
+  try {
+    for (const ch of Array.from(bubble.children || [])){
+      if (!textEl && ch.classList && ch.classList.contains('bubble-text')) textEl = ch;
+      if (!mediaEl && ch.classList && ch.classList.contains('bubble-media')) mediaEl = ch;
+    }
+  } catch {}
+
+  if (!textEl || !mediaEl){
+    const initial = (bubble.textContent || '');
+    bubble.textContent = '';
+    textEl = document.createElement('div');
+    textEl.className = 'bubble-text';
+    textEl.textContent = initial;
+    mediaEl = document.createElement('div');
+    mediaEl.className = 'bubble-media';
+    bubble.appendChild(textEl);
+    bubble.appendChild(mediaEl);
+  }
+
+  const parts = { text: textEl, media: mediaEl };
+  try { bubble.__arcanaParts = parts; } catch {}
+  return parts;
 }
 
 // Backward‑compatible helper used by non‑SSE UI bits (config/doctor/etc).
@@ -1751,6 +1842,8 @@ async function sendWithGatewayV2(){
   }
   const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
   try { gatewayV2SessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey(); } catch {}
+  // Ensure reactor runner is started (best-effort)
+  try { await ensureV2RunnerStarted(); } catch {}
   appendMessage('user', text);
   input.value = '';
   autoResize();
@@ -1813,11 +1906,12 @@ try {
 async function ensureTransportReady(){
   try{
     if (gatewayV2Detected){
-      if (gatewayV2Enabled){
-        try { if (!gatewayV2SessionKey) gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
-        try { setupGatewayV2WebSocket(); } catch {}
-        return 'v2';
-      }
+    if (gatewayV2Enabled){
+      try { if (!gatewayV2SessionKey) gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
+      try { setupGatewayV2WebSocket(); } catch {}
+      try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
+      return 'v2';
+    }
       try {
         if (!window.__arcana_sse_initialized){
           setupSseConnection();
@@ -1846,6 +1940,7 @@ async function ensureTransportReady(){
       if (isV2){
         try { gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
         try { setupGatewayV2WebSocket(); } catch {}
+        try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
         return 'v2';
       }
       try {
@@ -1934,6 +2029,11 @@ function handleGatewayV2Envelope(payload){
 
 const TOOL_STREAM_LS_KEY = 'arcana.toolStreamEnabled.v1';
 let toolStreamEnabled = (()=>{ try{ const v = localStorage.getItem(TOOL_STREAM_LS_KEY); return v === '1' || v === 'true'; } catch{ return false } })();
+
+const SSE_BACKOFF_BASE_MS = 1000;
+const SSE_BACKOFF_MAX_MS = 15000;
+let sseBackoffMs = SSE_BACKOFF_BASE_MS;
+let sseReconnectTimer = null;
 
 function buildEventsUrl(){
   try{
@@ -2030,6 +2130,7 @@ function setupSseConnection(){
     const es = new EventSource(buildEventsUrl()); window.__arcana_global_es = es;
     es.onmessage = (ev)=>{
     try{
+      sseBackoffMs = SSE_BACKOFF_BASE_MS;
       const data = JSON.parse(ev.data);
 
       // Logs panel + lifecycle
@@ -2061,6 +2162,7 @@ function setupSseConnection(){
         return;
       }
       if (data.type === 'turn_start'){
+        if (!data.sessionId) { return; }
         const targetId = data.sessionId || sid;
         try { if (data.sessionId) { typing.set(data.sessionId, true); try { requestRefreshList(); } catch {} } } catch {}
         try {
@@ -2096,6 +2198,13 @@ function setupSseConnection(){
           } catch {}
         } catch {}
         logMain(sid, 'turn start');
+        try {
+          const sid3 = String(targetId || "");
+          let idx2 = Number(lastToolTurnBySession.get(sid3));
+          if (!Number.isFinite(idx2)) idx2 = 0;
+          upsertLlmAction(sid3, idx2, { status: "running", argsSummary: "Generating…" });
+        } catch {}
+
         if (targetId === currentId){
           try { renderLiveInfoFor(targetId); } catch {}
           if (activeLogTab === 'tools'){ try { renderToolsPanel(targetId); } catch {} }
@@ -2104,6 +2213,7 @@ function setupSseConnection(){
       }
 
       if (data.type === 'turn_end'){
+        if (!data.sessionId) { return; }
         const targetId = data.sessionId || sid;
         try { if (data.sessionId) { typing.delete(data.sessionId); try { requestRefreshList(); } catch {} } } catch {}
         try {
@@ -2139,6 +2249,12 @@ function setupSseConnection(){
           }
         } catch {}
         try { markTurnDone(targetId); } catch {}
+        try {
+          const sid3 = String(targetId || "");
+          let ti = Number(lastToolTurnBySession.get(sid3));
+          if (Number.isFinite(ti)) upsertLlmAction(sid3, ti, { status: "done", setEndedAt: true });
+        } catch {}
+
         // For background sessions, just refresh the list/unread state.
         if (targetId && targetId !== currentId){
           try { requestRefreshList(); } catch {}
@@ -2244,6 +2360,16 @@ function setupSseConnection(){
 
       // Thinking bubbles for active chat
       if (data.type === 'thinking_start'){
+        try {
+          const target = data.sessionId || sid;
+          const ss = String(target || "");
+          if (ss){
+            let ti = Number(lastToolTurnBySession.get(ss));
+            if (!Number.isFinite(ti)) ti = 0;
+            upsertLlmAction(ss, ti, { appendLog: "thinking start" });
+          }
+        } catch {}
+
         const isBackground = !!(data.sessionId && data.sessionId !== currentId);
         if (isBackground){
           logMain(sid, 'thinking start');
@@ -2255,10 +2381,34 @@ function setupSseConnection(){
         return;
       }
       if (data.type === 'thinking_progress'){
+        try {
+          const target = data.sessionId || sid;
+          const ss = String(target || "");
+          if (ss){
+            let ti = Number(lastToolTurnBySession.get(ss));
+            if (!Number.isFinite(ti)) ti = 0;
+            const n = (typeof data.chars === "number" && data.chars >= 0) ? data.chars : 0;
+            upsertLlmAction(ss, ti, { appendLog: "thinking +" + n + " chars" });
+          }
+        } catch {}
+
         logMain(sid, 'thinking progress: ' + (data.chars||0) + ' chars');
         return;
       }
       if (data.type === 'thinking_end'){
+        try {
+          const target = data.sessionId || sid;
+          const ss = String(target || "");
+          if (ss){
+            let ti = Number(lastToolTurnBySession.get(ss));
+            if (!Number.isFinite(ti)) ti = 0;
+            const n = (typeof data.chars === "number") ? (data.chars||0) : 0;
+            const ms = (typeof data.tookMs === "number") ? (data.tookMs||0) : undefined;
+            const line = "thinking end: " + n + " chars" + (typeof ms === "number" ? ", " + ms + " ms" : "");
+            upsertLlmAction(ss, ti, { appendLog: line });
+          }
+        } catch {}
+
         const isBackground = !!(data.sessionId && data.sessionId !== currentId);
         if (isBackground){
           if (typeof data.chars !== 'undefined' || typeof data.tookMs !== 'undefined')
@@ -2331,32 +2481,46 @@ function setupSseConnection(){
       }
 
       if (data.type === 'assistant_text'){
-        // For non-current sessions, refresh list/unread and skip UI updates.
+        // For non-current sessions, skip UI updates; list refresh happens on turn_end.
         if (data.sessionId && data.sessionId !== currentId){
-        try { requestRefreshList(); } catch {}
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
+        try {
+          const txt = typeof data.text === "string" ? data.text : "";
+          let ti = Number(lastToolTurnBySession.get(String(sid2)));
+          if (!Number.isFinite(ti)) ti = 0;
+          upsertLlmAction(String(sid2), ti, { argsSummary: "Output: " + txt.length + " chars" });
+        } catch {}
+
         if (!activeAssistant) activeAssistant = appendMessage('assistant','');
         setTyping(activeAssistant, false);
-        activeAssistant.textContent = data.text || '';
+        {
+        const parts = ensureBubbleParts(activeAssistant);
+        if (parts && parts.text) parts.text.textContent = data.text || '';
+        else activeAssistant.textContent = data.text || '';
+      }
         messages.scrollTop = messages.scrollHeight;
         try { if (currentId) markSessionSeen(currentId); } catch {}
         return;
       }
       if (data.type === 'assistant_image'){
-        // For non-current sessions, refresh list/unread and skip UI updates.
+        // For non-current sessions, skip UI updates; list refresh happens on turn_end.
         if (data.sessionId && data.sessionId !== currentId){
-          try { requestRefreshList(); } catch {}
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
         if (!activeAssistant) activeAssistant = appendMessage('assistant','');
         setTyping(activeAssistant, false);
+        const parts = ensureBubbleParts(activeAssistant);
         const img = document.createElement('img');
-        img.src = data.url; img.style.maxWidth = '100%'; img.style.borderRadius = '6px';
-        if (activeAssistant.textContent){ const txt = activeAssistant.textContent; activeAssistant.textContent = ''; const tdiv = document.createElement('div'); tdiv.textContent = txt; activeAssistant.appendChild(tdiv); }
-        activeAssistant.appendChild(img);
+        img.src = data.url;
+        img.style.maxWidth = '100%';
+        img.style.borderRadius = '6px';
+        img.style.display = 'block';
+        img.style.marginTop = '8px';
+        if (parts && parts.media) parts.media.appendChild(img);
+        else activeAssistant.appendChild(img);
         messages.scrollTop = messages.scrollHeight;
         try { if (currentId) markSessionSeen(currentId); } catch {}
         return;
@@ -2391,6 +2555,23 @@ function setupSseConnection(){
         return;
       }
     }catch{}
+  };
+  es.onerror = ()=>{
+  try{
+    if (gatewayV2Enabled) return;
+    if (!es || es.readyState !== 2) return;
+    if (typeof sseBackoffMs !== 'number' || sseBackoffMs <= 0) sseBackoffMs = SSE_BACKOFF_BASE_MS;
+    const delay = sseBackoffMs;
+    sseBackoffMs = Math.min(SSE_BACKOFF_MAX_MS, sseBackoffMs * 2);
+    if (sseReconnectTimer){
+      try{ clearTimeout(sseReconnectTimer); } catch{}
+    }
+    sseReconnectTimer = setTimeout(()=>{
+      try{
+        if (!gatewayV2Enabled) setupSseConnection();
+      } catch{}
+    }, delay);
+  } catch{}
   };
 } catch {}
 }
@@ -2947,3 +3128,56 @@ async function openVault(){
 }
 
 try { (document.getElementById('cfg-vault')||{}).addEventListener('click', ()=>{ openVault().catch(()=>{}) }) } catch {}
+
+
+// Virtual LLM action per turn (no actual tool events)
+function upsertLlmAction(sessionId, turnIndex, update){
+  try{
+    const sid = String(sessionId || getCurrentSessionId() || "");
+    if (!sid) return null;
+    const panel = getToolPanel(sid); if (!panel) return null;
+    const idx = (typeof turnIndex === "number" && !Number.isNaN(turnIndex)) ? turnIndex : (Number(lastToolTurnBySession.get(sid))||0);
+    const id = "v:llm:" + String(idx);
+    const now = new Date();
+    const ts = now.toLocaleTimeString();
+    let a = panel.actions.get(id);
+    if (!a){
+      a = {
+        id,
+        toolName: "LLM",
+        category: "think",
+        status: "running",
+        argsSummary: (update && update.argsSummary) ? String(update.argsSummary) : "Generating…",
+        argsFull: "",
+        startedAt: ts,
+        endedAt: "",
+        sessionId: sid,
+        turnIndex: idx,
+        log: "",
+      };
+      panel.actions.set(id, a);
+      panel.order.push(id);
+      if (!panel.selectedId) panel.selectedId = id;
+    }
+    if (update){
+      if (update.status){ a.status = String(update.status); }
+      if (typeof update.argsSummary !== "undefined"){ a.argsSummary = String(update.argsSummary || ""); }
+      if (update.setEndedAt){ a.endedAt = ts; }
+      if (typeof update.appendLog === "string" && update.appendLog){
+        a.log = a.log ? (a.log + "\n" + update.appendLog) : update.appendLog;
+      }
+    }
+    if (typeof a.log === "string" && a.log.length > TOOL_PANELS_MAX_LOG_CHARS){
+      a.log = a.log.slice(-TOOL_PANELS_MAX_LOG_CHARS);
+    }
+    try{ scheduleSaveToolPanel(sid); } catch {}
+    if (sid === getCurrentSessionId()){
+      if (activeLogTab === "tools"){
+        renderToolsPanel(sid);
+      } else if (activeLogTab === "details"){
+        renderToolDetails(sid);
+      }
+    }
+    return a;
+  } catch { return null }
+}

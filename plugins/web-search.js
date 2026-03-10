@@ -7,7 +7,9 @@ export default async function(pi){
       type: 'object',
       properties: {
         query: { type: 'string' },
-        engine: { type: 'string', enum: ['auto','duckduckgo','bing','baidu'], default: 'auto' }
+        engine: { type: 'string', enum: ['auto','duckduckgo','bing','baidu'], default: 'auto' },
+        waitUntil: { type: 'string', enum: ['networkidle','domcontentloaded'], default: 'networkidle' },
+        timeoutMs: { type: 'number', minimum: 1 }
       },
       required: ['query']
     },
@@ -41,7 +43,9 @@ export default async function(pi){
       else u = 'https://duckduckgo.com/?q=' + encodeURIComponent(q);
 
       const pw = await import('../src/pw-runtime.js');
-      await pw.navigate(u, { waitUntil:'networkidle' });
+      const waitUntil = (args && typeof args.waitUntil === 'string' && args.waitUntil) ? args.waitUntil : 'networkidle';
+      const timeoutMs = (args && typeof args.timeoutMs === 'number' && args.timeoutMs > 0) ? args.timeoutMs : undefined;
+      await pw.navigate(u, { waitUntil, timeoutMs });
       // Try to extract Top-N structured results
       let top = [];
       try {

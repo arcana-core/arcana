@@ -69,7 +69,7 @@ body{margin:0;background:var(--bg);font:16px/1.4 -apple-system,BlinkMacSystemFon
 @media (max-width: 480px){ .subagent{width:92vw;right:4vw;bottom:80px} }
 /* sidebar-test */
 /* Layout additions for sessions */
-.layout{max-width:1440px;margin:0 auto;height:100vh}
+.layout{width:100%;max-width:1440px;margin:0 auto;height:100vh}
 .left{display:flex}
 #sidebar{flex:0 0 240px;max-width:280px;background:#fff;border-right:1px solid #e7e7e7;display:flex;flex-direction:column;min-height:100%}
 @media (max-width: 980px){ #sidebar{flex-basis:200px} }
@@ -97,8 +97,11 @@ body{margin:0;background:var(--bg);font:16px/1.4 -apple-system,BlinkMacSystemFon
 
 /* Polish to align example.png */
 body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100%)}
-.layout{display:flex;height:calc(100vh - 60px);justify-content:flex-start;gap:16px;padding:8px 8px 0}
-.left{display:flex !important;gap:16px;flex:0 0 auto !important;width:960px !important;max-width:960px !important;background:transparent}
+.layout{display:flex;width:100%;flex-direction:row;height:calc(100vh - 60px);justify-content:flex-start;gap:16px;padding:8px 8px 0}
+.left{display:flex !important;gap:16px;flex:1 1 0 !important;width:auto !important;max-width:none !important;min-width:0;background:transparent}
+.right{flex:0 0 30% !important;width:30% !important}
+/* Flex chat container within .left to prevent overflow */
+.left > .wechat{flex:1 1 auto;min-width:0;width:auto !important}
 #sidebar{width:260px !important;border-right:none;border:1px solid #e9e9e9;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.06);background:#fff;overflow:auto}
 .wechat{background:#fff;border:1px solid #e9e9e9;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.06);position:relative}
 .chat-header{height:52px;background:#fafafa;border-bottom:1px solid #ececec;border-radius:12px 12px 0 0}
@@ -151,6 +154,7 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 .tools-pill-web{background:#e0f2fe;border:1px solid #7dd3fc}
 .tools-pill-cli{background:#fee2e2;border:1px solid #fca5a5}
 .tools-pill-code{background:#ede9fe;border:1px solid #a5b4fc}
+.tools-pill-think{background:#e6effe;border:1px solid #93c5fd}
 .tools-pill-int{background:#dcfce7;border:1px solid #86efac}
 .tools-pill-other{background:#fef3c7;border:1px solid #fcd34d}
 .tools-card-meta{font-size:11px;color:#9ca3af;display:flex;justify-content:space-between;gap:6px;margin-top:1px}
@@ -194,11 +198,13 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 
 /* Responsive layout for smaller screens */
 @media (max-width: 900px){
-  .layout{flex-direction:column;height:auto;}
-  .left{width:100% !important;max-width:none !important;flex-direction:column !important;}
-  .right{width:100%;max-width:none;margin-top:12px;}
+  .layout{flex-direction:column !important;height:auto;}
+  .left{width:100% !important;max-width:none !important;flex:0 0 100% !important;flex-direction:column !important;}
+  .right{width:100% !important;max-width:none !important;flex:0 0 100% !important;margin-top:12px;}
   .sidebar-group{flex-direction:column;flex:0 0 auto;max-width:none;width:100%;}
   .agents-panel{flex:0 0 auto;max-height:260px;}
   #sidebar{flex:1;}
   #session-list{max-height:260px;overflow:auto;}
+  /* Stacked layout: chat fills full width */
+  .left > .wechat{width:100% !important}
 }

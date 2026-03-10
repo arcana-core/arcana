@@ -60,6 +60,7 @@ Notes
 Compaction
 - Cron agentTurn jobs track an approximate per-session token count. By default, when a session exceeds 200000 tokens (or if token usage is unavailable and the combined history text exceeds 600000 UTF-8 bytes), older messages are compacted.
 - Compaction keeps only the most recent 50 messages and summarizes earlier messages into the session summary field.
+- Prompt construction uses a bounded history prelude (recent messages + summary) to reduce context-window overflow risk.
 - These thresholds (tokens and fallback bytes) can be configured per agent from the web UI advanced settings panel under 设置 / 诊断 (the "会话压缩设置" section).
 - Cron settings are stored per agent under .arcana/agents/<agentId>/cron/settings.json and are also accessible via the HTTP endpoints /api/cron-settings and /api/timer-settings (compatibility alias).
 

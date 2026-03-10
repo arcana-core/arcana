@@ -2,11 +2,9 @@ import { createAgentSession, DefaultResourceLoader, createReadTool, createGrepTo
 import { getModel } from '@mariozechner/pi-ai';
 import { loadArcanaPlugins } from './plugin-loader.js';
 import { startServicesOnce } from './services/manager.js';
-// Scheme C: tool-host isolation. Use proxy tools that delegate to a
-// persistent child process which can be killed to cancel hangs.
-import { ToolHostClient } from './tool-host-client.js';
-import { sweepOrphanedToolHostsOnce } from './tool-host-registry.js';
-import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractTool, createProxyWebSearchTool } from './tools/toolhost-proxies.js';
+// Tool Daemon: singleton per workspace. HTTP server with cancel via fetch Abort.
+import { ToolDaemonClient } from './tool-daemon/client.js';
+import { createProxyBashTool, createProxyWebRenderTool, createProxyWebExtractTool, createProxyWebSearchTool } from './tools/tooldaemon-proxies.js';
 import createCodexSubagentTool from './tools/codex-subagent.js';
 import createNotebookTool from './tools/notebook.js';
 import createMemoryTools from './tools/memory.js';
@@ -251,7 +249,6 @@ class AsyncMutex{
 }
 
 const envOverlayMutex = new AsyncMutex();
-const sweptToolHostWorkspaces = new Set();
 
 async function runWithEnvOverlay(agentHomeRoot, fn){
   const globalMeta = readGlobalVaultMeta();
@@ -316,11 +313,6 @@ export async function createArcanaSession(opts={}){
   const bootstrapContextMode = String(opts.bootstrapContextMode || "").trim().toLowerCase();
   const workspaceRoot = opts.workspaceRoot || opts.cwd || process.cwd();
   const workspaceRootNormalized = String(workspaceRoot || '').split('\\').join('/');
-  const sweepKey = String(workspaceRoot || '').trim();
-  if (sweepKey && !sweptToolHostWorkspaces.has(sweepKey)){
-    sweptToolHostWorkspaces.add(sweepKey);
-    try { sweepOrphanedToolHostsOnce(workspaceRoot); } catch {}
-  }
   let agentHomeRoot = opts.agentHomeRoot;
   if (!agentHomeRoot){
     try {
@@ -351,13 +343,13 @@ export async function createArcanaSession(opts={}){
   const anthropicBaseOverride = normalizeAnthropicBase(cfg?.base_url || process.env.ANTHROPIC_BASE_URL || '');
   if (anthropicBaseOverride && model && model.provider === 'anthropic') model = { ...model, baseUrl: anthropicBaseOverride };
 
-  // Create tool-host client and proxy tools. We always register a proxy 'bash'
+  // Create tool-daemon client and proxy tools. We always register a proxy 'bash'
   // tool, but activation is controlled by execPolicy via setActiveToolsByName.
-  const toolHost = new ToolHostClient({ cwd: workspaceRoot });
-  const webRender = createProxyWebRenderTool(toolHost);
-  const webExtract = createProxyWebExtractTool(toolHost);
-  const webSearchProxy = createProxyWebSearchTool(toolHost);
-  const bashProxy = createProxyBashTool(toolHost);
+  const toolDaemon = new ToolDaemonClient({ workspaceRoot });
+  const webRender = createProxyWebRenderTool(toolDaemon);
+  const webExtract = createProxyWebExtractTool(toolDaemon);
+  const webSearchProxy = createProxyWebSearchTool(toolDaemon);
+  const bashProxy = createProxyBashTool(toolDaemon);
   // Start core workspace services once per process. This runs before plugins.
   try { await startServicesOnce(); } catch {}
 
@@ -602,9 +594,9 @@ export async function createArcanaSession(opts={}){
 
   createdSession = created && created.session ? created.session : null;
 
-  // Attach the tool-host client to the session so server-side abort can hard-cancel active tool calls.
+  // Attach the tool-daemon client to the session so server-side abort can cancel active tool calls.
   try {
-    if (createdSession && !createdSession._arcanaToolHostClient) createdSession._arcanaToolHostClient = toolHost;
+    if (createdSession && !createdSession._arcanaToolHostClient) createdSession._arcanaToolHostClient = toolDaemon;
   } catch {}
 
   // Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
@@ -628,7 +620,7 @@ export async function createArcanaSession(opts={}){
   const visibleSkillNames = arcanaSkills.map(s=>s.name).filter(Boolean);
   const toolNames = created.session?.getActiveToolNames ? created.session.getActiveToolNames() : baseTools.map(t=>t?.name).filter(Boolean);
 
-  return { session: created.session, model, toolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost, skillToolMap };
+  return { session: created.session, model, toolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost: toolDaemon, skillToolMap };
 }
 
 export default { createArcanaSession };
