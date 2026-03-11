@@ -66,9 +66,10 @@ export async function startToolDaemon({ workspaceRoot, port }){
         if (req.method === "POST" && (u.pathname === "/profiles/stop" || u.pathname === "/profiles/reset")){
           let responded = false; let timer = null; let bodyText = ""; let explicitKey = null;
           const finish = function(code, obj){ if (responded) return; responded = true; try { if (timer) clearTimeout(timer); } catch {} return json(res, code, obj); };
-          const doCleanup = async function(){ try { await bm.stopProfile({ headers: req.headers, profileKey: explicitKey }); } catch {} };
-          try { req.on("close", function(){ try { doCleanup(); } catch {} }); } catch {}
-          try { timer = setTimeout(async function(){ try { await bm.stopProfile({ headers: req.headers, profileKey: explicitKey }); } catch {} finish(200, { ok:false, error:"timeout" }); }, 120000); } catch {}
+          const maybeCleanup = async function(){ if (responded) return; try { await bm.stopProfile({ headers: req.headers, profileKey: explicitKey }); } catch {} };
+          try { req.on("aborted", function(){ try { maybeCleanup(); } catch {} }); } catch {}
+          try { res.on("close", function(){ try { if (!responded) maybeCleanup(); } catch {} }); } catch {}
+          try { timer = setTimeout(async function(){ try { await maybeCleanup(); } catch {} finish(200, { ok:false, error:"timeout" }); }, 120000); } catch {}
           req.on("data", function(c){ bodyText += c.toString("utf-8"); });
           req.on("end", async function(){
             let args = {}; try { args = JSON.parse(bodyText||"{}"); } catch {}
@@ -91,9 +92,10 @@ export async function startToolDaemon({ workspaceRoot, port }){
         if (req.method === "POST" && u.pathname.startsWith("/tool/")){
           let bodyText = ""; let responded = false; let timer = null; let explicitKey = null;
           const finish = function(code, obj){ if (responded) return; responded = true; try { if (timer) clearTimeout(timer); } catch {} return json(res, code, obj); };
-          const doCleanup = async function(){ try { await bm.stopProfile({ headers: req.headers, profileKey: explicitKey }); } catch {} };
-          try { req.on("close", function(){ try { doCleanup(); } catch {} }); } catch {}
-          try { timer = setTimeout(async function(){ try { await bm.stopProfile({ headers: req.headers, profileKey: explicitKey }); } catch {} finish(200, { ok:false, error:"timeout" }); }, 120000); } catch {}
+          const maybeCleanup = async function(){ if (responded) return; try { await bm.stopProfile({ headers: req.headers, profileKey: explicitKey }); } catch {} };
+          try { req.on("aborted", function(){ try { maybeCleanup(); } catch {} }); } catch {}
+          try { res.on("close", function(){ try { if (!responded) maybeCleanup(); } catch {} }); } catch {}
+          try { timer = setTimeout(async function(){ try { await maybeCleanup(); } catch {} finish(200, { ok:false, error:"timeout" }); }, 120000); } catch {}
           req.on("data", function(c){ bodyText += c.toString("utf-8"); });
           req.on("end", async function(){
             let args = {}; try { args = JSON.parse(bodyText||"{}"); } catch {}

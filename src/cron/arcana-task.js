@@ -402,11 +402,45 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
     const finishedAtMs = Date.now();
     const msg = String(e?.message || e || '');
     const code = (msg === 'timeout') ? 'timeout' : (msg || 'error');
-    try { log.write('Error: ' + code + '\n'); } catch {}
+
+    function buildErrorStack(err){
+      try {
+        const parts = [];
+        let cur = err;
+        let depth = 0;
+        const MAX_DEPTH = 8;
+        while (cur && depth < MAX_DEPTH){
+          const st = cur && cur.stack ? String(cur.stack) : '';
+          const mm = cur && cur.message ? String(cur.message) : String(cur || '');
+          parts.push(st || ('Error: ' + mm));
+          cur = (cur && typeof cur === 'object' && cur.cause && typeof cur.cause === 'object') ? cur.cause : null;
+          if (cur) parts.push('Caused by:');
+          depth++;
+        }
+        return parts.join('\n');
+      } catch {
+        try { return String(err && err.stack ? err.stack : (err && err.message ? err.message : String(err||''))); } catch { return 'error'; }
+      }
+    }
+
+    const fullStack = buildErrorStack(e);
+    const cap = 8000;
+    const boundedStack = typeof fullStack === 'string' ? (fullStack.length > cap ? fullStack.slice(0, cap) : fullStack) : '';
+
+    try {
+      log.write('Error: ' + code + '\n');
+      if (fullStack) log.write('Stack:\n' + fullStack + '\n');
+    } catch {}
+
+    try {
+      emit({ type: 'turn_error', sessionId: sid, agentId: effectiveAgentId, error: code, errorStack: boundedStack, startedAtMs, finishedAtMs });
+    } catch {}
+
     return {
       ok: false,
       sessionId: sid,
       error: code,
+      errorStack: boundedStack,
       startedAtMs,
       finishedAtMs,
       outputTail: tailLines(textBuffer),

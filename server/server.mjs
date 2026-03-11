@@ -5,7 +5,7 @@ import { join, extname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 
-import { createHash, randomBytes, scryptSync, createCipheriv, createDecipheriv } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createArcanaSession } from '../src/session.js';
 import { eventBus, runWithContext } from '../src/event-bus.js';
 import { parseFrontmatter, parseSkillBlock } from '@mariozechner/pi-coding-agent';
@@ -14,6 +14,10 @@ import { runDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
 import { loadArcanaConfig, loadAgentConfig } from '../src/config.js';
 import { loadArcanaSkills } from '../src/skills.js';
+import {
+  WELL_KNOWN_SECRETS,
+  secrets,
+} from '../src/secrets/index.js';
 import {
   createSession as ssCreate,
   listSessions as ssList,
@@ -214,6 +218,40 @@ function envFlagDefaultTrue(name){
 }
 
 const MEMORY_FLUSH_ENABLED = envFlagDefaultTrue('ARCANA_MEMORY_FLUSH');
+
+// Build a full error stack with cause chain (maxDepth=8) and cap at 8000 chars
+function buildErrorStack(err, { maxDepth = 8, cap = 8000 } = {}){
+  try {
+    const seen = new Set();
+    const parts = [];
+    let depth = 0;
+    let cur = err;
+    while (cur && depth < maxDepth){
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      let s = '';
+      try {
+        if (cur && typeof cur.stack === 'string' && cur.stack) s = String(cur.stack);
+        else if (cur && typeof cur.message === 'string') s = (cur.name ? (cur.name + ': ') : '') + String(cur.message);
+        else s = String(cur);
+      } catch { s = String(cur); }
+      if (depth === 0) parts.push(s);
+      else parts.push('Caused by: ' + s);
+      let next = null;
+      try { next = cur && cur.cause ? cur.cause : null; } catch { next = null; }
+      cur = next;
+      depth++;
+    }
+    let out = parts.join('\n');
+    if (typeof out === 'string' && out.length > cap){ out = out.slice(0, cap); }
+    return out;
+  } catch {
+    try {
+      const s = err && (err.stack || err.message) ? (err.stack || err.message) : String(err);
+      return String(s || '').slice(0, 8000);
+    } catch { return ''; }
+  }
+}
 function mergeAgentConfig(globalCfg, agentCfg){
   const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
   const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
@@ -401,8 +439,7 @@ function seedAgentHomeBootstrap(agentHomeDir, agentId){
       ';',
       '; [feishu]',
       '; command = node $ARCANA_PKG_ROOT/skills/feishu/scripts/feishu-bridge.mjs',
-      '; env.FEISHU_APP_ID = your-app-id',
-      '; env.FEISHU_APP_SECRET = your-app-secret',
+      '; configure secrets in Arcana Secrets UI: services/feishu/app_id and services/feishu/app_secret',
       '; env.FEISHU_DOMAIN = feishu',
       '',
     ];
@@ -988,46 +1025,7 @@ function hookSseDrain(res, meta){
   } catch {}
 }
 
-// Env vault: runtime env setter + on-disk vault
-function isValidEnvName(n){
-  try {
-    const s = String(n || '');
-    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
-  } catch { return false; }
-}
 
-// --- On-disk vault state + helpers ---
-const VAULT_PATH = arcanaHomePath('vault.json');
-// Public-ish meta exposed via /api/env.vault
-const vaultInfo = {
-  path: VAULT_PATH,
-  hasFile: false,
-  encrypted: false,
-  locked: false,
-  names: new Set(), // env var names stored in vault
-};
-// In-memory decrypted values (only when unlocked/plain)
-let vaultValues = {};
-
-function vaultMetaForResponse(){
-  try {
-    return {
-      path: String(vaultInfo.path || ''),
-      hasFile: !!vaultInfo.hasFile,
-      encrypted: !!vaultInfo.encrypted,
-      locked: !!vaultInfo.locked,
-      names: Array.from(vaultInfo.names || []),
-    };
-  } catch {
-    return {
-      path: String(VAULT_PATH || ''),
-      hasFile: false,
-      encrypted: false,
-      locked: false,
-      names: [],
-    };
-  }
-}
 
 function pad2(n){ return String(n).padStart(2, '0'); }
 function localParts(d = new Date()){
@@ -1102,231 +1100,8 @@ function appendToAgentLongtermMemory({ agentHomeDir, heading, content }){
   }
 }
 
-function filterValid(obj){
-  const out = {};
-  try {
-    for (const [k, v] of Object.entries(obj || {})){
-      if (!isValidEnvName(k)) continue;
-      out[k] = v == null ? '' : String(v);
-    }
-  } catch {}
-  return out;
-}
 
-function applyEnvFrom(values){
-  try {
-    for (const [k, v] of Object.entries(filterValid(values))){
-      process.env[k] = v == null ? '' : String(v);
-    }
-  } catch {}
-}
 
-// KDF + crypto helpers
-function deriveVaultKey(passphrase, kdfParams){
-  const base = kdfParams || {};
-  const N = typeof base.N === 'number' ? base.N : 16384;
-  const r = typeof base.r === 'number' ? base.r : 8;
-  const p = typeof base.p === 'number' ? base.p : 1;
-  const saltB64 = base.saltB64 || randomBytes(16).toString('base64');
-  const salt = Buffer.from(String(saltB64), 'base64');
-  const key = scryptSync(String(passphrase || ''), salt, 32, { N, r, p });
-  return { key, kdf:{ saltB64, N, r, p } };
-}
-
-function encryptValues(values, passphrase){
-  const { key, kdf } = deriveVaultKey(passphrase, null);
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const plaintext = Buffer.from(JSON.stringify(filterValid(values)), 'utf8');
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  const names = Object.keys(filterValid(values));
-  return {
-    version: 1,
-    encrypted: true,
-    updatedAt: new Date().toISOString(),
-    names,
-    kdf,
-    cipher: {
-      alg: 'aes-256-gcm',
-      ivB64: iv.toString('base64'),
-      tagB64: tag.toString('base64'),
-    },
-    ciphertextB64: ciphertext.toString('base64'),
-  };
-}
-
-function decryptValues(fileObj, passphrase){
-  if (!fileObj || !fileObj.encrypted){
-    return filterValid((fileObj && fileObj.values) || {});
-  }
-  const { key } = deriveVaultKey(passphrase, fileObj.kdf || {});
-  const cipherMeta = fileObj.cipher || {};
-  const ivB64 = cipherMeta.ivB64 || fileObj.ivB64 || fileObj.iv;
-  const tagB64 = cipherMeta.tagB64 || fileObj.tagB64 || fileObj.tag;
-  const ciphertextB64 = fileObj.ciphertextB64 || fileObj.ciphertext;
-  const iv = Buffer.from(String(ivB64 || ''), 'base64');
-  const tag = Buffer.from(String(tagB64 || ''), 'base64');
-  const enc = Buffer.from(String(ciphertextB64 || ''), 'base64');
-  const decipher = createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
-  const out = Buffer.concat([decipher.update(enc), decipher.final()]);
-  const obj = JSON.parse(out.toString('utf8') || '{}');
-  return filterValid(obj && typeof obj === 'object' ? obj : {});
-}
-
-async function readVaultFile(){
-  try {
-    if (!existsSync(VAULT_PATH)) return null;
-    const text = readFileSync(VAULT_PATH, 'utf8');
-    if (!text) return null;
-    const data = JSON.parse(text);
-    const encrypted = !!data && !!data.encrypted;
-    let names = [];
-    if (Array.isArray(data.names)) names = data.names;
-    else if (!encrypted && data && data.values && typeof data.values === 'object') names = Object.keys(data.values);
-    names = names.filter((n) => isValidEnvName(n));
-    return { data, encrypted, names };
-  } catch { return null; }
-}
-
-async function writeVaultFile(obj){
-  try { ensureArcanaHomeDir(); } catch {}
-  const json = JSON.stringify(obj, null, 2);
-  try {
-    await writeFile(VAULT_PATH, json, { mode: 0o600 });
-  } catch {
-    await writeFile(VAULT_PATH, json);
-  }
-  try { await chmod(VAULT_PATH, 0o600); } catch {}
-}
-
-async function loadVaultFromDisk(){
-  try {
-    const file = await readVaultFile();
-    if (!file){
-      vaultInfo.hasFile = false;
-      vaultInfo.encrypted = false;
-      vaultInfo.locked = false;
-      vaultInfo.names = new Set();
-      vaultValues = {};
-      return;
-    }
-    vaultInfo.hasFile = true;
-    vaultInfo.encrypted = !!file.encrypted;
-    vaultInfo.names = new Set(Array.isArray(file.names) ? file.names : []);
-    if (!file.encrypted){
-      const vals = filterValid((file.data && file.data.values) || {});
-      vaultInfo.locked = false;
-      vaultValues = vals;
-      applyEnvFrom(vals);
-      return;
-    }
-    const envPass = String(process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
-    if (!envPass){
-      vaultInfo.locked = true;
-      vaultValues = {};
-      return;
-    }
-    try {
-      const vals = decryptValues(file.data, envPass);
-      vaultInfo.locked = false;
-      vaultValues = vals;
-      try {
-        if (!vaultInfo.names || !(vaultInfo.names instanceof Set)){
-          vaultInfo.names = new Set();
-        }
-        for (const n of Object.keys(vals || {})){
-          if (isValidEnvName(n)) vaultInfo.names.add(n);
-        }
-      } catch {}
-      applyEnvFrom(vals);
-    } catch {
-      vaultInfo.locked = true;
-      vaultValues = {};
-    }
-  } catch {
-    vaultInfo.hasFile = false;
-    vaultInfo.encrypted = false;
-    vaultInfo.locked = false;
-    vaultInfo.names = new Set();
-    vaultValues = {};
-  }
-}
-
-const ERR_VAULT_LOCKED = 'VAULT_LOCKED';
-const ERR_VAULT_BAD_PASSPHRASE = 'VAULT_BAD_PASSPHRASE';
-
-async function persistVaultUpdate({ set, unset, passphrase }){
-  try {
-    const pass = String(passphrase || '').trim();
-    const file = await readVaultFile();
-    const wasEncrypted = !!(file && file.encrypted);
-    let baseValues = {};
-
-    if (!file){
-      baseValues = {};
-    } else if (!file.encrypted){
-      baseValues = filterValid((file.data && file.data.values) || {});
-    } else {
-      if (!pass){
-        const err = new Error('vault_locked');
-        err.code = ERR_VAULT_LOCKED;
-        throw err;
-      }
-      try {
-        baseValues = decryptValues(file.data, pass);
-      } catch {
-        const err = new Error('vault_bad_passphrase');
-        err.code = ERR_VAULT_BAD_PASSPHRASE;
-        throw err;
-      }
-    }
-
-    const cleanSet = filterValid(set || {});
-    const cleanUnset = Array.isArray(unset) ? unset.filter((n) => isValidEnvName(n)) : [];
-    for (const [k, v] of Object.entries(cleanSet)) baseValues[k] = v;
-    for (const n of cleanUnset) { delete baseValues[n]; }
-
-    const finalValues = filterValid(baseValues);
-    const names = Object.keys(finalValues);
-    const shouldEncrypt = !!pass || wasEncrypted;
-
-    if (shouldEncrypt){
-      if (!pass){
-        const err = new Error('vault_locked');
-        err.code = ERR_VAULT_LOCKED;
-        throw err;
-      }
-      const obj = encryptValues(finalValues, pass);
-      await writeVaultFile(obj);
-      vaultInfo.hasFile = true;
-      vaultInfo.encrypted = true;
-      vaultInfo.locked = false;
-      vaultInfo.names = new Set(names);
-      vaultValues = finalValues;
-      return;
-    }
-
-    const obj = {
-      version: 1,
-      encrypted: false,
-      updatedAt: new Date().toISOString(),
-      values: finalValues,
-    };
-    await writeVaultFile(obj);
-    vaultInfo.hasFile = true;
-    vaultInfo.encrypted = false;
-    vaultInfo.locked = false;
-    vaultInfo.names = new Set(names);
-    vaultValues = finalValues;
-  } catch (e) {
-    if (e && (e.code === ERR_VAULT_LOCKED || e.code === ERR_VAULT_BAD_PASSPHRASE)){
-      throw e;
-    }
-    throw e;
-  }
-}
 
 function resolveAgentHomeDirForEnv(agentIdRaw){
   try {
@@ -1339,237 +1114,32 @@ function resolveAgentHomeDirForEnv(agentIdRaw){
   }
 }
 
-function agentVaultPath(agentHomeDir){
-  const base = String(agentHomeDir || '').trim();
-  if (!base) return '';
-  return join(base, 'vault.json');
-}
+// Legacy agent vault path removed
 
-async function readAgentVaultFile(agentHomeDir){
-  try {
-    const path = agentVaultPath(agentHomeDir);
-    if (!path || !existsSync(path)) return null;
-    const text = readFileSync(path, 'utf8');
-    if (!text) return { path, data: null, encrypted: false, names: [], inheritGlobal: true };
-    const data = JSON.parse(text);
-    const encrypted = !!data && !!data.encrypted;
-    let names = [];
-    if (Array.isArray(data.names)) names = data.names;
-    else if (!encrypted && data && data.values && typeof data.values === 'object') names = Object.keys(data.values);
-    names = names.filter((n) => isValidEnvName(n));
-    const inheritGlobal = (typeof data.inheritGlobal === 'boolean') ? data.inheritGlobal : true;
-    return { path, data, encrypted, names, inheritGlobal };
-  } catch {
-    return null;
-  }
-}
 
-async function writeAgentVaultFile(agentHomeDir, obj){
-  const base = String(agentHomeDir || '').trim();
-  if (!base) return;
-  try { mkdirSync(base, { recursive: true }); } catch {}
-  const path = agentVaultPath(base);
-  const json = JSON.stringify(obj, null, 2);
-  try {
-    await writeFile(path, json, { mode: 0o600 });
-  } catch {
-    await writeFile(path, json);
-  }
-  try { await chmod(path, 0o600); } catch {}
-}
-
-async function readAgentVaultState(agentHomeDir){
-  const base = String(agentHomeDir || '').trim();
-  const path = agentVaultPath(base);
-  const emptyMeta = {
-    path: path || '',
-    hasFile: false,
-    encrypted: false,
-    locked: false,
-    names: [],
-    inheritGlobal: true,
-  };
-  try {
-    const file = await readAgentVaultFile(base);
-    if (!file || !file.data){
-      const meta = { ...emptyMeta };
-      if (file && file.path) meta.path = file.path;
-      if (file) meta.hasFile = true;
-      return { meta, values: {} };
-    }
-    const data = file.data;
-    const encrypted = !!file.encrypted;
-    const inheritGlobal = (typeof file.inheritGlobal === 'boolean') ? file.inheritGlobal : true;
-    let names = Array.isArray(file.names) ? file.names : [];
-    names = names.filter((n) => isValidEnvName(n));
-    const meta = {
-      path: file.path || path || '',
-      hasFile: true,
-      encrypted,
-      locked: false,
-      names,
-      inheritGlobal,
-    };
-
-    let values = {};
-    if (!encrypted){
-      values = filterValid((data && data.values && typeof data.values === 'object') ? data.values : {});
-      meta.locked = false;
-      return { meta, values };
-    }
-
-    const envPass = String(process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
-    if (!envPass){
-      meta.locked = true;
-      return { meta, values: {} };
-    }
-    try {
-      values = decryptValues(data, envPass);
-      meta.locked = false;
-      return { meta, values };
-    } catch {
-      meta.locked = true;
-      return { meta, values: {} };
-    }
-  } catch {
-    return { meta: emptyMeta, values: {} };
-  }
-}
-
-async function persistAgentVaultUpdate({ agentHomeDir, set, unset, passphrase, inheritGlobal }){
-  try {
-    const pass = String(passphrase || '').trim();
-    const file = await readAgentVaultFile(agentHomeDir);
-    const wasEncrypted = !!(file && file.encrypted);
-    const prevData = file && file.data;
-    let baseValues = {};
-    let inherit = (prevData && typeof prevData.inheritGlobal === 'boolean') ? prevData.inheritGlobal : true;
-
-    if (typeof inheritGlobal === 'boolean') inherit = inheritGlobal;
-
-    if (!file || !prevData){
-      baseValues = {};
-    } else if (!file.encrypted){
-      baseValues = filterValid((prevData && prevData.values) || {});
-    } else {
-      if (!pass){
-        const err = new Error('vault_locked');
-        err.code = ERR_VAULT_LOCKED;
-        throw err;
-      }
-      try {
-        baseValues = decryptValues(prevData, pass);
-      } catch {
-        const err = new Error('vault_bad_passphrase');
-        err.code = ERR_VAULT_BAD_PASSPHRASE;
-        throw err;
-      }
-    }
-
-    const cleanSet = filterValid(set || {});
-    const cleanUnset = Array.isArray(unset) ? unset.filter((n) => isValidEnvName(n)) : [];
-    for (const [k, v] of Object.entries(cleanSet)) baseValues[k] = v;
-    for (const n of cleanUnset) { delete baseValues[n]; }
-
-    const finalValues = filterValid(baseValues);
-    const names = Object.keys(finalValues);
-    const shouldEncrypt = !!pass || wasEncrypted;
-
-    if (shouldEncrypt){
-      if (!pass){
-        const err = new Error('vault_locked');
-        err.code = ERR_VAULT_LOCKED;
-        throw err;
-      }
-      const obj = encryptValues(finalValues, pass);
-      obj.inheritGlobal = inherit;
-      await writeAgentVaultFile(agentHomeDir, obj);
-      return {
-        names,
-        inheritGlobal: inherit,
-        encrypted: true,
-        locked: false,
-      };
-    }
-
-    const obj = {
-      version: 1,
-      encrypted: false,
-      updatedAt: new Date().toISOString(),
-      inheritGlobal: inherit,
-      values: finalValues,
-    };
-    await writeAgentVaultFile(agentHomeDir, obj);
-    return {
-      names,
-      inheritGlobal: inherit,
-      encrypted: false,
-      locked: false,
-    };
-  } catch (e) {
-    if (e && (e.code === ERR_VAULT_LOCKED || e.code === ERR_VAULT_BAD_PASSPHRASE)){
-      throw e;
-    }
-    throw e;
-  }
-}
-
-async function handleGetEnv(req, res){
+// Secrets API: manage logical secret names backed by the internal encrypted vault.
+// GET /api/secrets?agentId=... -> { bindings: { name: { scope, inherited, hasBinding, hasAgent, hasGlobal } }, wellKnown: [...], meta:{ global, agent } }
+async function handleGetSecrets(req, res){
   try {
     const url = new URL(req.url, 'http://localhost');
     const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
     const agentId = agentIdParam || DEFAULT_AGENT_ID;
+
     const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
-
-    const globalVault = vaultMetaForResponse();
-    const globalNames = Array.isArray(globalVault.names) ? globalVault.names : [];
-
-    const { meta: agentVault, values: agentValues } = await readAgentVaultState(agentHomeDir);
-    const agentNames = Array.isArray(agentVault.names) ? agentVault.names : [];
-    const inheritEffective = agentVault.inheritGlobal !== false;
-
-    const allNamesSet = new Set();
-    for (const n of globalNames){ if (n) allNamesSet.add(String(n)); }
-    for (const n of agentNames){ if (n) allNamesSet.add(String(n)); }
-    const allNames = Array.from(allNamesSet);
-    allNames.sort();
-
-    const vars = allNames.map((name) => {
-      const storedGlobal = globalNames.includes(name);
-      const storedAgent = agentNames.includes(name);
-      const scope = storedAgent ? 'agent' : (storedGlobal ? 'global' : '');
-      let hasValue = false;
-      if (storedAgent && !agentVault.locked){
-        const v = agentValues && Object.prototype.hasOwnProperty.call(agentValues, name) ? agentValues[name] : undefined;
-        if (v) hasValue = true;
-      }
-      if (!hasValue && inheritEffective && process.env[name]){
-        hasValue = true;
-      }
-      return { name, storedGlobal, storedAgent, scope, hasValue };
-    });
-
-    const vault = {
-      global: globalVault,
-      agent: agentVault,
-      inheritGlobal: inheritEffective,
-    };
-
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ vars, vault }));
+    const { bindings, meta } = await secrets.listNames(agentHomeDir);
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ bindings, wellKnown: WELL_KNOWN_SECRETS || [], meta }));
   } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'env_list_failed', message: e?.message || String(e) }));
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_list_failed', message: e?.message || String(e) }));
   }
 }
 
-// Set/unset environment variables at runtime + persist to vault.
-// Body shape: { agentId?: string, scope?: 'global'|'agent', set: { VAR: value, ... }, unset: [ 'VAR2', ... ], passphrase?: '...', inheritGlobal?: boolean }
-async function handlePostEnv(req, res){
+// POST /api/secrets
+// Body: { agentId?: string, inheritGlobal?: boolean, bindings: { name: { scope?:'global'|'agent', delete?:boolean } } }
+async function handlePostSecrets(req, res){
   try {
-    const bufs = []; for await (const chunk of req) bufs.push(chunk);
+    const bufs = [];
+    for await (const chunk of req) bufs.push(chunk);
     const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    const toSet = (body && body.set && typeof body.set === 'object') ? body.set : {};
-    const toUnset = Array.isArray(body && body.unset) ? body.unset : [];
-    const passphrase = String((body && body.passphrase) || process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
 
     let agentId = '';
     try {
@@ -1579,75 +1149,285 @@ async function handlePostEnv(req, res){
     } catch {}
     if (!agentId) agentId = DEFAULT_AGENT_ID;
 
-    const scopeRaw = String((body && body.scope) || '').trim().toLowerCase();
-    const scope = (scopeRaw === 'agent') ? 'agent' : 'global';
-    const inheritGlobal = (body && typeof body.inheritGlobal === 'boolean') ? body.inheritGlobal : undefined;
+    const incoming = (body && body.bindings && typeof body.bindings === 'object') ? body.bindings : {};
 
-    if (scope === 'global'){
+    const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
+
+    let inherit = true;
+    if (body && typeof body.inheritGlobal === 'boolean'){ inherit = body.inheritGlobal; }
+    const validationErrors = [];
+    const namePattern = /^[A-Za-z0-9_\/-]+$/;
+
+    for (const [nameRaw, spec] of Object.entries(incoming)){
+      const name = String(nameRaw || '').trim();
+      if (!name) continue;
+
+      // Name validation: must not start with '/', must not contain '..', and allow only [A-Za-z0-9_/-].
+      if (name.startsWith('/')){
+        validationErrors.push({ name, reason: 'name_must_not_start_with_slash' });
+        continue;
+      }
+      if (name.includes('..')){
+        validationErrors.push({ name, reason: 'name_must_not_contain_dotdot' });
+        continue;
+      }
+      if (!namePattern.test(name)){
+        validationErrors.push({ name, reason: 'name_has_invalid_characters' });
+        continue;
+      }
+
+      const s = (spec && typeof spec === 'object') ? spec : {};
+      const scopeRaw = String(s.scope || '').trim().toLowerCase();
+      const scope = scopeRaw === 'agent' ? 'agent' : (scopeRaw === 'global' ? 'global' : '');
+      const shouldDelete = !!s.delete;
+
+      if (!scope){
+        validationErrors.push({ name, reason: 'invalid_scope' });
+        continue;
+      }
+
       try {
-        await persistVaultUpdate({ set: toSet, unset: toUnset, passphrase });
+        if (shouldDelete){
+          await secrets.unset(name, scope, agentHomeDir);
+        }
       } catch (e) {
-        if (e && e.code === ERR_VAULT_LOCKED){
-          res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked', message: 'Vault is encrypted; provide passphrase.' }));
-          return;
-        }
-        if (e && e.code === ERR_VAULT_BAD_PASSPHRASE){
-          res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
-          return;
-        }
-        throw e;
-      }
-
-      let touchedWorkspace = false;
-      for (const [kRaw, vRaw] of Object.entries(toSet)){
-        const k = String(kRaw || '').trim();
-        if (!isValidEnvName(k)) continue;
-        const v = vRaw == null ? '' : String(vRaw);
-        process.env[k] = v;
-        if (k === 'ARCANA_WORKSPACE') touchedWorkspace = true;
-      }
-      for (const nRaw of toUnset){
-        const n = String(nRaw || '').trim();
-        if (!isValidEnvName(n)) continue;
-        try { delete process.env[n]; } catch {}
-        if (n === 'ARCANA_WORKSPACE') touchedWorkspace = true;
-      }
-
-      if (touchedWorkspace){
-        try { resetWorkspaceRootCache(); } catch {}
-        workspaceRoot = resolveWorkspaceRoot();
-        resetSessions();
-        try { await ensurePolicySession('restricted'); } catch {}
-      }
-    } else {
-      const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
-      try {
-        await persistAgentVaultUpdate({ agentHomeDir, set: toSet, unset: toUnset, passphrase, inheritGlobal });
-      } catch (e) {
-        if (e && e.code === ERR_VAULT_LOCKED){
-          res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked', message: 'Vault is encrypted; provide passphrase.' }));
-          return;
-        }
-        if (e && e.code === ERR_VAULT_BAD_PASSPHRASE){
-          res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
-          return;
-        }
-        throw e;
+        validationErrors.push({ name, reason: e?.code || 'vault_error' });
       }
     }
 
-    try { broadcast({ type: 'env_refresh' }); } catch {}
-    try {
-      const modelLabel = model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '<auto>';
-      broadcast({ type: 'server_info', model: modelLabel, tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
-    } catch {}
+    if (validationErrors.length){
+      res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({
+        error: 'secrets_validation_failed',
+        message: 'Secrets validation failed',
+        items: validationErrors,
+      }));
+      return;
+    }
+
+    try { broadcast({ type: 'secrets_refresh' }); } catch {}
 
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
   } catch (e) {
-    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'env_update_failed', message: e?.message || String(e) }));
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_update_failed', message: e?.message || String(e) }));
   }
 }
 
+
+// POST /api/secrets/import -> plaintext secret setter for internal vault
+// Body: { agentId, name, scope:'global'|'agent', value }
+async function handlePostSecretsImport(req, res){
+  try {
+    const bufs = [];
+    for await (const chunk of req) bufs.push(chunk);
+    const raw = bufs.length ? Buffer.concat(bufs).toString('utf8') : '';
+    let body = {};
+    if (raw){
+      try { body = JSON.parse(raw); }
+      catch {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+        return;
+      }
+    }
+
+    let agentId = '';
+    try {
+      if (body && Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null){
+        agentId = String(body.agentId || '').trim();
+      }
+    } catch {}
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
+
+    const nameRaw = body && typeof body.name === 'string' ? body.name : '';
+    const name = String(nameRaw || '').trim();
+    const scopeRaw = body && typeof body.scope === 'string' ? body.scope : '';
+    const scopeLower = String(scopeRaw || '').trim().toLowerCase();
+    const scope = scopeLower === 'agent' ? 'agent' : (scopeLower === 'global' ? 'global' : '');
+
+    const namePattern = /^[A-Za-z0-9_\/-]+$/;
+
+    if (!name){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'name_required', message: 'Secret name is required' }));
+      return;
+    }
+    if (!scope){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'invalid_scope', message: 'Scope must be global or agent' }));
+      return;
+    }
+
+    if (name.startsWith('/')){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_validation_failed', message: 'Secret name must not start with slash', items:[{ name, reason: 'name_must_not_start_with_slash' }] }));
+      return;
+    }
+    if (name.includes('..')){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_validation_failed', message: 'Secret name must not contain ..', items:[{ name, reason: 'name_must_not_contain_dotdot' }] }));
+      return;
+    }
+    if (!namePattern.test(name)){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_validation_failed', message: 'Secret name has invalid characters', items:[{ name, reason: 'name_has_invalid_characters' }] }));
+      return;
+    }
+
+    const hasValue = body && Object.prototype.hasOwnProperty.call(body, 'value');
+    const value = hasValue ? String(body.value || '') : '';
+    if (!value){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'value_required', message: 'Secret value must be non-empty' }));
+      return;
+    }
+
+    const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
+
+    try {
+      await secrets.setText(name, value, scope, agentHomeDir);
+    } catch (e) {
+      if (e && e.code === 'VAULT_UNINITIALIZED'){
+        res.writeHead(409, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_uninitialized' }));
+        return;
+      }
+      if (e && e.code === 'VAULT_LOCKED'){
+        res.writeHead(423, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_locked' }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_import_failed', message: e?.message || String(e) }));
+      return;
+    }
+
+    try { broadcast({ type: 'secrets_refresh' }); } catch {}
+
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, name, scope }));
+  } catch (e) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'secrets_import_failed', message: e?.message || String(e) }));
+  }
+}
+
+// Secrets vault init/unlock/status
+async function handleSecretsInit(req, res){
+  try {
+    const bufs = [];
+    for await (const chunk of req) bufs.push(chunk);
+    const raw = bufs.length ? Buffer.concat(bufs).toString('utf8') : '';
+    let body = {};
+    if (raw){
+      try { body = JSON.parse(raw); }
+      catch {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+        return;
+      }
+    }
+    const passRaw = body && typeof body.password === 'string' ? body.password : '';
+    const pass = String(passRaw || '');
+    if (!pass){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'password_required' }));
+      return;
+    }
+    try {
+      const st = secrets.init(pass);
+      // legacy migration removed
+      try { ensureDefaultAgentExists(); } catch {}
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, initialized: st.initialized, locked: st.locked }));
+    } catch (e) {
+      if (e && e.code === 'VAULT_ALREADY_INITIALIZED'){
+        res.writeHead(409, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_already_initialized' }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_init_failed', message: e?.message || String(e) }));
+    }
+  } catch (e) {
+    try { console.warn('[secrets:init] vault_init_failed:', e?.stack || e); } catch {}
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_init_failed', message: e?.message || String(e), code: e?.code || '' }));
+  }
+}
+
+async function handleSecretsUnlock(req, res){
+  try {
+    const bufs = [];
+    for await (const chunk of req) bufs.push(chunk);
+    const raw = bufs.length ? Buffer.concat(bufs).toString('utf8') : '';
+    let body = {};
+    if (raw){
+      try { body = JSON.parse(raw); }
+      catch {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+        return;
+      }
+    }
+    const passRaw = body && typeof body.password === 'string' ? body.password : '';
+    const pass = String(passRaw || '');
+    if (!pass){
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'password_required' }));
+      return;
+    }
+    try {
+      const st = secrets.unlock(pass);
+      // legacy migration removed
+      try { ensureDefaultAgentExists(); } catch {}
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, initialized: st.initialized, locked: st.locked }));
+    } catch (e) {
+      if (e && e.code === 'VAULT_UNINITIALIZED'){
+        res.writeHead(409, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_uninitialized' }));
+        return;
+      }
+      if (e && e.code === 'VAULT_BAD_PASSPHRASE'){
+        res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_bad_passphrase' }));
+        return;
+      }
+      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_unlock_failed', message: e?.message || String(e) }));
+    }
+  } catch (e) {
+    res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_unlock_failed', message: e?.message || String(e) }));
+  }
+}
+
+async function handleSecretsStatus(req, res){
+  try {
+    const st = secrets.status();
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ initialized: !!st.initialized, locked: !!st.locked }));
+  } catch (e) {
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'vault_status_failed', message: e?.message || String(e) }));
+  }
+}
+
+// POST /api/secrets/reset
+// Body: { agentId?: string }
+// Deletes global and agent secrets.enc files and locks in-memory key
+async function handleSecretsReset(req, res){
+  try {
+    const bufs = []; for await (const chunk of req) bufs.push(chunk);
+    const raw = bufs.length ? Buffer.concat(bufs).toString('utf8') : '';
+    let body = {};
+    if (raw){
+      try { body = JSON.parse(raw); }
+      catch {
+        res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'invalid_json', message: 'Request body must be valid JSON' }));
+        return;
+      }
+    }
+
+    let agentId = '';
+    try {
+      if (body && Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null){
+        agentId = String(body.agentId || '').trim();
+      }
+    } catch {}
+    if (!agentId) agentId = DEFAULT_AGENT_ID;
+
+    const agentHomeDir = resolveAgentHomeDirForEnv(agentId);
+    let deleted = { global: false, agent: false };
+    try { deleted = secrets.reset(agentHomeDir) || deleted; } catch { try { secrets.lock(); } catch {} }
+    try { secrets.lock(); } catch {}
+    try { broadcast({ type: 'secrets_refresh' }); } catch {}
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, deleted }));
+  } catch (e) {
+    // Keep this endpoint safe; return ok with no deletions on error
+    try { secrets.lock(); } catch {}
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, deleted: { global: false, agent: false } }));
+  }
+}
+
+// POST /api/secrets/migrate_env_vault
+// Body: { agentId?: string, passphrase?: string }
+async function handleSecretsMigrateEnvVault(req, res){
+  res.writeHead(410, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ error: 'legacy_migration_removed' }));
+}
 async function ensurePolicySession(policy) {
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   if (sessionsByPolicy.has(pol)) return sessionsByPolicy.get(pol);
@@ -2164,6 +1944,22 @@ function broadcast(ev) {
   }
 }
 
+// Build a human-readable label for the current global model,
+// matching the logic used for initial SSE connect in handleEvents.
+function modelLabelFromCurrentModel(){
+  try {
+    return model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '<auto>';
+  } catch { return '<auto>'; }
+}
+
+// Broadcast a fresh server_info snapshot based on current globals.
+function broadcastServerInfo(){
+  try {
+    const modelLabel = modelLabelFromCurrentModel();
+    broadcast({ type: 'server_info', model: modelLabel, tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
+  } catch {}
+}
+
 async function handleEvents(req, res) {
   await ensurePolicySession('restricted');
   ensureSubagentEventBusBridge();
@@ -2528,9 +2324,10 @@ async function handleChat2(req, res) {
         }
       }
 
-      try { console.error('[arcana:chat2] prompt failed:', msg); } catch {}
-      try { broadcast({ type: 'error', sessionId, message: msg }); } catch {}
-      res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg }));
+      const stack = buildErrorStack(promptError, { maxDepth: 8, cap: 8000 });
+      try { console.error('[arcana:chat2] prompt failed with stack:\n' + stack); } catch {}
+      try { broadcast({ type: 'error', sessionId, message: msg, stack }); } catch {}
+      res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg, stack }));
       return;
     }
 
@@ -2560,7 +2357,12 @@ async function handleChat2(req, res) {
     const respText = lastAssistantText || out;
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: respText }));
   } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: e?.message || String(e) }));
+    let msg = '';
+    try { msg = String(e && (e.message || e)) || 'server_error'; } catch { msg = 'server_error'; }
+    const stack = buildErrorStack(e, { maxDepth: 8, cap: 8000 });
+    try { console.error('[arcana:chat2] unhandled error with stack:\n' + stack); } catch {}
+    try { broadcast({ type: 'error', sessionId, message: msg, stack }); } catch {}
+    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg, stack }));
   }
 }
 
@@ -2847,7 +2649,8 @@ async function handlePostAgentConfig(req, res) {
     }
 
     resetSessions();
-    try { broadcast({ type: 'server_info', model: '', tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames }); } catch {}
+    try { await ensurePolicySession('restricted'); } catch {}
+    try { broadcastServerInfo(); } catch {}
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
   } catch (e) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_config_write_failed', message: e?.message || String(e) }));
@@ -2911,7 +2714,8 @@ async function handlePostConfig(req, res) {
 
     await writeFile(path, JSON.stringify(cfgObj, null, 2), 'utf-8');
     resetSessions();
-    broadcast({ type: 'server_info', model: '', tools: toolNames, plugins: pluginFiles, workspace: workspaceRoot, skills: skillNames });
+    try { await ensurePolicySession('restricted'); } catch {}
+    try { broadcastServerInfo(); } catch {}
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true }));
   } catch (e) {
     res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'config_write_failed', message: e?.message || String(e) }));
@@ -3116,8 +2920,15 @@ function createRequestHandler() {
     if (req.method === 'GET' && url.pathname === '/health') { res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, plugins: (pluginFiles?.length || 0) })); return; }
     if (req.method === 'GET' && url.pathname === '/api/events') { await handleEvents(req, res); return; }
 
-    if (req.method === 'GET' && url.pathname === '/api/env') { await handleGetEnv(req, res); return; }
-    if (req.method === 'POST' && url.pathname === '/api/env') { await handlePostEnv(req, res); return; }
+    
+    if (req.method === 'GET' && url.pathname === '/api/secrets') { await handleGetSecrets(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/secrets') { await handlePostSecrets(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/secrets/import') { await handlePostSecretsImport(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/secrets/init') { await handleSecretsInit(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/secrets/unlock') { await handleSecretsUnlock(req, res); return; }
+    if (req.method === 'GET' && url.pathname === '/api/secrets/status') { await handleSecretsStatus(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/secrets/reset') { await handleSecretsReset(req, res); return; }
+    if (req.method === 'POST' && url.pathname === '/api/secrets/migrate_env_vault') { await handleSecretsMigrateEnvVault(req, res); return; }
 
     // Concurrent chat + persistence
     if (req.method === 'POST' && url.pathname === '/api/chat2') { await handleChat2(req, res); return; }
@@ -3156,7 +2967,7 @@ function createRequestHandler() {
 export async function startArcanaWebServer({ port, workspaceRoot: wsRoot } = {}) {
   if (wsRoot) { process.env.ARCANA_WORKSPACE = String(wsRoot); try { resetWorkspaceRootCache(); } catch {} }
   workspaceRoot = resolveWorkspaceRoot();
-  try { ensureArcanaHomeDir(); await loadVaultFromDisk(); } catch {}
+  try { ensureArcanaHomeDir(); } catch {}
   try { ensureDefaultAgentExists(); } catch {}
 
   const server = http.createServer(createRequestHandler());

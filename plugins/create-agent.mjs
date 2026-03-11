@@ -363,8 +363,7 @@ function createCreateAgentTool() {
           ";",
           "; [feishu]",
           "; command = node $ARCANA_PKG_ROOT/skills/feishu/scripts/feishu-bridge.mjs",
-          "; env.FEISHU_APP_ID = your-app-id",
-          "; env.FEISHU_APP_SECRET = your-app-secret",
+          "; configure secrets in Arcana Secrets UI: services/feishu/app_id and services/feishu/app_secret",
           "; env.FEISHU_DOMAIN = feishu",
           "",
         ];

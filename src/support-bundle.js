@@ -6,6 +6,8 @@ import { runDoctor } from './doctor.js';
 import { loadArcanaConfig } from './config.js';
 import { resolveWorkspaceRoot } from './workspace-guard.js';
 import { loadArcanaPlugins } from './plugin-loader.js';
+import { resolveAgentHomeRoot } from './agent-guard.js';
+import { providerApiKeyName, secrets } from './secrets/index.js';
 
 function redactPath(p){
   try{
@@ -39,20 +41,33 @@ function sanitizeConfig(cfg){
   return clone;
 }
 
-function envSummary(){
+async function envSummary(){
   const out = {};
   const keep = ['ARCANA_WORKSPACE','ARCANA_PROVIDER','ARCANA_MODEL','ARCANA_THINKING','ARCANA_EXEC_POLICY','ARCANA_PW_ENGINE','ARCANA_MEMORY_TRIGGERS','OPENAI_BASE_URL','OPENAI_API_BASE','ANTHROPIC_BASE_URL'];
   for (const k of keep){ if (process.env[k]) out[k] = k.includes('WORKSPACE') ? redactPath(process.env[k]) : String(process.env[k]); }
-  // API keys are summarized as present/not present only
-  out.keys_present = {
-    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-    ANTHROPIC_API_KEY: !!process.env.ANTHROPIC_API_KEY,
-    GOOGLE_API_KEY: !!process.env.GOOGLE_API_KEY,
-    OPENROUTER_API_KEY: !!process.env.OPENROUTER_API_KEY,
-    XAI_API_KEY: !!process.env.XAI_API_KEY,
-  };
+
+  // Secrets presence summary (booleans only; no secret values or op refs)
+  try {
+    const agentHomeRoot = resolveAgentHomeRoot();
+    const { bindings } = await secrets.listNames(agentHomeRoot);
+    const providers = ['openai','anthropic','google','openrouter','xai'];
+    const flags = {};
+    for (const prov of providers){
+      const name = providerApiKeyName(prov);
+      const b = bindings && bindings[name];
+      const hasAgent = !!(b && b.hasAgent);
+      const hasGlobal = !!(b && b.hasGlobal && b.inherited !== false);
+      flags[prov] = !!(hasAgent || hasGlobal);
+    }
+    out.secrets_present = flags;
+  } catch {
+    out.secrets_present = {};
+  }
+
   return out;
 }
+
+
 
 function versionSummary(){
   let pkg = null;
@@ -82,7 +97,8 @@ export async function createSupportBundle({ outDir, cwd }={}){
   if (cfg) writeFileSync(join(baseDir,'config.sanitized.json'), JSON.stringify(cfg, null, 2));
 
   // env summary
-  writeFileSync(join(baseDir,'env.sanitized.json'), JSON.stringify(envSummary(), null, 2));
+  const env = await envSummary();
+  writeFileSync(join(baseDir,'env.sanitized.json'), JSON.stringify(env, null, 2));
 
   // versions
   writeFileSync(join(baseDir,'versions.json'), JSON.stringify(versionSummary(), null, 2));

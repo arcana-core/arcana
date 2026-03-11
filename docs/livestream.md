@@ -73,11 +73,10 @@ State and logs
   - These logs reuse the cron-style Arcana task logging (prompt + assistant tail).
 
 Env vars
-- General:
-  - OPENAI_API_KEY
-    - Used by Arcana to run LLM turns via runArcanaTask.
+- General (secrets):
+- Bind providers/<provider>/api_key in the Secrets UI (for example providers/openai/api_key saved in the Secrets section of the internal vault) so Arcana can run LLM turns via runArcanaTask.
 
-- Livestream tuning:
+- Livestream tuning (non-secret env):
   - ARCANA_LIVESTREAM_TICK_MS
     - Default tick interval in milliseconds when --tick-ms is not provided.
     - Default: 3000.
@@ -88,11 +87,10 @@ Env vars
     - Hard timeout in milliseconds for each showrunner LLM turn.
     - Default: 45000.
 
-- live_tts provider env (delegated to the skill):
-  - ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID
-  - ALIYUN_DASHSCOPE_API_KEY / DASHSCOPE_API_KEY
-  - ALIYUN_COSYVOICE_ENDPOINT, ALIYUN_COSYVOICE_MODEL
-  - ALIYUN_COSYVOICE_WS_URL, ALIYUN_COSYVOICE_WS_MODEL, ALIYUN_COSYVOICE_VOICE
+- live_tts provider secrets and env:
+  - Bind services/elevenlabs/api_key in the Secrets UI (for ElevenLabs) and configure any non-secret env like ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID.
+  - Bind services/aliyun/dashscope_api_key for DashScope-based voices; keep ALIYUN_COSYVOICE_* env vars for non-secret endpoint/model/voice configuration.
+- Do not store API keys directly in environment variables; prefer secrets bindings stored in the internal encrypted vault.
 
 Safety and content guarantees
 - The showrunner prompt strictly instructs the agent to:

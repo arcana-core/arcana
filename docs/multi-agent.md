@@ -104,8 +104,7 @@ Background services are configured **per agent** via `services.ini` in the agent
     ```ini
     [feishu]
     command = node $ARCANA_PKG_ROOT/skills/feishu/scripts/feishu-bridge.mjs
-    env.FEISHU_APP_ID = your-app-id
-    env.FEISHU_APP_SECRET = your-app-secret
+    # 在 Arcana 密码箱 Secrets 区域绑定 services/feishu/app_id 和 services/feishu/app_secret
     env.FEISHU_DOMAIN = feishu
     ```
 

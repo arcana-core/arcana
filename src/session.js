@@ -14,8 +14,7 @@ import { createCronTool } from './tools/cron.js';
 import { createHeartbeatTool } from './tools/heartbeat.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname } from 'node:path';
-import { scryptSync, createDecipheriv } from 'node:crypto';
-import { resolveArcanaHome, arcanaHomePath } from './arcana-home.js';
+import { resolveArcanaHome } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, promises as fsp } from 'node:fs';
 import { buildArcanaSkillsPrompt, loadArcanaSkills } from './skills.js';
@@ -26,6 +25,7 @@ import { ensureReadAllowed } from './workspace-guard.js';
 import { resolveAgentHomeRoot } from './agent-guard.js';
 import { buildAgentBootstrapContext } from './agent-bootstrap-context.js';
 import { globSync } from 'glob';
+import { createSecretsContext } from './secrets/index.js';
 
 function arcanaPkgRoot(){
   const here = fileURLToPath(new URL('.', import.meta.url)); // arcana/src/
@@ -80,234 +80,7 @@ function mergeAgentConfig(globalCfg, agentCfg){
   return base;
 }
 
-// --- Env vault overlay (global + per-agent) ---
-
-function isValidEnvName(n){
-  try {
-    const s = String(n || '');
-    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
-  } catch { return false; }
-}
-
-function filterValidEnv(obj){
-  const out = {};
-  try {
-    for (const [k, v] of Object.entries(obj || {})){
-      if (!isValidEnvName(k)) continue;
-      out[k] = v == null ? '' : String(v);
-    }
-  } catch {}
-  return out;
-}
-
-function deriveVaultKey(passphrase, kdfParams){
-  const base = kdfParams || {};
-  const N = typeof base.N === 'number' ? base.N : 16384;
-  const r = typeof base.r === 'number' ? base.r : 8;
-  const p = typeof base.p === 'number' ? base.p : 1;
-  const saltB64 = base.saltB64 || '';
-  const salt = Buffer.from(String(saltB64), 'base64');
-  const key = scryptSync(String(passphrase || ''), salt, 32, { N, r, p });
-  return { key };
-}
-
-function decryptVaultValues(fileObj, passphrase){
-  if (!fileObj) return {};
-  if (!fileObj.encrypted){
-    const raw = (fileObj.values && typeof fileObj.values === 'object') ? fileObj.values : {};
-    return filterValidEnv(raw);
-  }
-  const { key } = deriveVaultKey(passphrase, fileObj.kdf || {});
-  const cipherMeta = fileObj.cipher || {};
-  const ivB64 = cipherMeta.ivB64 || fileObj.ivB64 || fileObj.iv;
-  const tagB64 = cipherMeta.tagB64 || fileObj.tagB64 || fileObj.tag;
-  const ciphertextB64 = fileObj.ciphertextB64 || fileObj.ciphertext;
-  const iv = Buffer.from(String(ivB64 || ''), 'base64');
-  const tag = Buffer.from(String(tagB64 || ''), 'base64');
-  const enc = Buffer.from(String(ciphertextB64 || ''), 'base64');
-  const decipher = createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(tag);
-  const out = Buffer.concat([decipher.update(enc), decipher.final()]);
-  const obj = JSON.parse(out.toString('utf8') || '{}');
-  return filterValidEnv(obj && typeof obj === 'object' ? obj : {});
-}
-
-function readGlobalVaultMeta(){
-  const path = arcanaHomePath('vault.json');
-  const meta = {
-    path,
-    hasFile: false,
-    encrypted: false,
-    names: [],
-  };
-  try {
-    if (!path || !existsSync(path)) return meta;
-    const text = readFileSync(path, 'utf8');
-    if (!text) {
-      return { ...meta, hasFile: true };
-    }
-    const data = JSON.parse(text);
-    const encrypted = !!(data && data.encrypted);
-    let names = [];
-    if (Array.isArray(data.names)) names = data.names;
-    else if (data && data.values && typeof data.values === 'object') names = Object.keys(data.values);
-    names = names.filter((n) => isValidEnvName(n));
-    return {
-      path,
-      hasFile: true,
-      encrypted,
-      names,
-    };
-  } catch {
-    return meta;
-  }
-}
-
-function agentVaultPath(agentHomeRoot){
-  const base = String(agentHomeRoot || '').trim();
-  if (!base) return '';
-  return join(base, 'vault.json');
-}
-
-function readAgentVaultState(agentHomeRoot){
-  const path = agentVaultPath(agentHomeRoot);
-  const empty = {
-    path: path || '',
-    hasFile: false,
-    encrypted: false,
-    locked: false,
-    names: [],
-    inheritGlobal: true,
-    values: {},
-  };
-  try {
-    if (!path || !existsSync(path)) return empty;
-    const text = readFileSync(path, 'utf8');
-    if (!text) {
-      return { ...empty, hasFile: true };
-    }
-    const data = JSON.parse(text);
-    const encrypted = !!(data && data.encrypted);
-    let names = [];
-    if (Array.isArray(data.names)) names = data.names;
-    else if (!encrypted && data && data.values && typeof data.values === 'object') names = Object.keys(data.values);
-    names = names.filter((n) => isValidEnvName(n));
-    const inheritGlobal = (typeof data.inheritGlobal === 'boolean') ? data.inheritGlobal : true;
-    let values = {};
-    let locked = false;
-    if (!encrypted){
-      const raw = (data && data.values && typeof data.values === 'object') ? data.values : {};
-      values = filterValidEnv(raw);
-    } else {
-      const envPass = String(process.env.ARCANA_VAULT_PASSPHRASE || '').trim();
-      if (!envPass) {
-        locked = true;
-      } else {
-        try { values = decryptVaultValues(data, envPass); }
-        catch { locked = true; values = {}; }
-      }
-    }
-    return {
-      path,
-      hasFile: true,
-      encrypted,
-      locked,
-      names,
-      inheritGlobal,
-      values,
-    };
-  } catch {
-    return empty;
-  }
-}
-
-class AsyncMutex{
-  constructor(){
-    this._locked = false;
-    this._waiters = [];
-  }
-  async acquire(){
-    if (!this._locked){
-      this._locked = true;
-      return;
-    }
-    await new Promise((resolve) => { this._waiters.push(resolve); });
-  }
-  release(){
-    if (this._waiters.length){
-      const next = this._waiters.shift();
-      try { next(); } catch {}
-    } else {
-      this._locked = false;
-    }
-  }
-  async runExclusive(fn){
-    await this.acquire();
-    try { return await fn(); }
-    finally { this.release(); }
-  }
-}
-
-const envOverlayMutex = new AsyncMutex();
-
-async function runWithEnvOverlay(agentHomeRoot, fn){
-  const globalMeta = readGlobalVaultMeta();
-  const agentMeta = readAgentVaultState(agentHomeRoot);
-  const globalNames = new Set(globalMeta.names || []);
-  const agentValues = agentMeta.values || {};
-  const inheritGlobal = agentMeta.inheritGlobal !== false;
-
-  const hasGlobalNames = globalNames.size > 0;
-  const hasAgentValues = Object.keys(agentValues).length > 0;
-  const shouldHideGlobal = hasGlobalNames && inheritGlobal === false;
-
-  if (!shouldHideGlobal && !hasAgentValues){
-    return fn();
-  }
-
-  return envOverlayMutex.runExclusive(async () => {
-    const previous = new Map();
-    try {
-      if (shouldHideGlobal){
-        for (const name of globalNames){
-          if (!previous.has(name)){
-            if (Object.prototype.hasOwnProperty.call(process.env, name)) previous.set(name, process.env[name]);
-            else previous.set(name, undefined);
-          }
-          delete process.env[name];
-        }
-      }
-      for (const [k, v] of Object.entries(agentValues)){
-        if (!previous.has(k)){
-          if (Object.prototype.hasOwnProperty.call(process.env, k)) previous.set(k, process.env[k]);
-          else previous.set(k, undefined);
-        }
-        process.env[k] = v == null ? '' : String(v);
-      }
-      return await fn();
-    } finally {
-      for (const [k, v] of previous.entries()){
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
-    }
-  });
-}
-
-function wrapToolWithEnvOverlay(tool, agentHomeRoot){
-  if (!tool || typeof tool.execute !== 'function') return tool;
-  const exec = tool.execute.bind(tool);
-  return {
-    ...tool,
-    async execute(...args){
-      return runWithEnvOverlay(agentHomeRoot, () => exec(...args));
-    }
-  };
-}
-
-export async function runWithAgentEnvOverlay(agentHomeRoot, fn){
-  return runWithEnvOverlay(agentHomeRoot, fn);
-}
+// --- Secrets context (internal encrypted vault + env) ---
 
 export async function createArcanaSession(opts={}){
   const bootstrapContextMode = String(opts.bootstrapContextMode || "").trim().toLowerCase();
@@ -327,7 +100,22 @@ export async function createArcanaSession(opts={}){
   const agentCfg = loadAgentConfig(agentHomeRoot);
   const cfg = mergeAgentConfig(globalCfg, agentCfg);
 
+  const secrets = createSecretsContext({ agentHomeRoot });
+
+  function wrapToolWithSecrets(tool){
+    if (!tool || typeof tool.execute !== 'function') return tool;
+    const exec = tool.execute.bind(tool);
+    return {
+      ...tool,
+      async execute(callId, args, signal, onUpdate, ctx){
+        const ctxWithSecrets = { ...(ctx || {}), secrets };
+        return exec(callId, args, signal, onUpdate, ctxWithSecrets);
+      }
+    };
+  }
+
   const providerName = (cfg && cfg.provider) ? String(cfg.provider).trim() : '';
+  // Legacy provider key; prefer secrets bindings
   const providerKey = (cfg && cfg.key) ? String(cfg.key).trim() : '';
 
   let model;
@@ -497,7 +285,7 @@ export async function createArcanaSession(opts={}){
             } catch {}
 
             const nextCustomTools = buildCustomTools();
-            const wrappedCustomTools = nextCustomTools.map((t) => wrapToolWithEnvOverlay(t, agentHomeRoot));
+            const wrappedCustomTools = nextCustomTools.map((t) => wrapToolWithSecrets(t));
 
             if (createdSession && typeof createdSession.reload === 'function') {
               try {
@@ -580,8 +368,9 @@ export async function createArcanaSession(opts={}){
   // bash/edit/write. 'bash' is available via our proxy in customTools and can be
   // enabled by policy at runtime.
   const baseTools = [readTool, grepTool, findTool, lsTool];
-  const wrappedBaseTools = baseTools.map((t) => wrapToolWithEnvOverlay(t, agentHomeRoot));
-  const wrappedCustomTools = customTools.map((t) => wrapToolWithEnvOverlay(t, agentHomeRoot));
+
+  const wrappedBaseTools = baseTools.map((t) => wrapToolWithSecrets(t));
+  const wrappedCustomTools = customTools.map((t) => wrapToolWithSecrets(t));
 
   const created = await createAgentSession({
     cwd: workspaceRoot,
@@ -602,8 +391,16 @@ export async function createArcanaSession(opts={}){
   // Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
   try {
     const prov = providerName || (model && model.provider) || '';
-    if (prov && providerKey && created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage && typeof created.session.modelRegistry.authStorage.setRuntimeApiKey === 'function') {
-      created.session.modelRegistry.authStorage.setRuntimeApiKey(prov, providerKey);
+    let key = providerKey;
+    if (!key && prov) {
+      try {
+        key = await secrets.getProviderApiKey(prov);
+      } catch {
+        key = providerKey;
+      }
+    }
+    if (prov && key && created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage && typeof created.session.modelRegistry.authStorage.setRuntimeApiKey === 'function') {
+      created.session.modelRegistry.authStorage.setRuntimeApiKey(prov, key);
     }
   } catch {}
 

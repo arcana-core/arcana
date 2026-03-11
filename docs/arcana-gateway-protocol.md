@@ -63,7 +63,7 @@ events via `src/event-bus.js`.
 
 Examples of event types (non-exhaustive, aligned with current SSE events):
 
-- `server_info`, `env_refresh`.
+- `server_info`.
 - `turn_start`, `turn_end`.
 - `thinking_start`, `thinking_progress`, `thinking_end`.
 - `assistant_text`, `assistant_image`.
@@ -335,4 +335,3 @@ are descriptive; they do not imply that the Gateway endpoints exist yet.
     and `session_state` events to drive replies back to the channel.
 - This keeps channel code focused on normalization and reply sending, while the
   Gateway owns sessions, turns, and observability.
-

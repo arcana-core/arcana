@@ -36,7 +36,8 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
         }
       } catch (e) {
         try {
-          console.error('[arcana:gateway-v2] scheduler wake error', e && e.message ? e.message : e);
+          const full = e && e.stack ? e.stack : (e && e.message ? e.message : String(e||''));
+          console.error('[arcana:gateway-v2] scheduler wake error', full);
         } catch {}
       }
     }, delay);
@@ -162,4 +163,3 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
 }
 
 export default { createScheduler };
-

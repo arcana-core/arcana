@@ -2,6 +2,8 @@ import { listJobs, saveJob, setJobNextRun, buildLogPath, appendRun, acquireJobRu
 import { runExecTask } from './exec.js';
 import { runArcanaTask } from './arcana-task.js';
 import { appendMessage } from '../sessions-store.js';
+import { arcanaHomePath } from '../arcana-home.js';
+import { createSecretsContext } from '../secrets/index.js';
 
 function nowIso(){ return new Date().toISOString(); }
 
@@ -72,14 +74,16 @@ async function getFeishuTenantAccessToken({ baseUrl, appId, appSecret }){
   return cache.token;
 }
 
-async function sendFeishuReplyForCron({ job, delivery, assistantText, outputTail }){
+async function sendFeishuReplyForCron({ job, delivery, assistantText, outputTail, agentId }){
   try {
     const modeRaw = delivery && delivery.mode != null ? String(delivery.mode).trim().toLowerCase() : 'none';
     if (modeRaw !== 'feishu_reply') return;
     const messageId = delivery && delivery.messageId ? String(delivery.messageId).trim() : '';
     if (!messageId) return;
-    const appId = (process.env.FEISHU_APP_ID || process.env.LARK_APP_ID || '').trim();
-    const appSecret = (process.env.FEISHU_APP_SECRET || process.env.LARK_APP_SECRET || '').trim();
+    const agentHomeRoot = arcanaHomePath('agents', agentId || 'default');
+    const secrets = createSecretsContext({ agentHomeRoot });
+    const appId = String(await secrets.getText('services/feishu/app_id') || '').trim();
+    const appSecret = String(await secrets.getText('services/feishu/app_secret') || '').trim();
     if (!appId || !appSecret) return;
     const baseUrl = resolveFeishuBaseUrl(process.env.FEISHU_DOMAIN || 'feishu');
     const token = await getFeishuTenantAccessToken({ baseUrl, appId, appSecret });
@@ -163,7 +167,7 @@ async function runAgentTurn(job, { agentId, workspaceRoot, logPath, startMs }){
       const title = job.title || 'Cron Agent Turn';
       const res = await runArcanaTask({ prompt, sessionId: deliverySessionId, title, logPath, agentId, timeoutMs });
       if (mode === 'feishu_reply' && res && res.ok){
-        await sendFeishuReplyForCron({ job, delivery, assistantText: res.assistantText, outputTail: res.outputTail });
+        await sendFeishuReplyForCron({ job, delivery, assistantText: res.assistantText, outputTail: res.outputTail, agentId });
       }
       return res;
     } finally {
@@ -213,7 +217,7 @@ async function runAgentTurn(job, { agentId, workspaceRoot, logPath, startMs }){
   }
 
   if (mode === 'feishu_reply' && res && res.ok){
-    await sendFeishuReplyForCron({ job, delivery, assistantText: res.assistantText, outputTail: res.outputTail });
+    await sendFeishuReplyForCron({ job, delivery, assistantText: res.assistantText, outputTail: res.outputTail, agentId });
   }
 
   return res;

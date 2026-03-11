@@ -230,8 +230,62 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
           runnerState: cfg.runnerValue,
         };
 
-        result = await runner.run(ctx);
-        ok = !!(result && Object.prototype.hasOwnProperty.call(result, 'ok') ? result.ok : true);
+        try {
+          result = await runner.run(ctx);
+          ok = !!(result && Object.prototype.hasOwnProperty.call(result, 'ok') ? result.ok : true);
+          // If runner succeeded but returned ok:false, broadcast error without throwing
+          if (!ok && result) {
+            const msg = (typeof result.error === 'string' && result.error) ? result.error : 'error';
+            const rawStack = (typeof result.errorStack === 'string' && result.errorStack) ? result.errorStack : (msg ? (new Error(String(msg))).stack : '');
+            const cap = 8000;
+            const bounded = rawStack && rawStack.length > cap ? rawStack.slice(0, cap) : rawStack;
+            try { console.error('[arcana:gateway-v2] turn error (runner result)', '\nagentId=', aId, 'sessionKey=', sKey, 'runnerId=', runnerId, 'reason=', reason || 'wake', '\n', bounded || msg); } catch {}
+            if (wsHub && typeof wsHub.broadcast === 'function'){
+              try {
+                wsHub.broadcast({
+                  type: 'turn.error',
+                  agentId: aId,
+                  sessionKey: sKey,
+                  runnerId,
+                  reason: reason || 'wake',
+                  error: msg,
+                  errorStack: bounded || '',
+                  tsMs: nowMs(),
+                });
+              } catch {}
+            }
+          }
+        } catch (e) {
+          ok = false;
+          try {
+            const full = e && e.stack ? String(e.stack) : (e && e.message ? String(e.message) : String(e||''));
+            const cap = 8000;
+            const bounded = full.length > cap ? full.slice(0, cap) : full;
+            console.error('[arcana:gateway-v2] turn error', '\nagentId=', aId, 'sessionKey=', sKey, 'runnerId=', runnerId, 'reason=', reason || 'wake', '\n', full);
+            if (wsHub && typeof wsHub.broadcast === 'function'){
+              try {
+                wsHub.broadcast({
+                  type: 'turn.error',
+                  agentId: aId,
+                  sessionKey: sKey,
+                  runnerId,
+                  reason: reason || 'wake',
+                  error: e && e.message ? String(e.message) : 'error',
+                  errorStack: bounded,
+                  tsMs: nowMs(),
+                });
+              } catch {}
+            }
+            const retryMsRaw = Number(process.env.ARCANA_GATEWAY_V2_ERROR_RETRY_MS);
+            const retryDelayMs = (Number.isFinite(retryMsRaw) && retryMsRaw >= 0) ? retryMsRaw : 5000;
+            if (scheduler && typeof scheduler.requestWake === 'function'){
+              try {
+                scheduler.requestWake({ agentId: aId, sessionKey: sKey, priority: 5, reason: 'runner.recover', delayMs: retryDelayMs });
+              } catch {}
+            }
+          } catch {}
+          throw e;
+        }
 
         if (result && Array.isArray(result.outputs) && result.outputs.length && outbox && typeof outbox.deliverOutputs === 'function'){
           try {
@@ -305,4 +359,3 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
 }
 
 export default { createEngine };
-

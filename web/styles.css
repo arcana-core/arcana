@@ -110,6 +110,11 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 .msg.me .bubble{background:#07c160;color:#fff}
 .composer{background:#fff;border-top:1px solid #ececec;border-radius:0 0 12px 12px}
 .composer .send{height:38px;min-width:80px;border-radius:8px}
+.fullshell-open .chat-header{background:#fff6d9;border-color:#f1e0a6}
+.fullshell-open .composer{background:#fff6d9;border-top-color:#f1e0a6}
+.fullshell-open .composer .icon{background:#fff;border-color:#e3c86a}
+.fullshell-open .composer textarea{background:#fff;border-color:#e3c86a}
+.fullshell-open .composer .send{background:#b58900}
 .right .display{background:rgba(255,255,255,.95);border:1px solid #e1e4f0;border-radius:12px;box-shadow:0 14px 45px rgba(15,23,42,.18)}
 .tabs-bar{background:#fafafa}
 .logs{padding:10px}

@@ -3,7 +3,7 @@ Install & Quickstart
 Prereqs
 - Node.js 18+ (LTS recommended)
 - npm 9+
-- Optional: provider API key (e.g., OPENAI_API_KEY)
+- Optional: provider API key via Arcana secrets (e.g., bind providers/openai/api_key in the Secrets UI Secrets section; the value is stored encrypted in the internal vault).
 
 Install (macOS/Linux)
 - Run: npm i
@@ -14,7 +14,7 @@ Install (Windows PowerShell)
 - Run: npx playwright install
 
 Configure a provider (example: OpenAI)
-- Export OPENAI_API_KEY in your shell
+- In the Secrets UI, bind providers/openai/api_key in the Secrets section and paste your OpenAI API key; Arcana will encrypt it into the internal vault.
 - Optional: set ARCANA_MODEL=openai:gpt-4o-mini
 - Or create arcana.config.json in the repo root (or set ARCANA_CONFIG to a custom config path) with provider and model fields
 

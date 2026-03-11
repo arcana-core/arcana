@@ -22,6 +22,18 @@ This skill scaffolds a new skill for the active agent under `$ARCANA_HOME/agents
 - Avoid extra docs (README/CHANGELOG). Place details in `references/` and executable code in `scripts/`.
 - Keep SKILL.md concise; link to reference files when details are long.
 
+## Secrets bindings
+
+- New skills **must not** read `process.env` directly for API keys or other secrets.
+- Use `ctx.secrets.getText('<logical-name>')` from within tools to read secrets via Arcana's bindings system.
+- Prefer logical names that follow the shared conventions, for example:
+  - `providers/openai/api_key`
+  - `providers/google/api_key`
+  - `services/feishu/app_id`
+  - `services/wechat/app_secret`
+- When a required secret is missing, use the `vault` tool with `names: ['<logical-name>']` to open the Secrets UI for the user.
+- The Arcana server also exposes a secrets management API at `/api/secrets`; the Secrets UI is backed by this endpoint and should be the primary way users manage bound secrets.
+
 ## When This Skill Owns Tools（与工具绑定）
 
 - 工具位置：`<skill>/tools/<tool>/`（无论该 Skill 位于 Agent Home 还是工作区 ./skills，下游加载器都会自动发现）。

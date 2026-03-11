@@ -6,6 +6,8 @@ import { loadArcanaConfig, applyProviderEnv, resolveModelFromConfig, resolveMode
 import { resolveWorkspaceRoot } from './workspace-guard.js';
 import { loadArcanaPlugins } from './plugin-loader.js';
 import { loadArcanaSkills } from './skills.js';
+import { resolveAgentHomeRoot } from './agent-guard.js';
+import { providerApiKeyName, secrets } from './secrets/index.js';
 
 function redactPath(p){
   try{
@@ -79,24 +81,35 @@ export async function runDoctor({ cwd } = {}){
   } else {
     modelNext.push('Set ARCANA_PROVIDER and ARCANA_MODEL, or configure in arcana.config.json.');
   }
-  const envFlags = {
-    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-    ANTHROPIC_API_KEY: !!process.env.ANTHROPIC_API_KEY,
-    GOOGLE_API_KEY: !!process.env.GOOGLE_API_KEY,
-    OPENROUTER_API_KEY: !!process.env.OPENROUTER_API_KEY,
-    XAI_API_KEY: !!process.env.XAI_API_KEY
-  };
-  const needKey = ['openai','anthropic','google','openrouter','xai'].includes(provider) && !Object.values(envFlags).some(Boolean) && !cfg?.key;
+  let secretsFlags = {};
+  try {
+    const agentHomeRoot = resolveAgentHomeRoot();
+    const { bindings } = await secrets.listNames(agentHomeRoot);
+    const providersNeedingKeys = ['openai','anthropic','google','openrouter','xai'];
+    secretsFlags = {};
+    for (const provId of providersNeedingKeys){
+      const name = providerApiKeyName(provId);
+      const b = bindings && bindings[name];
+      const hasAgent = !!(b && b.hasAgent);
+      const hasGlobal = !!(b && b.hasGlobal && b.inherited !== false);
+      secretsFlags[provId] = !!(hasAgent || hasGlobal);
+    }
+  } catch {
+    secretsFlags = {};
+  }
+  const providerRequiresKey = ['openai','anthropic','google','openrouter','xai'].includes(provider);
+  const hasSecretForProvider = providerRequiresKey ? !!secretsFlags[provider] : false;
+  const needKey = providerRequiresKey && !hasSecretForProvider && !cfg?.key;
   const envOk = !needKey;
+  const secretNameForNext = provider ? ('providers/' + provider + '/api_key') : 'providers/<provider>/api_key';
   checks.push({
     id: 'env',
-    title: 'Environment',
+    title: 'Secrets',
     status: status(envOk, !envOk),
     code: envOk ? 'ENV_API_KEY_PRESENT_OR_NOT_REQUIRED' : 'ENV_API_KEY_MISSING',
-    details: { provider, keys_present: envFlags, model_from: modelSel ? 'config/env' : (provider ? 'fallback' : 'unspecified') },
-    next: envOk ? [] : ['Set an API key for your chosen provider, e.g. OPENAI_API_KEY.']
+    details: { provider, secrets_present: secretsFlags, model_from: modelSel ? 'config/env' : (provider ? 'fallback' : 'unspecified') },
+    next: envOk ? [] : ['Open the Arcana secrets UI and bind ' + secretNameForNext + ' for your chosen provider.']
   });
-
   const modelOk = !!model;
   const modelLabel = model ? (model.provider + ':' + model.id + (model.baseUrl ? (' @ ' + model.baseUrl) : '')) : '';
   checks.push({
@@ -182,4 +195,3 @@ export function printDoctor(result){
 }
 
 export default { runDoctor, printDoctor };
-

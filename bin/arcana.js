@@ -44,7 +44,7 @@ Usage:
   arcana gateway serve [--port <n>]     # run gateway v2 HTTP+WS server
 
 Env:
-  OPENAI_API_KEY (or /login in interactive modes)
+  Use the Secrets UI to bind providers/<provider>/api_key (for example providers/openai/api_key).
 `;
 
 function error(msg){ console.error('[arcana]', msg); process.exit(1); }
@@ -81,7 +81,7 @@ async function chat(){
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   async function loop(){
-    await new Promise((resolve)=> rl.question('> ', async (line)=>{ try { await session.prompt(line); } catch(e){ console.error('[arcana]', e?.message||e); } resolve(); }));
+    await new Promise((resolve)=> rl.question('> ', async (line)=>{ try { await session.prompt(line); } catch(e){ try{ console.error('[arcana]', e?.stack||e?.message||e); } catch{} } resolve(); }));
     return loop();
   }
   await loop();
@@ -118,7 +118,7 @@ async function main(){
   return console.log(HELP);
 }
 
-main().catch((e)=>{ console.error('[arcana] failed:', e?.message||e); process.exit(1); });
+main().catch((e)=>{ try{ console.error('[arcana] failed:', e?.stack||e?.message||e); } catch{ console.error('[arcana] failed'); } process.exit(1); });
 
 async function livestreamCLI({ args }){
   const [, , sub, ...rest] = args;
@@ -407,7 +407,7 @@ async function chat2(){
   async function runPrompt(line){
     inFlight = true;
     try { await session.prompt(line); }
-    catch(e){ console.error('[arcana]', e?.message||e); }
+    catch(e){ try{ console.error('[arcana]', e?.stack||e?.message||e); } catch{} }
     finally { inFlight = false; if (queue.length){ const next = queue.shift(); runPrompt(next); } }
   }
 

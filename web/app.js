@@ -1074,6 +1074,67 @@ function ensureBubbleParts(bubble){
   return parts;
 }
 
+// Client-side MEDIA: helpers (mirror server/server.mjs behavior)
+function normalizeMediaRef(raw){
+  if (!raw) return '';
+  let s = String(raw).trim();
+  if (!s) return '';
+  const mdMatch = s.match(/^\[[^\]]*]\(([^)]+)\)/);
+  if (mdMatch && mdMatch[1]){
+    s = mdMatch[1].trim();
+  } else {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if (!(first && first === last && (first === '"' || first === '\'' || first === '`'))){
+      s = s.split(/\s+/)[0];
+    }
+  }
+  const strip = new Set(["'", '"', '`', '(', ')', '[', ']', '<', '>', ',', ';']);
+  while (s.length && strip.has(s[0])){
+    s = s.slice(1).trimStart();
+  }
+  while (s.length && strip.has(s[s.length - 1])){
+    s = s.slice(0, -1).trimEnd();
+  }
+  while (s.length && strip.has(s[0])){
+    s = s.slice(1).trimStart();
+  }
+  while (s.length && strip.has(s[s.length - 1])){
+    s = s.slice(0, -1).trimEnd();
+  }
+  return s;
+}
+
+function extractMediaFromAssistantText(text){
+  const mediaRefs = [];
+  if (!text) return { text: '', mediaRefs };
+  const lines = String(text || '').split(/\r?\n/);
+  let inFence = false;
+  const outLines = [];
+  for (const line of lines){
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')){
+      const count = (line.match(/```/g) || []).length;
+      if (count % 2 === 1) inFence = !inFence;
+      outLines.push(line);
+      continue;
+    }
+    if (inFence){
+      outLines.push(line);
+      continue;
+    }
+    if (trimmed.startsWith('MEDIA:')){
+      const idx = line.indexOf('MEDIA:');
+      const raw = idx >= 0 ? line.slice(idx + 6) : '';
+      const ref = normalizeMediaRef(raw);
+      if (ref) mediaRefs.push(ref);
+      continue;
+    }
+    outLines.push(line);
+  }
+  return { text: outLines.join('\n'), mediaRefs };
+}
+
 // Backward‑compatible helper used by non‑SSE UI bits (config/doctor/etc).
 function appendLog(txt){ addLogLine(getCurrentSessionId() || '', 'main', String(txt||'')); }
 
@@ -1112,6 +1173,86 @@ try {
 
 function qs(id){ return document.getElementById(id); }
 
+// --- Full Shell (policy=open) persistence + UI ---
+// Storage keys
+const FULLSHELL_LS_PREFIX = 'arcana.fullshell.v1:'; // format: arcana.fullshell.v1:<agentId>:<sessionId>
+const FULLSHELL_PENDING_SS = 'arcana.fullshell.pending.v1'; // sessionStorage flag when no session yet
+
+function fullshellKey(agentId, sessionId){
+  try{ return FULLSHELL_LS_PREFIX + String(agentId || DEFAULT_AGENT_ID) + ':' + String(sessionId || ''); } catch { return FULLSHELL_LS_PREFIX + (agentId || DEFAULT_AGENT_ID) + ':' + (sessionId || '') }
+}
+
+function loadFullshellPolicy(agentId, sessionId){
+  try{
+    if (typeof localStorage === 'undefined') return null;
+    const key = fullshellKey(agentId, sessionId);
+    const v = localStorage.getItem(key);
+    if (v == null) return null;
+    return (v === '1' || v === 'true' || v === 'open');
+  } catch { return null }
+}
+
+function saveFullshellPolicy(agentId, sessionId, checked){
+  try{
+    if (typeof localStorage === 'undefined') return;
+    const key = fullshellKey(agentId, sessionId);
+    localStorage.setItem(key, checked ? '1' : '0');
+  } catch(e){ try{ warnStorageQuota(); } catch{} }
+}
+
+function getPendingFullshell(){
+  try{
+    if (typeof sessionStorage === 'undefined') return null;
+    const v = sessionStorage.getItem(FULLSHELL_PENDING_SS);
+    if (v == null) return null;
+    return (v === '1' || v === 'true' || v === 'open');
+  } catch { return null }
+}
+
+function setPendingFullshell(checked){
+  try{ if (typeof sessionStorage !== 'undefined') sessionStorage.setItem(FULLSHELL_PENDING_SS, checked ? '1' : '0'); } catch {}
+}
+
+function clearPendingFullshell(){
+  try{ if (typeof sessionStorage !== 'undefined') sessionStorage.removeItem(FULLSHELL_PENDING_SS); } catch {}
+}
+
+function applyFullshellUi(checked){
+  try{ document.body && document.body.classList && document.body.classList.toggle('fullshell-open', !!checked); } catch {}
+}
+
+function persistPendingFullshellFor(sessionId, agentId){
+  try{
+    const sid = String(sessionId || ''); if (!sid) return;
+    const fallbackAid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const aid = String(agentId || fallbackAid || DEFAULT_AGENT_ID);
+    const pending = getPendingFullshell();
+    if (pending == null) return;
+    saveFullshellPolicy(aid, sid, !!pending);
+    clearPendingFullshell();
+    const el = qs('fullshell'); if (el) el.checked = !!pending;
+    applyFullshellUi(!!pending);
+  } catch {}
+}
+
+// Wire checkbox change handler
+try{
+  const cb = qs('fullshell');
+  if (cb && cb.addEventListener){
+    cb.addEventListener('change', ()=>{
+      try{
+        const checked = !!cb.checked;
+        applyFullshellUi(checked);
+        let sid = '';
+        try{ sid = getCurrentSessionId() || currentId || ''; } catch {}
+        const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+        if (sid){ saveFullshellPolicy(aid, sid, checked); }
+        else { setPendingFullshell(checked); }
+      } catch {}
+    });
+  }
+} catch {}
+
 async function loadTimerSettingsUI(){
   try{
     const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
@@ -1143,6 +1284,8 @@ async function loadConfigUI(){
     if (qs('cfg-model-global')) qs('cfg-model-global').value = globalCfg.model || '';
     if (qs('cfg-base-url-global')) qs('cfg-base-url-global').value = globalCfg.base_url || '';
     if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? '已设置' : '未设置';
+    // Update default (global) model label cache
+    try { __setCachedModelLabel(DEFAULT_AGENT_ID, globalCfg); } catch {}
 
     // Current agent override config
     try{
@@ -1153,6 +1296,8 @@ async function loadConfigUI(){
       const agentCfg = await r2.json();
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = agentCfg.provider || '';
       if (qs('cfg-model-agent')) qs('cfg-model-agent').value = agentCfg.model || '';
+      // Update per-agent model label cache
+      try { __setCachedModelLabel(aid, agentCfg); } catch {}
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = agentCfg.base_url || '';
       if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? '已设置' : '未设置';
     }catch(e){
@@ -1162,6 +1307,8 @@ async function loadConfigUI(){
       if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = '未设置';
       appendLog('[config] 读取 Agent 配置失败');
     }
+    // Best-effort: refresh live info model label immediately
+    try { if (currentId) renderLiveInfoFor(currentId); } catch {}
   }catch(e){ appendLog('[config] 读取失败'); }
 }
 
@@ -1179,6 +1326,7 @@ async function saveGlobalConfigUI(){
     if (!r.ok || !j.ok){ appendLog('[config] 保存全局配置失败'); return; }
     if (qs('cfg-key-global')) qs('cfg-key-global').value = '';
     await loadConfigUI();
+    try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     appendLog('[config] 已保存全局配置');
   }catch(e){ appendLog('[config] 保存全局配置失败'); }
 }
@@ -1198,6 +1346,7 @@ async function saveAgentConfigUI(){
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 保存 Agent 配置失败'); return; }
     if (qs('cfg-key-agent')) qs('cfg-key-agent').value = '';
+    try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     await loadConfigUI();
     appendLog('[config] 已保存 Agent 配置');
   }catch(e){ appendLog('[config] 保存 Agent 配置失败'); }
@@ -1210,6 +1359,7 @@ async function clearAgentConfigUI(){
     const r = await fetch('/api/agent-config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 清除 Agent 配置失败'); return; }
+    try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     if (qs('cfg-key-agent')) qs('cfg-key-agent').value = '';
     await loadConfigUI();
     appendLog('[config] 已清除 Agent 配置');
@@ -1299,6 +1449,43 @@ let hasAgents = false;
 let currentWorkspace = '';
 
 // Live Info backing state: global + per-session
+// Per-agent model label cache (from config UI fetches)
+// Keyed by agentId; use DEFAULT_AGENT_ID for global default.
+const __modelLabelByAgent = new Map();
+
+function __formatModelLabelFromConfig(cfg){
+  try{
+    const provider = String((cfg && cfg.provider) || '').trim();
+    const model = String((cfg && cfg.model) || '').trim();
+    const base = String((cfg && (cfg.base_url || cfg.baseUrl)) || '').trim();
+    const isEmpty = !provider && !model && !base;
+    if (isEmpty) return '<auto>';
+    let head = '';
+    if (provider && model) head = provider + ':' + model;
+    else if (provider) head = provider;
+    else if (model) head = model;
+    else head = '<auto>';
+    if (base) head += ' @ ' + base;
+    return head;
+  } catch { return '<auto>' }
+}
+
+function __setCachedModelLabel(agentId, cfg){
+  try{
+    const aid = String(agentId || DEFAULT_AGENT_ID);
+    const label = __formatModelLabelFromConfig(cfg||{});
+    __modelLabelByAgent.set(aid, label);
+  } catch {}
+}
+
+function __getCachedModelLabel(agentId){
+  try{
+    const aid = String(agentId || DEFAULT_AGENT_ID);
+    const v = __modelLabelByAgent.get(aid);
+    return (typeof v === 'string') ? v : '';
+  } catch { return '' }
+}
+
 const globalLiveInfo = {
   model: '',
   tools: [],
@@ -1470,6 +1657,7 @@ async function setCurrentAgent(id){
   } catch {}
 
   if (!hasAgents){
+  try { if (currentId) renderLiveInfoFor(currentId); } catch {}
   requestRefreshList();
     return;
   }
@@ -1691,6 +1879,26 @@ async function openSession(id){
   setCurrent(id);
   renderMessages([]); // clear
   const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+  // Restore fullshell policy for this session (or pending fallback)
+  try{
+    const cb = qs('fullshell');
+    const stored = loadFullshellPolicy(aid, id);
+    if (stored !== null){
+      if (cb) cb.checked = !!stored;
+      applyFullshellUi(!!stored);
+    } else {
+      const pend = getPendingFullshell();
+      if (pend !== null){
+        if (cb) cb.checked = !!pend;
+        applyFullshellUi(!!pend);
+        clearPendingFullshell();
+        saveFullshellPolicy(aid, id, !!pend);
+      } else {
+        if (cb) cb.checked = false;
+        applyFullshellUi(false);
+      }
+    }
+  } catch {}
   const obj = await loadSession(id, aid);
   try {
     if (obj && obj.updatedAt){
@@ -1728,10 +1936,54 @@ async function openSession(id){
 function renderMessages(msgs){
   messages.innerHTML = '';
   for (const m of (msgs||[])){
-    const isHb = m.role === 'assistant' && typeof m.text === 'string' && m.text.startsWith('[heartbeat]');
-    const displayText = isHb ? '💓 ' + m.text.replace(/^\[heartbeat\]\n\n?/, '') : m.text;
-    const bubble = appendMessage(m.role, displayText);
-    if (isHb && bubble) bubble.classList.add('heartbeat-msg');
+    const role = (m && m.role) ? m.role : '';
+    const rawText = (m && typeof m.text === 'string') ? m.text : '';
+    if (role === 'assistant'){
+      const isHb = rawText.startsWith('[heartbeat]');
+      let body = rawText;
+      if (isHb){
+        const p1 = '[heartbeat]\n\n';
+        const p2 = '[heartbeat]\n';
+        if (body.startsWith(p1)) body = body.slice(p1.length);
+        else if (body.startsWith(p2)) body = body.slice(p2.length);
+      }
+      const extracted = extractMediaFromAssistantText(body);
+      const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+      const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+      const displayText = isHb ? '💓 ' + cleanText : cleanText;
+      const bubble = appendMessage('assistant', displayText);
+      if (isHb && bubble) bubble.classList.add('heartbeat-msg');
+      if (bubble && mediaRefs.length){
+        const parts = ensureBubbleParts(bubble) || {};
+        const mediaEl = parts.media || bubble;
+        let sidCurrent = '';
+        try{
+          const sidFn = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId : null;
+          const sid = sidFn ? sidFn() : (currentId || '');
+          sidCurrent = String(sid || '');
+        } catch{}
+        for (const refRaw of mediaRefs){
+          const ref = String(refRaw || '').trim();
+          if (!ref) continue;
+          const lower = ref.toLowerCase();
+          let src = ref;
+          if (!(lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:'))){
+            const pathParam = encodeURIComponent(ref);
+            const sidParam = sidCurrent ? '&sessionId=' + encodeURIComponent(sidCurrent) : '';
+            src = '/api/local-file?path=' + pathParam + sidParam;
+          }
+          const img = document.createElement('img');
+          img.src = src;
+          img.style.maxWidth = '100%';
+          img.style.borderRadius = '6px';
+          img.style.display = 'block';
+          img.style.marginTop = '8px';
+          mediaEl.appendChild(img);
+        }
+      }
+    } else {
+      appendMessage(role || 'user', rawText);
+    }
   }
   messages.scrollTop = messages.scrollHeight;
 }
@@ -1782,6 +2034,8 @@ async function ensureSession(){
   if (hasAgents && currentAgentId){
     const created = await createSession('新会话', '', currentAgentId);
     setCurrent(created.id);
+    // If the user toggled before a session existed, persist pending now
+    try{ persistPendingFullshellFor(created.id, currentAgentId || DEFAULT_AGENT_ID); } catch {}
     currentWorkspace = String(created.workspace || '');
     await refreshList();
     return currentId;
@@ -1790,6 +2044,8 @@ async function ensureSession(){
   if (!ws){ appendLog('[sessions] 未选择工作区'); throw new Error('workspace_required') }
   const created = await createSession('新会话', ws);
   setCurrent(created.id);
+  // Persist pending fullshell for this newly created session
+  try{ persistPendingFullshellFor(created.id, DEFAULT_AGENT_ID); } catch {}
   currentWorkspace = String(created.workspace || ws || '');
   await refreshList();
   return currentId;
@@ -1821,8 +2077,24 @@ async function sendWithSession(){
       if (ws) payload.workspace = ws;
     }
     const r = await fetch('/api/chat2', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
-    const j = await r.json();
-    if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = j.text || '[无响应]'; }
+    let j = null; try { j = await r.json(); } catch {}
+    if (!r.ok){
+      const parts = [];
+      let head = '';
+      try { head = (j && (j.message || j.error)) ? String(j.message || j.error) : ''; } catch { head = ''; }
+      if (!head) head = 'HTTP ' + (r.status || '?');
+      parts.push(head);
+      try { if (j && typeof j.stack === 'string' && j.stack) parts.push(String(j.stack)); } catch {}
+      const text = parts.join('\n');
+      if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){
+        setTyping(activeAssistant, false);
+        activeAssistant.textContent = text;
+      }
+      // Also log the server error for visibility in the logs panel
+      try{ logMain(sidAtSend, text.startsWith('[error]') ? text : ('[error] ' + text)); } catch{}
+      return;
+    }
+    if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = (j && j.text) || '[无响应]'; }
     if (getCurrentSessionId() === sidAtSend || currentId === sidAtSend){
       await openSession(sidAtSend);
     } else {
@@ -1989,6 +2261,21 @@ function setupGatewayV2WebSocket(){
 function handleGatewayV2Envelope(payload){
   try{
     if (!payload || typeof payload !== 'object') return;
+    // Top-level gateway v2 error events
+    if (payload.type === 'turn.error' || payload.type === 'scheduler.wake_error'){
+      const a = String(payload.agentId || (hasAgents && currentAgentId) || DEFAULT_AGENT_ID);
+      const s = String(payload.sessionKey || '');
+      const curAgent = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+      const expectedKey = gatewayV2SessionKey || ensureGatewayV2SessionKey();
+      if (a !== curAgent) return;
+      if (s && expectedKey && s !== expectedKey) return;
+      const err = (typeof payload.error === 'string' && payload.error) ? payload.error : (typeof payload.message === 'string' ? payload.message : 'error');
+      const st = (typeof payload.errorStack === 'string' && payload.errorStack) ? payload.errorStack : (typeof payload.stack === 'string' ? payload.stack : '');
+      const sid = getCurrentSessionId() || currentId || '';
+      const text = '[error] ' + String(err || 'error') + (st ? ('\n' + String(st)) : '');
+      logMain(sid, text);
+      return;
+    }
     if (payload.type === 'event.appended'){
       const ev = payload.event;
       if (!ev || typeof ev !== 'object') return;
@@ -2017,6 +2304,15 @@ function handleGatewayV2Envelope(payload){
           bubble.textContent = text;
         }
         messages.scrollTop = messages.scrollHeight;
+        return;
+      }
+      if (evType === 'turn.error' || evType === 'scheduler.wake_error'){
+        const d = ev.data || {};
+        const err = (typeof d.error === 'string' && d.error) ? d.error : (typeof d.message === 'string' ? d.message : 'error');
+        const st = (typeof d.errorStack === 'string' && d.errorStack) ? d.errorStack : (typeof d.stack === 'string' ? d.stack : '');
+        const sid = getCurrentSessionId() || currentId || '';
+        const msg = '[error] ' + String(err || 'error') + (st ? ('\n' + String(st)) : '');
+        logMain(sid, msg);
         return;
       }
       if (evType === 'message'){
@@ -2135,9 +2431,9 @@ function setupSseConnection(){
 
       // Logs panel + lifecycle
       const sid = data.sessionId || currentId;
-            if (data.type === 'open_vault'){
-        try { openVault(Array.isArray(data.names) ? data.names : []).catch(()=>{}) } catch {}
-        logMain(sid, 'open vault' + (Array.isArray(data.names) && data.names.length ? (': ' + data.names.join(', ')) : ''));
+            if (data.type === 'open_vault' || data.type === 'open_secrets'){
+        try { openSecrets(Array.isArray(data.names) ? data.names : []).catch(()=>{}) } catch {}
+        logMain(sid, 'open secrets' + (Array.isArray(data.names) && data.names.length ? (': ' + data.names.join(', ')) : ''));
         return;
       }
       try { const em = (data && data.message && data.message.errorMessage) ? String(data.message.errorMessage) : null; if (em) { logMain(sid, '[error] ' + em); } } catch {}
@@ -2158,7 +2454,12 @@ function setupSseConnection(){
         return;
       }
       if (data.type === 'error'){
-        try { if (data.message) logMain(sid, '[error] ' + data.message); } catch {}
+        try {
+          const msg = typeof data.message === 'string' ? data.message : '';
+          if (data.stack){ logMain(sid, (msg || '[error]') + '\n' + String(data.stack)); }
+          else if (msg){ logMain(sid, '[error] ' + msg); }
+          else { logMain(sid, '[error]'); }
+        } catch {}
         return;
       }
       if (data.type === 'turn_start'){
@@ -2318,11 +2619,7 @@ function setupSseConnection(){
         } catch {}
         return;
       }
-      if (data.type === 'env_refresh'){
-        try { appendLog('[vault] 已刷新环境变量'); } catch {}
-        return;
-      }
-      if (data.type === 'tool_execution_update'){
+            if (data.type === 'tool_execution_update'){
         const raw = (typeof data.partialResult !== 'undefined') ? data.partialResult : data.update;
         const info = formatToolUpdateInfo(raw);
         try { upsertToolAction(data); } catch {}
@@ -2671,7 +2968,22 @@ function renderLiveInfoFor(sessionId){
   try {
     const sid = String(sessionId || '');
     const snap = sid ? ensureLiveForSession(sid) : null;
-    LI.model = globalLiveInfo.model || '';
+
+    // Prefer per-session label; treat cached '<auto>' as empty to avoid overriding richer server info.
+    const selAgent = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    let cachedSel = __getCachedModelLabel(selAgent);
+    if (cachedSel === '<auto>') cachedSel = '';
+    let cachedDef = __getCachedModelLabel(DEFAULT_AGENT_ID);
+    if (cachedDef === '<auto>') cachedDef = '';
+
+    let modelLabel = '';
+    if (snap && typeof snap.model === 'string' && snap.model) modelLabel = String(snap.model);
+    else if (cachedSel) modelLabel = cachedSel;
+    else if (cachedDef) modelLabel = cachedDef;
+    else if (globalLiveInfo.model) modelLabel = String(globalLiveInfo.model);
+    // Final fallback should show '<auto>' if everything is empty.
+    LI.model = modelLabel || '<auto>';
+
     LI.workspace = (snap && snap.workspace) || globalLiveInfo.workspace || '';
     LI.tools = (snap && Array.isArray(snap.tools)) ? snap.tools.slice() : (globalLiveInfo.tools || []);
     LI.skills = (snap && Array.isArray(snap.skills)) ? snap.skills.slice() : (globalLiveInfo.skills || []);
@@ -2692,442 +3004,256 @@ function renderLiveInfo(){
 }
 
 // --- Vault (Env) UI ---
-let VAULT_PASSPHRASE_CACHE = '';
 
-function buildVaultRow(v, globalVault, agentVault, section){
-  const tr = document.createElement('div');
-  tr.className = 'vault-row';
-  tr.style.cssText = 'display:grid;grid-template-columns: 180px 1fr 90px;gap:8px;align-items:center;margin:4px 0;';
-  const name = String(v && v.name || '');
-  const has = !!(v && v.hasValue);
-  const storedGlobal = !!(v && v.storedGlobal);
-  const storedAgent = !!(v && v.storedAgent);
-  const gEncrypted = !!(globalVault && globalVault.encrypted);
-  const gLocked = !!(globalVault && globalVault.locked);
-  const aEncrypted = !!(agentVault && agentVault.encrypted);
-  const aLocked = !!(agentVault && agentVault.locked);
-  const isGlobalRow = section === 'global';
-  const storedHere = isGlobalRow ? storedGlobal : storedAgent;
-  const encryptedHere = isGlobalRow ? gEncrypted : aEncrypted;
-  const lockedHere = isGlobalRow ? gLocked : aLocked;
-
-  const nameEl = document.createElement('div');
-  nameEl.textContent = name || '(未命名)';
-  nameEl.style.cssText = 'font-family:monospace;font-size:12px;word-break:break-all;';
-
-  const valWrap = document.createElement('div');
-  const input = document.createElement('input');
-  input.type = 'password';
-  input.placeholder = has ? '已设置（留空保持不变）' : '未设置（输入新值）';
-  input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px;border:1px solid #ddd;border-radius:6px;';
-
-  const extra = document.createElement('div');
-  extra.style.cssText = 'display:flex;gap:6px;align-items:center;';
-  const clear = document.createElement('input'); clear.type = 'checkbox'; clear.id = 'clear-' + name + '-' + (isGlobalRow ? 'global' : 'agent'); clear.dataset.kind = 'clear';
-  const clearLbl = document.createElement('label'); clearLbl.htmlFor = clear.id; clearLbl.textContent = '清除'; clearLbl.style.fontSize = '12px';
-  clear.addEventListener('change', ()=>{ input.disabled = clear.checked; if (clear.checked) input.value = ''; });
-  extra.appendChild(clear); extra.appendChild(clearLbl);
-
-  valWrap.appendChild(input);
-  valWrap.appendChild(extra);
-
-  const status = document.createElement('div');
-  let statusText = '';
-  let statusColor = '';
-  const storedAny = storedHere;
-  const lockedSome = storedHere && encryptedHere && lockedHere;
-  if (has && storedHere){
-    statusText = '已设置';
-    statusColor = '#0a0';
-  } else if (storedAny && lockedSome){
-    statusText = '已保存(需解锁)';
-    statusColor = '#b58900';
-  } else if (storedAny){
-    statusText = '已保存';
-    statusColor = '#666';
-  } else {
-    statusText = '未设置';
-    statusColor = '#a00';
-  }
-  status.textContent = statusText;
-  status.style.cssText='font-size:12px;color:' + statusColor;
-
-  tr.appendChild(nameEl);
-  tr.appendChild(valWrap);
-  tr.appendChild(status);
-
-  tr.dataset.varName = name;
-  tr.dataset.storedGlobal = storedGlobal ? '1' : '0';
-  tr.dataset.storedAgent = storedAgent ? '1' : '0';
-  tr.dataset.section = isGlobalRow ? 'global' : 'agent';
-  tr.querySelector = tr.querySelector.bind(tr);
-  return tr;
-}
-
-async function openVault(){
+async function openSecrets(){
   const overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:10000;';
   const dialog = document.createElement('div');
-  dialog.style.cssText = 'width:720px;max-width:95vw;max-height:90vh;overflow:auto;background:#fff;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.25);padding:14px;';
-  dialog.innerHTML =
-    '<div style="display:flex;align-items:center;gap:8px;">' +
-    '<div style="font-weight:600;font-size:15px;">密码箱（环境变量）</div>' +
-    '<div id="vault-sub" style="font-size:12px;color:#666;">加载中…</div>' +
-    '<div style="margin-left:auto;"><button id="vault-close">×</button></div>' +
-    '</div>' +
-    '<div id="vault-body" style="margin-top:8px;"></div>' +
-    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">' +
-    '  <button id="vault-cancel">取消</button>' +
-    '  <button id="vault-save">保存</button>' +
-    '</div>';
-  overlay.appendChild(dialog); document.body.appendChild(overlay);
-
+  dialog.style.cssText = 'width:640px;max-width:95vw;max-height:90vh;overflow:auto;background:#fff;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.25);padding:14px;';
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
   function close(){ try { document.body.removeChild(overlay); } catch {} }
 
-  async function postVaultEnv(payload){
-    const resp = await fetch('/api/env', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify(payload) });
-    if (!resp.ok){
-      if (resp.status === 423){ appendLog('[vault] 已加密且锁定：请输入口令再保存/解锁'); return false; }
-      if (resp.status === 403){ appendLog('[vault] 口令不正确'); return false; }
-      appendLog('[vault] 保存失败'); return false; }
-    const j = await resp.json();
-    if (!j || j.ok !== true){ appendLog('[vault] 保存失败'); return false; }
-    return true;
-  }
-
-  try { dialog.querySelector('#vault-close').addEventListener('click', close) } catch {}
-  try { dialog.querySelector('#vault-cancel').addEventListener('click', close) } catch {}
-
-  const bodyEl = dialog.querySelector('#vault-body');
-  bodyEl.innerHTML = '<div style="font-size:12px;color:#666;">加载中…</div>';
-  let vars = [];
-  let vaultGlobal = {};
-  let vaultAgent = {};
-  let inheritEffective = true;
-  let legacyMode = false;
   const agentId = currentAgentId || DEFAULT_AGENT_ID;
-  try {
-    const r = await fetch('/api/env?agentId=' + encodeURIComponent(agentId));
-    const j = await r.json();
-    const rawVars = Array.isArray(j && j.vars) ? j.vars : [];
-    const vMetaRaw = j && typeof j.vault === 'object' && j.vault ? j.vault : {};
-    const hasLayered = !!(vMetaRaw && typeof vMetaRaw.global === 'object' && vMetaRaw.global);
-    if (hasLayered){
-      legacyMode = false;
-      vars = rawVars;
-      const vMeta = vMetaRaw;
-      vaultGlobal = vMeta && typeof vMeta.global === 'object' && vMeta.global ? vMeta.global : {};
-      vaultAgent = vMeta && typeof vMeta.agent === 'object' && vMeta.agent ? vMeta.agent : {};
-      if (typeof vMeta.inheritGlobal === 'boolean') inheritEffective = vMeta.inheritGlobal;
-      else if (typeof vaultAgent.inheritGlobal === 'boolean') inheritEffective = vaultAgent.inheritGlobal;
-      else inheritEffective = true;
+
+  async function render(){
+    dialog.innerHTML = '<div style="font-size:12px;color:#666;">加载中…</div>';
+
+    let data;
+    try {
+      const r = await fetch('/api/secrets?agentId=' + encodeURIComponent(agentId));
+      data = await r.json();
+    } catch (e) {
+      dialog.innerHTML = '<div style="color:red;">加载失败: ' + String(e) + '</div><div style="margin-top:8px;"><button id="sec-close">关闭</button></div>';
+      dialog.querySelector('#sec-close').addEventListener('click', close);
+      return;
+    }
+
+    const bindings = (data && data.bindings && typeof data.bindings === 'object') ? data.bindings : {};
+    const wellKnown = Array.isArray(data && data.wellKnown) ? data.wellKnown : [];
+    const meta = (data && data.meta && typeof data.meta === 'object') ? data.meta : {};
+    const globalMeta = (meta.global && typeof meta.global === 'object') ? meta.global : {};
+    const initialized = !!globalMeta.initialized;
+    const locked = !!globalMeta.locked;
+
+    let html = '<div style="display:flex;align-items:center;gap:8px;">' +
+      '<div style="font-weight:600;font-size:15px;">🔐 密钥箱（Secrets）</div>' +
+      '<div id="sec-status" style="font-size:12px;color:#666;"></div>' +
+      '<div style="margin-left:auto;"><button id="sec-close-top">×</button></div>' +
+      '</div>';
+
+    if (!initialized) {
+      html += '<div style="margin-top:12px;background:#fff7e0;border-radius:8px;padding:12px;">' +
+        '<div style="font-size:13px;font-weight:600;color:#b58900;margin-bottom:8px;">⚠ 密钥箱尚未初始化</div>' +
+        '<div style="font-size:12px;color:#666;margin-bottom:8px;">首次使用需要设置口令。口令用于加密所有密钥，请牢记。</div>' +
+        '<div style="display:flex;gap:8px;align-items:center;">' +
+        '  <input id="sec-pass" type="password" placeholder="设置密钥箱口令" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px;" />' +
+        '  <button id="sec-init" style="padding:8px 16px;background:#2d7ff9;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;">初始化密钥箱</button>' +
+        '</div>' +
+        '</div>';
+    } else if (locked) {
+      html += '<div style="margin-top:12px;background:#f0f4ff;border-radius:8px;padding:12px;">' +
+        '<div style="font-size:13px;font-weight:600;color:#2d7ff9;margin-bottom:8px;">🔒 密钥箱已锁定</div>' +
+        '<div style="font-size:12px;color:#666;margin-bottom:8px;">输入口令解锁后才能查看或管理密钥。</div>' +
+        '<div style="display:flex;gap:8px;align-items:center;">' +
+        '  <input id="sec-pass" type="password" placeholder="输入密钥箱口令" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px;" />' +
+        '  <button id="sec-unlock" style="padding:8px 16px;background:#2d7ff9;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;">解锁</button>' +
+        '  <button id="sec-reset-locked" style="padding:8px 16px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;">重置密钥箱</button>' +
+        '</div>' +
+        '</div>';
     } else {
-      legacyMode = true;
-      vars = rawVars.map((v)=>({
-        name: v && v.name ? String(v.name) : '',
-        hasValue: !!(v && v.hasValue),
-        storedGlobal: !!(v && (v.storedGlobal || v.stored)),
-        storedAgent: false,
-      }));
-      vaultGlobal = (vMetaRaw && typeof vMetaRaw === 'object') ? vMetaRaw : {};
-      vaultAgent = {
-        path: '',
-        hasFile: false,
-        encrypted: false,
-        locked: false,
-        names: [],
-        inheritGlobal: true,
-      };
-      inheritEffective = true;
-    }
-  } catch {
-    bodyEl.innerHTML = '<div style="color:#a00;font-size:12px;">读取失败</div>';
-    return;
-  }
+      const names = Object.keys(bindings).sort();
+      const statusText = '已解锁 · ' + names.length + ' 个密钥';
 
-  try {
-    const subEl = dialog.querySelector('#vault-sub');
-    if (subEl){
-      function metaText(vm){
-        if (!vm || !vm.hasFile) return '未创建';
-        const encrypted = !!vm.encrypted;
-        const locked = !!vm.locked;
-        if (encrypted && locked) return '已加密·已锁定';
-        if (encrypted) return '已加密';
-        return '未加密';
-      }
-      let text = '';
-      if (legacyMode){
-        text += '后端: legacy(仅全局) · ';
-      }
-      text += '全局：' + metaText(vaultGlobal) + ' · 代理(' + (agentId || DEFAULT_AGENT_ID) + ')：' + metaText(vaultAgent);
-      if (vaultGlobal && vaultGlobal.path){ text += ' · 全局文件: ' + String(vaultGlobal.path); }
-      if (vaultAgent && vaultAgent.path){ text += ' · 代理文件: ' + String(vaultAgent.path); }
-      subEl.textContent = text;
-    }
-  } catch {}
+      html += '<div style="margin-top:12px;">' +
+        '<div style="font-size:12px;color:#27ae60;margin-bottom:8px;">🔓 ' + statusText + '</div>';
+      html += '<div style="margin:8px 0 12px 0;text-align:right;">' +
+        '<button id="sec-reset" style="padding:6px 10px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;">重置密钥箱</button>' +
+      '</div>';
 
-  bodyEl.innerHTML = '';
-  const container = document.createElement('div');
-  container.style.cssText = 'display:flex;flex-direction:column;gap:12px;';
-
-  const globalSection = document.createElement('div');
-  const globalHeader = document.createElement('div');
-  globalHeader.style.cssText = 'font-size:13px;font-weight:600;color:#333;margin-bottom:4px;';
-  globalHeader.textContent = '全局';
-  const globalList = document.createElement('div');
-  globalList.id = 'vault-list-global';
-  for (const v of vars){
-    if (v && v.storedGlobal){
-      globalList.appendChild(buildVaultRow(v, vaultGlobal, vaultAgent, 'global'));
-    }
-  }
-  if (vaultGlobal && vaultGlobal.hasFile && !globalList.querySelector('.vault-row')){
-    const warn = document.createElement('div');
-    warn.style.cssText = 'font-size:12px;color:#b58900;background:#fff7e0;border-radius:6px;padding:6px 8px;margin-top:4px;display:flex;align-items:center;justify-content:space-between;gap:8px;';
-    const msg = document.createElement('span');
-    msg.textContent = '检测到全局保险箱文件，但当前未显示任何变量，可能是已加密且锁定或旧版创建的文件。';
-    const btn = document.createElement('button');
-    btn.textContent = '解锁并加载已保存变量';
-    btn.addEventListener('click', async ()=>{
-      try {
-        const passEl = dialog.querySelector('#vault-passphrase');
-        const pass = String((passEl && passEl.value) || '').trim();
-        if (!pass){
-          appendLog('[vault] 请输入保险箱口令后再解锁');
-          if (passEl && typeof passEl.focus === 'function'){ try { passEl.focus(); } catch {} }
-          return;
+      if (names.length > 0) {
+        html += '<div style="font-size:12px;font-weight:600;color:#333;margin-bottom:4px;">已保存的密钥</div>';
+        html += '<div style="max-height:200px;overflow-y:auto;border:1px solid #e7e7e7;border-radius:6px;">';
+        for (const n of names) {
+          const b = bindings[n];
+          const scopeLabel = b.hasAgent ? '代理' : (b.hasGlobal ? '全局' : '');
+          const scopeColor = b.hasAgent ? '#8e44ad' : '#2d7ff9';
+          html += '<div class="sec-row" data-name="' + n + '" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid #f0f0f0;font-size:12px;">' +
+            '<span style="flex:1;font-family:monospace;color:#333;">' + n + '</span>' +
+            '<span style="font-size:11px;color:' + scopeColor + ';background:' + scopeColor + '20;padding:1px 6px;border-radius:4px;">' + scopeLabel + '</span>' +
+            '<label style="display:flex;align-items:center;gap:3px;cursor:pointer;color:#999;"><input type="checkbox" class="sec-del-check" data-name="' + n + '" data-scope="' + (b.hasAgent ? 'agent' : 'global') + '" /><span style="font-size:11px;">删除</span></label>' +
+            '</div>';
         }
-        const ok = await postVaultEnv({ scope:'global', set:{}, unset:[], passphrase: pass });
-        if (!ok) return;
-        appendLog('[vault] 已解锁全局变量');
-        close();
-        try { openVault().catch(()=>{}) } catch {}
-      } catch {
-        appendLog('[vault] 解锁失败');
+        html += '</div>';
+        html += '<div style="margin-top:6px;text-align:right;"><button id="sec-batch-delete" style="font-size:12px;padding:4px 12px;background:#e74c3c;color:#fff;border:none;border-radius:4px;cursor:pointer;">删除选中</button></div>';
+      } else {
+        html += '<div style="font-size:12px;color:#999;margin-bottom:8px;">暂无密钥，请在下方添加。</div>';
       }
-    });
-    warn.appendChild(msg);
-    warn.appendChild(btn);
-    globalList.appendChild(warn);
-  }
 
-  const addGlobal = document.createElement('div');
-  addGlobal.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px;';
-  addGlobal.innerHTML = 
-    '<span style="font-size:12px;color:#666;">新增全局变量</span>' +
-    '<input id="vault-new-global-name" placeholder="名称（仅限 ARCANA_* 或 *_API_KEY）" style="flex:0 0 280px;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
-    '<input id="vault-new-global-value" placeholder="值" type="password" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
-    '<button id="vault-add-global">添加</button>';
-  addGlobal.querySelector('#vault-add-global').addEventListener('click', ()=>{
-    const nInput = addGlobal.querySelector('#vault-new-global-name');
-    const vInput = addGlobal.querySelector('#vault-new-global-value');
-    const n = String((nInput||{}).value || '').trim();
-    const v = String((vInput||{}).value || '');
-    if (!n) return;
-    const row = buildVaultRow({ name:n, hasValue:false, storedGlobal:false, storedAgent:false }, vaultGlobal, vaultAgent, 'global');
-    const pwd = row.querySelector('input[type=password]');
-    if (pwd){ pwd.value = v; }
-    globalList.appendChild(row);
-    if (nInput) nInput.value = '';
-    if (vInput) vInput.value = '';
-  });
-
-  globalSection.appendChild(globalHeader);
-  globalSection.appendChild(globalList);
-  globalSection.appendChild(addGlobal);
-
-  const agentSection = document.createElement('div');
-  const agentHeader = document.createElement('div');
-  agentHeader.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:4px;';
-  const agentTitle = document.createElement('div');
-  agentTitle.style.cssText = 'font-size:13px;font-weight:600;color:#333;';
-  agentTitle.textContent = '代理';
-  const inheritWrap = document.createElement('div');
-  inheritWrap.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:12px;color:#666;';
-  inheritWrap.innerHTML = 
-    '<label style="display:flex;align-items:center;gap:4px;">' +
-    '  <input id="vault-inherit-global" type="checkbox" />' +
-    '  <span>继承全局密码</span>' +
-    '</label>' +
-    '<span style="margin-left:8px;color:#999;">仅作用于代理：' + String(agentId || DEFAULT_AGENT_ID) + '</span>';
-  const inheritBox = inheritWrap.querySelector('#vault-inherit-global');
-  if (inheritBox){ inheritBox.checked = !!inheritEffective; }
-  if (legacyMode){
-    inheritWrap.style.display = 'none';
-    inheritWrap.style.pointerEvents = 'none';
-    inheritWrap.style.opacity = '0.6';
-  }
-  agentHeader.appendChild(agentTitle);
-  agentHeader.appendChild(inheritWrap);
-
-  const agentList = document.createElement('div');
-  agentList.id = 'vault-list-agent';
-  if (legacyMode){
-    const info = document.createElement('div');
-    info.style.cssText = 'font-size:12px;color:#666;background:#f5f5f5;border-radius:6px;padding:6px 8px;margin-top:4px;';
-    info.textContent = '当前服务端不支持代理级密码箱；请重启/升级后端以启用。';
-    agentList.appendChild(info);
-  } else {
-    for (const v of vars){
-      if (v && v.storedAgent){
-        agentList.appendChild(buildVaultRow(v, vaultGlobal, vaultAgent, 'agent'));
+      html += '<div style="margin-top:12px;border-top:1px solid #e7e7e7;padding-top:12px;">' +
+        '<div style="font-size:12px;font-weight:600;color:#333;margin-bottom:6px;">添加密钥</div>' +
+        '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">' +
+        '  <input id="sec-add-name" list="sec-well-known" placeholder="密钥名称（如 services/aliyun/dashscope_api_key）" style="flex:1;min-width:200px;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:12px;font-family:monospace;" />' +
+        '  <datalist id="sec-well-known">';
+      for (const wk of wellKnown) {
+        html += '<option value="' + wk.name + '">';
       }
+      html += '</datalist>' +
+        '  <input id="sec-add-value" type="password" placeholder="密钥值" style="flex:1;min-width:150px;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:12px;" />' +
+        '  <select id="sec-add-scope" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:12px;">' +
+        '    <option value="global">全局</option>' +
+        '    <option value="agent">代理</option>' +
+        '  </select>' +
+        '  <button id="sec-add-btn" style="padding:6px 14px;background:#27ae60;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;">添加</button>' +
+        '</div>' +
+        '</div>';
+
+      html += '</div>';
     }
-    if (vaultAgent && vaultAgent.hasFile && !agentList.querySelector('.vault-row')){
-      const warn = document.createElement('div');
-      warn.style.cssText = 'font-size:12px;color:#b58900;background:#fff7e0;border-radius:6px;padding:6px 8px;margin-top:4px;display:flex;align-items:center;justify-content:space-between;gap:8px;';
-      const msg = document.createElement('span');
-      msg.textContent = '检测到代理保险箱文件，但当前未显示任何变量，可能是已加密且锁定或旧版创建的文件。';
-      const btn = document.createElement('button');
-      btn.textContent = '解锁并加载已保存变量';
-      btn.addEventListener('click', async ()=>{
+
+    html += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">' +
+      '<button id="sec-close-bottom">关闭</button>' +
+      '</div>';
+
+    dialog.innerHTML = html;
+
+    // Event listeners
+    try { dialog.querySelector('#sec-close-top').addEventListener('click', close); } catch {}
+    try { dialog.querySelector('#sec-close-bottom').addEventListener('click', close); } catch {}
+
+    // Init button
+    const initBtn = dialog.querySelector('#sec-init');
+    if (initBtn) {
+      initBtn.addEventListener('click', async () => {
+        const pass = String((dialog.querySelector('#sec-pass') || {}).value || '').trim();
+        if (!pass) { appendLog('[secrets] 请输入口令'); return; }
+        initBtn.disabled = true;
+        initBtn.textContent = '初始化中…';
         try {
-          const passEl = dialog.querySelector('#vault-passphrase');
-          const pass = String((passEl && passEl.value) || '').trim();
-          if (!pass){
-            appendLog('[vault] 请输入保险箱口令后再解锁');
-            if (passEl && typeof passEl.focus === 'function'){ try { passEl.focus(); } catch {} }
-            return;
+          const r = await fetch('/api/secrets/init', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: pass }) });
+          const j = await r.json();
+          if (!r.ok) {
+            const parts = [];
+            if (j && j.error) parts.push(String(j.error));
+            if (j && j.message) parts.push(String(j.message));
+            if (j && j.code) parts.push(String(j.code));
+            const msg = parts.length ? parts.join(' · ') : '未知错误';
+            appendLog('[secrets] 初始化失败: ' + msg);
+            initBtn.disabled = false; initBtn.textContent = '初始化密钥箱'; return;
           }
-          const payload = { scope:'agent', agentId, set:{}, unset:[], passphrase: pass };
-          const ok = await postVaultEnv(payload);
-          if (!ok) return;
-          appendLog('[vault] 已解锁代理变量');
-          close();
-          try { openVault().catch(()=>{}) } catch {}
-        } catch {
-          appendLog('[vault] 解锁失败');
+          appendLog('[secrets] 密钥箱初始化成功');
+          await render();
+        } catch (e) { appendLog('[secrets] 初始化失败: ' + e); initBtn.disabled = false; initBtn.textContent = '初始化密钥箱'; }
+      });
+    }
+
+    // Unlock button
+    const unlockBtn = dialog.querySelector('#sec-unlock');
+    if (unlockBtn) {
+      unlockBtn.addEventListener('click', async () => {
+        const pass = String((dialog.querySelector('#sec-pass') || {}).value || '').trim();
+        if (!pass) { appendLog('[secrets] 请输入口令'); return; }
+        unlockBtn.disabled = true;
+        unlockBtn.textContent = '解锁中…';
+        try {
+          const r = await fetch('/api/secrets/unlock', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: pass }) });
+          const j = await r.json();
+          if (r.status === 403) { appendLog('[secrets] 口令不正确'); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
+          if (r.status === 409) { appendLog('[secrets] 密钥箱未初始化'); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
+          if (!r.ok) { appendLog('[secrets] 解锁失败: ' + (j.error || j.message || '未知错误')); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
+          appendLog('[secrets] 已解锁');
+          await render();
+        } catch (e) { appendLog('[secrets] 解锁失败: ' + e); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; }
+      });
+    }
+
+    // Reset buttons (locked and unlocked states)
+    const resetBtn1 = dialog.querySelector('#sec-reset');
+    const resetBtn2 = dialog.querySelector('#sec-reset-locked');
+    const onReset = async () => {
+      try {
+        const step1 = prompt('危险操作：将永久删除所有密钥并清空记忆的口令。\n请输入大写 RESET 以确认:');
+        if (!step1 || step1.trim() !== 'RESET') { appendLog('[secrets] 已取消重置（未输入 RESET）'); return; }
+        if (!confirm('再次确认：是否重置密钥箱？该操作不可撤销。')) { appendLog('[secrets] 已取消重置'); return; }
+        const body = { agentId };
+        const r = await fetch('/api/secrets/reset', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        let j = null; try { j = await r.json(); } catch {}
+        if (!r.ok || !(j && j.ok)) { appendLog('[secrets] 重置失败'); return; }
+        appendLog('[secrets] 已重置密钥箱（全局: ' + (j.deleted && j.deleted.global ? '删除' : '无') + '，代理: ' + (j.deleted && j.deleted.agent ? '删除' : '无') + '）');
+        await render();
+      } catch (e) { appendLog('[secrets] 重置失败: ' + (((e && e.message) || e))); }
+    };
+    if (resetBtn1) resetBtn1.addEventListener('click', ()=>{ onReset().catch(()=>{}) });
+    if (resetBtn2) resetBtn2.addEventListener('click', ()=>{ onReset().catch(()=>{}) });
+
+    // Add secret button
+    const addBtn = dialog.querySelector('#sec-add-btn');
+    if (addBtn) {
+      addBtn.addEventListener('click', async () => {
+        const nameInput = dialog.querySelector('#sec-add-name');
+        const valueInput = dialog.querySelector('#sec-add-value');
+        const scopeSelect = dialog.querySelector('#sec-add-scope');
+        const name = String((nameInput || {}).value || '').trim();
+        const value = String((valueInput || {}).value || '');
+        const scope = String((scopeSelect || {}).value || 'global');
+        if (!name) { appendLog('[secrets] 请输入密钥名称'); return; }
+        if (!value) { appendLog('[secrets] 请输入密钥值'); return; }
+        addBtn.disabled = true;
+        addBtn.textContent = '添加中…';
+        try {
+          const r = await fetch('/api/secrets/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId, name, scope, value }) });
+          const j = await r.json();
+          if (r.status === 409) { appendLog('[secrets] 密钥箱未初始化'); addBtn.disabled = false; addBtn.textContent = '添加'; return; }
+          if (r.status === 423) { appendLog('[secrets] 密钥箱已锁定，请先解锁'); addBtn.disabled = false; addBtn.textContent = '添加'; return; }
+          if (!r.ok) { appendLog('[secrets] 添加失败: ' + (j.error || j.message || '未知错误')); addBtn.disabled = false; addBtn.textContent = '添加'; return; }
+          appendLog('[secrets] 已添加: ' + name);
+          await render();
+        } catch (e) { appendLog('[secrets] 添加失败: ' + e); addBtn.disabled = false; addBtn.textContent = '添加'; }
+      });
+    }
+
+    // Batch delete button
+    const delBtn = dialog.querySelector('#sec-batch-delete');
+    if (delBtn) {
+      delBtn.addEventListener('click', async () => {
+        const checks = dialog.querySelectorAll('.sec-del-check:checked');
+        if (!checks.length) { appendLog('[secrets] 未选中任何密钥'); return; }
+        const delBindings = {};
+        for (const c of checks) {
+          const n = c.dataset.name;
+          const s = c.dataset.scope || 'global';
+          delBindings[n] = { scope: s, delete: true };
+        }
+        delBtn.disabled = true;
+        delBtn.textContent = '删除中…';
+        try {
+          const r = await fetch('/api/secrets', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId, bindings: delBindings }) });
+          const j = await r.json();
+          if (!r.ok) { appendLog('[secrets] 删除失败: ' + (j.error || j.message || '未知错误')); delBtn.disabled = false; delBtn.textContent = '删除选中'; return; }
+          appendLog('[secrets] 已删除 ' + checks.length + ' 个密钥');
+          await render();
+        } catch (e) { appendLog('[secrets] 删除失败: ' + e); delBtn.disabled = false; delBtn.textContent = '删除选中'; }
+      });
+    }
+
+    // Enter key support for password inputs
+    const passInput = dialog.querySelector('#sec-pass');
+    if (passInput) {
+      passInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const btn = dialog.querySelector('#sec-init') || dialog.querySelector('#sec-unlock');
+          if (btn) btn.click();
         }
       });
-      warn.appendChild(msg);
-      warn.appendChild(btn);
-      agentList.appendChild(warn);
+      setTimeout(() => { try { passInput.focus(); } catch {} }, 100);
     }
   }
 
-  const addAgent = document.createElement('div');
-  addAgent.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:6px;';
-  if (!legacyMode){
-    addAgent.innerHTML = 
-      '<span style="font-size:12px;color:#666;">新增代理变量</span>' +
-      '<input id="vault-new-agent-name" placeholder="名称（仅限 ARCANA_* 或 *_API_KEY）" style="flex:0 0 280px;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
-      '<input id="vault-new-agent-value" placeholder="值" type="password" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
-      '<button id="vault-add-agent">添加</button>';
-    addAgent.querySelector('#vault-add-agent').addEventListener('click', ()=>{
-      const nInput = addAgent.querySelector('#vault-new-agent-name');
-      const vInput = addAgent.querySelector('#vault-new-agent-value');
-      const n = String((nInput||{}).value || '').trim();
-      const v = String((vInput||{}).value || '');
-      if (!n) return;
-      const row = buildVaultRow({ name:n, hasValue:false, storedGlobal:false, storedAgent:false }, vaultGlobal, vaultAgent, 'agent');
-      const pwd = row.querySelector('input[type=password]');
-      if (pwd){ pwd.value = v; }
-      agentList.appendChild(row);
-      if (nInput) nInput.value = '';
-      if (vInput) vInput.value = '';
-    });
-  } else {
-    addAgent.style.display = 'none';
-  }
-
-  agentSection.appendChild(agentHeader);
-  agentSection.appendChild(agentList);
-  if (!legacyMode) agentSection.appendChild(addAgent);
-
-  container.appendChild(globalSection);
-  container.appendChild(agentSection);
-
-  const passWrap = document.createElement('div');
-  passWrap.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:8px;font-size:12px;color:#666;';
-  passWrap.innerHTML = 
-    '<span style="flex:0 0 auto;">保险箱口令</span>' +
-    '<input id="vault-passphrase" type="password" placeholder="用于解锁/加密持久化文件" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;" />' +
-    '<label style="display:flex;align-items:center;gap:4px;flex:0 0 auto;">' +
-    '  <input id="vault-remember-pass" type="checkbox" />' +
-    '  <span>记住（本页会话）</span>' +
-    '</label>';
-  const passInput = passWrap.querySelector('#vault-passphrase');
-  if (passInput){ passInput.value = VAULT_PASSPHRASE_CACHE || ''; }
-
-  container.appendChild(passWrap);
-  bodyEl.appendChild(container);
-
-  dialog.querySelector('#vault-save').addEventListener('click', async ()=>{
-    try {
-      const globalListEl = dialog.querySelector('#vault-list-global');
-      const agentListEl = dialog.querySelector('#vault-list-agent');
-      const globalRows = globalListEl ? Array.from(globalListEl.querySelectorAll('.vault-row')) : [];
-      const agentRows = agentListEl ? Array.from(agentListEl.querySelectorAll('.vault-row')) : [];
-      const allRows = globalRows.concat(agentRows);
-
-      const setGlobal = {}; const unsetGlobal = [];
-      const setAgent = {}; const unsetAgent = [];
-      const clearAll = new Set();
-
-      for (const r of allRows){
-        const name = String(r.dataset.varName || '').trim(); if (!name) continue;
-        const clear = r.querySelector('input[type=checkbox][data-kind=clear]');
-        if (clear && clear.checked){
-          clearAll.add(name);
-        }
-      }
-
-      for (const name of clearAll){
-        unsetGlobal.push(name);
-        unsetAgent.push(name);
-      }
-
-      for (const r of globalRows){
-        const name = String(r.dataset.varName || '').trim(); if (!name) continue;
-        if (clearAll.has(name)) continue;
-        const val = r.querySelector('input[type=password]');
-        const v = String((val && val.value) || '');
-        if (!v) continue;
-        setGlobal[name] = v;
-      }
-
-      for (const r of agentRows){
-        const name = String(r.dataset.varName || '').trim(); if (!name) continue;
-        if (clearAll.has(name)) continue;
-        const val = r.querySelector('input[type=password]');
-        const v = String((val && val.value) || '');
-        if (!v) continue;
-        setAgent[name] = v;
-      }
-
-      const passEl = dialog.querySelector('#vault-passphrase');
-      const rememberEl = dialog.querySelector('#vault-remember-pass');
-      const pass = String((passEl && passEl.value) || '');
-      if (rememberEl && rememberEl.checked){
-        VAULT_PASSPHRASE_CACHE = pass;
-      } else {
-        VAULT_PASSPHRASE_CACHE = '';
-      }
-      const inheritEl = dialog.querySelector('#vault-inherit-global');
-      const inheritGlobal = inheritEl ? !!inheritEl.checked : true;
-
-      if (Object.keys(setGlobal).length || unsetGlobal.length){
-        const payloadGlobal = { scope:'global', set:setGlobal, unset:unsetGlobal };
-        if (pass) payloadGlobal.passphrase = pass;
-        const okGlobal = await postVaultEnv(payloadGlobal);
-        if (!okGlobal) return;
-      }
-
-      if (!legacyMode){
-        const payloadAgent = { scope:'agent', agentId, set:setAgent, unset:unsetAgent, inheritGlobal };
-        if (pass) payloadAgent.passphrase = pass;
-        const okAgent = await postVaultEnv(payloadAgent);
-        if (!okAgent) return;
-      }
-
-      appendLog('[vault] 已保存');
-      close();
-    } catch { appendLog('[vault] 保存失败'); }
-  });
+  await render();
 }
 
-try { (document.getElementById('cfg-vault')||{}).addEventListener('click', ()=>{ openVault().catch(()=>{}) }) } catch {}
+try { (document.getElementById('cfg-secrets')||{}).addEventListener('click', ()=>{ openSecrets().catch(()=>{}) }) } catch {}
 
 
 // Virtual LLM action per turn (no actual tool events)

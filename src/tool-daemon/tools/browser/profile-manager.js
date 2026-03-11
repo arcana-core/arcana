@@ -162,7 +162,15 @@ export class ProfileManager {
     args.push("--user-data-dir=" + String(userDataDir));
     args.push("--no-first-run");
     args.push("--no-default-browser-check");
+    const disableGpuEnv = String(process.env["ARCANA_BROWSER_DISABLE_GPU"] || "").trim().toLowerCase();
+    const useGpuStabilityFlags = !(disableGpuEnv === "0" || disableGpuEnv === "false");
     if (headless){ args.push("--headless=new"); }
+    if (headless && useGpuStabilityFlags){
+      args.push("--disable-gpu");
+      args.push("--disable-gpu-sandbox");
+      args.push("--disable-gpu-compositing");
+      args.push("--use-gl=swiftshader");
+    }
 
     const logPath = path.join(String(userDataDir), "chrome.log");
     let logFd = null;
@@ -255,6 +263,11 @@ export class ProfileManager {
       if (envPath && fs.existsSync(envPath)) return envPath;
     } catch {}
 
+    try {
+      const chromiumPath = chromium.executablePath();
+      if (chromiumPath && fs.existsSync(chromiumPath)) return chromiumPath;
+    } catch {}
+
     if (process.platform === "darwin"){
       const candidates = [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -268,8 +281,6 @@ export class ProfileManager {
         try { if (fs.existsSync(p)) return p; } catch {}
       }
     }
-
-    try { const p = chromium.executablePath(); if (p && fs.existsSync(p)) return p; } catch {}
     throw new Error("chromium_executable_not_found");
   }
 

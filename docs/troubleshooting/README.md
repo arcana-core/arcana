@@ -12,7 +12,7 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
   - Use one of: openai, anthropic, google, openrouter, xai
 
 - API key missing (ENV_API_KEY_MISSING)
-  - Export the key for your provider (e.g., OPENAI_API_KEY)
+- Open the Secrets UI and bind providers/<provider>/api_key for your chosen provider（例如在 Secrets 区域为 providers/openai/api_key 保存 API Key，值会加密写入内部密码箱）。
 
 - Model unresolved (MODEL_UNAVAILABLE)
   - Check provider+model or set ARCANA_MODEL; for OpenAI try gpt-4o-mini

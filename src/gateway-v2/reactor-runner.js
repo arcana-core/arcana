@@ -48,6 +48,18 @@ function computeNextLastSeenTs(events, lastSeenTs){
   return maxTs > lastSeenTs ? maxTs : lastSeenTs;
 }
 
+function computeBackoffMs(errorCount){
+  const base = 2000; // 2s
+  const cap = 60000; // 60s
+  const n = Number(errorCount || 0);
+  const pow = n > 0 ? Math.pow(2, Math.max(0, n - 1)) : 0;
+  const raw = Math.min(cap, base * (pow || 1));
+  const jitter = 0.2 * raw; // +/-20%
+  const delta = (Math.random() * 2 * jitter) - jitter;
+  const v = Math.max(0, Math.round(raw + delta));
+  return v;
+}
+
 async function updateReactorState({ agentId, sessionKey, state, lastSeenTs, sessionId }){
   const aId = agentId || 'default';
   const sKey = sessionKey || 'session';
@@ -128,7 +140,31 @@ export const reactorRunner = {
     const sessionId = result && result.sessionId;
     const assistantText = result && result.assistantText ? String(result.assistantText || '') : '';
 
-    await updateReactorState({ agentId, sessionKey, state, lastSeenTs: newLastSeenTs, sessionId });
+    // Decide whether to advance lastSeenTs based on run result
+    const ranOk = !!(result && result.ok);
+    const advanceLastSeen = ranOk; // do NOT advance on error
+    const nextLastSeenTs = advanceLastSeen ? newLastSeenTs : lastSeenTs;
+
+    // Persist reactor state with error tracking and lastSeenTs/sessionId
+    const prevErrorCount = Number(state && state.value && state.value.errorCount || 0) || 0;
+    const newErrorCount = ranOk ? 0 : (prevErrorCount + 1);
+    const now = nowMs();
+    try {
+      await patchState({
+        agentId,
+        sessionKey,
+        scope: 'reactor',
+        expectedVersion: state.version,
+        mutator: (value) => ({
+          ...(value || {}),
+          lastSeenTs: nextLastSeenTs,
+          sessionId: sessionId != null ? sessionId : ((value && value.sessionId) || null),
+          lastRunAtMs: now,
+          errorCount: newErrorCount,
+          lastErrorAtMs: ranOk ? null : now,
+        }),
+      });
+    } catch {}
 
     const outputs = [];
     if (assistantText){
@@ -142,19 +178,23 @@ export const reactorRunner = {
 
     let nextWakeDelayMs = null;
     try {
-      const ranOk = !!(result && result.ok);
-      if (!assistantText && ranOk){
+      if (!ranOk){
+        nextWakeDelayMs = computeBackoffMs(newErrorCount);
+      } else if (!assistantText){
         nextWakeDelayMs = 30 * 1000;
       }
     } catch {}
 
     return {
-      ok: !!(result && result.ok),
+      ok: ranOk,
       ran: true,
-      lastSeenTs: newLastSeenTs,
+      lastSeenTs: nextLastSeenTs,
       sessionId: sessionId || null,
       outputs,
       nextWakeDelayMs,
+      // Pass-through error fields if present so engine can log/broadcast
+      error: result && typeof result.error !== 'undefined' ? result.error : undefined,
+      errorStack: result && typeof result.errorStack === 'string' ? result.errorStack : undefined,
     };
   },
 };
