@@ -7,6 +7,7 @@ import { arcanaHomePath } from '../arcana-home.js';
 import { getContext, runWithContext, emit } from '../event-bus.js';
 import { loadCronSettings } from './store.js';
 import { DEFAULT_CONTEXT_POLICY, compactSession } from '../context-manager.js';
+import { buildErrorStack } from '../util/error.js';
 
 function tailLines(text, max=100){
   const lines = String(text||'').split('\n');
@@ -402,26 +403,6 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
     const finishedAtMs = Date.now();
     const msg = String(e?.message || e || '');
     const code = (msg === 'timeout') ? 'timeout' : (msg || 'error');
-
-    function buildErrorStack(err){
-      try {
-        const parts = [];
-        let cur = err;
-        let depth = 0;
-        const MAX_DEPTH = 8;
-        while (cur && depth < MAX_DEPTH){
-          const st = cur && cur.stack ? String(cur.stack) : '';
-          const mm = cur && cur.message ? String(cur.message) : String(cur || '');
-          parts.push(st || ('Error: ' + mm));
-          cur = (cur && typeof cur === 'object' && cur.cause && typeof cur.cause === 'object') ? cur.cause : null;
-          if (cur) parts.push('Caused by:');
-          depth++;
-        }
-        return parts.join('\n');
-      } catch {
-        try { return String(err && err.stack ? err.stack : (err && err.message ? err.message : String(err||''))); } catch { return 'error'; }
-      }
-    }
 
     const fullStack = buildErrorStack(e);
     const cap = 8000;

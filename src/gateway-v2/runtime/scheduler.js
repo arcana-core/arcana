@@ -1,4 +1,5 @@
 import { nowMs } from '../util.js';
+import { logError } from '../../util/error.js';
 
 export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, wsHub } = {}){
   const wakes = new Map();
@@ -36,8 +37,7 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
         }
       } catch (e) {
         try {
-          const full = e && e.stack ? e.stack : (e && e.message ? e.message : String(e||''));
-          console.error('[arcana:gateway-v2] scheduler wake error', full);
+          logError('[arcana:gateway-v2] scheduler wake error', e);
         } catch {}
       }
     }, delay);
@@ -109,7 +109,7 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
       dueJobs = await cronStore.findDueJobs({ nowMs: now });
     } catch (e) {
       try {
-        console.error('[arcana:gateway-v2] cron scan error', e && e.message ? e.message : e);
+        logError('[arcana:gateway-v2] cron scan error', e);
       } catch {}
       return;
     }

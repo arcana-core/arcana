@@ -5,6 +5,7 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 
 import { nowMs, iso, readBodyJson } from './util.js';
+import { logError } from '../util/error.js';
 import { createWsHub } from './ws-hub.js';
 import * as eventStore from './event-store.js';
 import { getState, patchState } from './state-store.js';
@@ -61,7 +62,7 @@ async function tryServeStatic(pathname, res){
     res.end(buf);
     return true;
   } catch (e) {
-    try { if (e && e.code !== "ENOENT") console.error("[arcana:gateway-v2] static error", e && e.message ? e.message : e); } catch {}
+    try { if (e && e.code !== "ENOENT") logError("[arcana:gateway-v2] static error", e); } catch {}
     return false;
   }
 }
@@ -151,7 +152,7 @@ export async function startGatewayV2({ port } = {}) {
           });
         } catch (e) {
           try {
-            console.error('[arcana:gateway-v2] channel start error', e && e.message ? e.message : e);
+            logError('[arcana:gateway-v2] channel start error', e);
           } catch {}
         }
       }

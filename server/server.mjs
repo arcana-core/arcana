@@ -37,6 +37,7 @@ import { DEFAULT_CONTEXT_POLICY, buildSessionPrelude, trimUserMessage, compactSe
 
 
 import { detectProblemMention, detectCorrectionMention, truncateText } from '../src/memory-triggers.js';
+import { buildErrorStack } from '../src/util/error.js';
 const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..'); // arcana/
 let workspaceRoot = null; // set on start
 
@@ -219,39 +220,6 @@ function envFlagDefaultTrue(name){
 
 const MEMORY_FLUSH_ENABLED = envFlagDefaultTrue('ARCANA_MEMORY_FLUSH');
 
-// Build a full error stack with cause chain (maxDepth=8) and cap at 8000 chars
-function buildErrorStack(err, { maxDepth = 8, cap = 8000 } = {}){
-  try {
-    const seen = new Set();
-    const parts = [];
-    let depth = 0;
-    let cur = err;
-    while (cur && depth < maxDepth){
-      if (seen.has(cur)) break;
-      seen.add(cur);
-      let s = '';
-      try {
-        if (cur && typeof cur.stack === 'string' && cur.stack) s = String(cur.stack);
-        else if (cur && typeof cur.message === 'string') s = (cur.name ? (cur.name + ': ') : '') + String(cur.message);
-        else s = String(cur);
-      } catch { s = String(cur); }
-      if (depth === 0) parts.push(s);
-      else parts.push('Caused by: ' + s);
-      let next = null;
-      try { next = cur && cur.cause ? cur.cause : null; } catch { next = null; }
-      cur = next;
-      depth++;
-    }
-    let out = parts.join('\n');
-    if (typeof out === 'string' && out.length > cap){ out = out.slice(0, cap); }
-    return out;
-  } catch {
-    try {
-      const s = err && (err.stack || err.message) ? (err.stack || err.message) : String(err);
-      return String(s || '').slice(0, 8000);
-    } catch { return ''; }
-  }
-}
 function mergeAgentConfig(globalCfg, agentCfg){
   const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
   const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
