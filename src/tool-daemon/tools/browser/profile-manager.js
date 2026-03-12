@@ -5,6 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
 import { chromium } from "playwright";
+import { normalizeProxySpec } from "./proxy.js";
 import { browserProfileDir, ensureDir, browserBaseDir, browserProfilesDir } from "../../paths.js";
 
 // Chromium-only ProfileManager using Playwright over CDP
@@ -125,7 +126,7 @@ export class ProfileManager {
     return { ok:true, moved:false };
   }
 
-  async getOrStartProfile(key, { headless=true, engine, forceRestart=false }={}){
+  async getOrStartProfile(key, { headless=true, engine, forceRestart=false, webgl=false, proxy }={}){
     const k = String(key || "default");
     const e = this.entries.get(k);
     if (e){
@@ -145,13 +146,13 @@ export class ProfileManager {
       if (toDropKey){ try { this.entries.delete(toDropKey); } catch {} }
     }
 
-    const entry = await this._startChromiumProfile(k, { headless: Boolean(headless) });
+    const entry = await this._startChromiumProfile(k, { headless: Boolean(headless), webgl: Boolean(webgl), proxy: proxy });
     this.entries.set(k, entry);
     this._touchActivity(entry);
     return entry;
   }
 
-  async _startChromiumProfile(key, { headless }){
+  async _startChromiumProfile(key, { headless, webgl=false, proxy }={}){
     const userDataDir = browserProfileDir(this.workspaceRoot, key);
     try { ensureDir(browserProfilesDir(this.workspaceRoot)); } catch {}
     try { ensureDir(userDataDir); } catch {}
@@ -162,10 +163,24 @@ export class ProfileManager {
     args.push("--user-data-dir=" + String(userDataDir));
     args.push("--no-first-run");
     args.push("--no-default-browser-check");
+    const p = normalizeProxySpec(proxy);
+    if (p && p.mode === "none"){
+      args.push("--no-proxy-server");
+    } else if (p && p.mode === "custom" && p.server){
+      args.push("--proxy-server=" + String(p.server));
+    }
     const disableGpuEnv = String(process.env["ARCANA_BROWSER_DISABLE_GPU"] || "").trim().toLowerCase();
     const useGpuStabilityFlags = !(disableGpuEnv === "0" || disableGpuEnv === "false");
+    const enableWebgl = Boolean(webgl);
     if (headless){ args.push("--headless=new"); }
-    if (headless && useGpuStabilityFlags){
+    if (headless && enableWebgl){
+      if (process.platform === "darwin"){ args.push("--use-angle=metal"); }
+      args.push("--enable-webgl");
+      args.push("--ignore-gpu-blocklist");
+      args.push("--enable-gpu-rasterization");
+      args.push("--disable-features=Vulkan");
+      args.push("--enable-unsafe-swiftshader");
+    } else if (headless && useGpuStabilityFlags){
       args.push("--disable-gpu");
       args.push("--disable-gpu-sandbox");
       args.push("--disable-gpu-compositing");
@@ -181,7 +196,7 @@ export class ProfileManager {
     try { if (typeof logFd === "number") fs.closeSync(logFd); } catch {}
     const pid = proc && proc.pid ? proc.pid : null;
 
-    const entry = { key: key, engine: "chromium", userDataDir: userDataDir, proc: proc, pid: pid, stale: false, lastActiveAt: Date.now(), browser: null, page: null, cdpPort: null, lastUrl: null, logPath: logPath };
+    const entry = { key: key, engine: "chromium", userDataDir: userDataDir, proc: proc, pid: pid, stale: false, lastActiveAt: Date.now(), browser: null, page: null, cdpPort: null, lastUrl: null, logPath: logPath, webgl: Boolean(webgl) };
     try { proc.on("exit", function(){ try { entry.stale = true; } catch {} }); } catch {}
 
     const port = await this._waitForDevToolsPort(userDataDir, 15000);
@@ -330,4 +345,4 @@ export class ProfileManager {
   _touchActivity(entry){ entry.lastActiveAt = Date.now(); }
 }
 
-	export default { ProfileManager };
+export default { ProfileManager };

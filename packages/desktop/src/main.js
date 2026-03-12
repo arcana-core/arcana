@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron';
 import { mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 /**
  * Minimal Electron shell that embeds Arcana's web server.
@@ -57,8 +57,21 @@ async function start(){
     const def = (opts && opts.defaultPath) ? String(opts.defaultPath) : workspace;
     return dialog.showOpenDialog({ defaultPath: def, properties: ['openDirectory'] });
   });
+
   // Import server lazily so it picks up env and does not auto-start
-  const mod = await import('../../arcana/server/server.mjs');
+  const devServerPath = join(__dirname, '..', '..', 'server', 'server.mjs');
+  let mod;
+  if (existsSync(devServerPath)){
+    // Development: use the server from the repo checkout
+    mod = await import('../../server/server.mjs');
+  } else {
+    // Packaged: load server from process.resourcesPath
+    const resourcesRoot = process.resourcesPath || process.cwd();
+    const bundledServerPath = join(resourcesRoot, 'server', 'server.mjs');
+    const bundledServerUrl = pathToFileURL(bundledServerPath).href;
+    mod = await import(bundledServerUrl);
+  }
+
   const { server, port } = await mod.startArcanaWebServer({ port: 0, workspaceRoot: workspace });
   arcanaServer = server;
   arcanaPort = port;
@@ -83,3 +96,4 @@ app.on('activate', async () => {
     await createWindow();
   }
 });
+

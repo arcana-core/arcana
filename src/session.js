@@ -102,6 +102,74 @@ export async function createArcanaSession(opts={}){
 
   const secrets = createSecretsContext({ agentHomeRoot });
 
+  function normalizeToolContentBlocks(content){
+    if (Array.isArray(content)){
+      const blocks = [];
+      for (const item of content){
+        if (item === null || item === undefined) continue;
+        const t = typeof item;
+        if (t === 'string' || t === 'number' || t === 'boolean'){
+          blocks.push({ type: 'text', text: String(item) });
+          continue;
+        }
+        if (item && typeof item === 'object'){
+          const block = item;
+          if (typeof block.type === 'string'){
+            if (block.type === 'text'){
+              const text = typeof block.text === 'string' ? block.text : String(block.text || '');
+              blocks.push({ ...block, text });
+            } else {
+              blocks.push(block);
+            }
+          } else {
+            blocks.push({ type: 'text', text: String(block) });
+          }
+          continue;
+        }
+        blocks.push({ type: 'text', text: String(item) });
+      }
+      return blocks;
+    }
+    if (content === null || content === undefined) return [];
+    const t = typeof content;
+    if (t === 'string' || t === 'number' || t === 'boolean'){
+      return [{ type: 'text', text: String(content) }];
+    }
+    if (content && typeof content === 'object'){
+      const block = content;
+      if (Array.isArray(block)) return normalizeToolContentBlocks(block);
+      if (typeof block.type === 'string'){
+        if (block.type === 'text'){
+          const text = typeof block.text === 'string' ? block.text : String(block.text || '');
+          return [{ ...block, text }];
+        }
+        return [block];
+      }
+      return [{ type: 'text', text: String(block) }];
+    }
+    return [{ type: 'text', text: String(content) }];
+  }
+
+  function normalizeToolResult(result){
+    try {
+      if (result && typeof result === 'object'){
+        if (Array.isArray(result)){
+          return { content: normalizeToolContentBlocks(result) };
+        }
+        // For object results without an explicit 'content' field, synthesize
+        // an empty content array so downstream code never sees undefined.
+        if (!('content' in result)) return { ...result, content: [] };
+        const normalizedContent = normalizeToolContentBlocks(result.content);
+        if (normalizedContent === result.content) return result;
+        return { ...result, content: normalizedContent };
+      }
+      if (result === null || result === undefined) return { content: [] };
+      return { content: normalizeToolContentBlocks(result) };
+    } catch {
+      return result;
+    }
+  }
+
   function wrapToolWithSecrets(tool){
     if (!tool || typeof tool.execute !== 'function') return tool;
     const exec = tool.execute.bind(tool);
@@ -109,7 +177,15 @@ export async function createArcanaSession(opts={}){
       ...tool,
       async execute(callId, args, signal, onUpdate, ctx){
         const ctxWithSecrets = { ...(ctx || {}), secrets };
-        return exec(callId, args, signal, onUpdate, ctxWithSecrets);
+        let wrappedOnUpdate = onUpdate;
+        if (typeof onUpdate === 'function'){
+          wrappedOnUpdate = function(partial){
+            const normalized = normalizeToolResult(partial);
+            return onUpdate(normalized);
+          };
+        }
+        const result = await exec(callId, args, signal, wrappedOnUpdate, ctxWithSecrets);
+        return normalizeToolResult(result);
       }
     };
   }

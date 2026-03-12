@@ -5,12 +5,14 @@ const sendBtn = document.querySelector('#send');
 let activeAssistant = null; // current assistant bubble to stream text into
 
 const GATEWAY_V2_SESSION_KEY_LS = 'arcana.v2.sessionKey.v1';
+const API_TOKEN_LS_KEY = 'arcana.apiToken.v1';
 let gatewayV2Enabled = false;
 let gatewayV2Detected = false;
 let gatewayV2ProbePromise = null;
 let gatewayV2SessionKey = '';
 let gatewayV2Ws = null;
 const gatewayV2Pending = new Map();
+let __apiTokenPromptedOnce = false;
 
 // Gateway v2 runner auto-start dedupe cache
 let __v2RunnerLastKey = '';
@@ -34,7 +36,9 @@ async function ensureV2RunnerStarted(){
     const body = { agentId, sessionKey, runnerId: 'reactor' };
     const p = (async ()=>{
       try{
-        const r = await fetch('/v2/runners/start', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+        const token = getStoredApiToken();
+        const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+        const r = await fetch('/v2/runners/start', { method:'POST', headers, body: JSON.stringify(body) });
         if (!r || !r.ok){
           try{ const preview = r ? await r.clone().text() : ''; appendLog('[v2] runner start failed: HTTP ' + (r ? r.status : '?') + (preview ? (' ' + _collapse(preview)) : '')); } catch { appendLog('[v2] runner start failed: HTTP ' + ((r && r.status) || '?')); }
           return;
@@ -69,6 +73,82 @@ function ensureGatewayV2SessionKey(){
     return key;
   } catch { return 'session'; }
 }
+
+function getStoredApiToken(){
+  try{
+    if (typeof localStorage === 'undefined') return '';
+    const v = localStorage.getItem(API_TOKEN_LS_KEY) || '';
+    return String(v || '').trim();
+  } catch { return ''; }
+}
+
+function setStoredApiToken(token){
+  try{
+    if (typeof localStorage === 'undefined') return;
+    const v = String(token || '').trim();
+    if (!v) return;
+    localStorage.setItem(API_TOKEN_LS_KEY, v);
+  } catch {}
+}
+
+// Monkey-patch fetch early so all API calls automatically attach Authorization
+// and trigger a one-time token prompt on 401.
+try{
+  const __origFetch = window.fetch;
+  if (typeof __origFetch === 'function'){
+    window.fetch = async function patchedFetch(input, init){
+      let url = '';
+      try{
+        if (typeof input === 'string') url = input;
+        else if (input && typeof input.url === 'string') url = input.url;
+      } catch {}
+
+      const isApi = (typeof url === 'string') && (url.startsWith('/api/') || url.startsWith('/v2/'));
+
+      let firstOpts = init || {};
+      if (isApi){
+        const token = getStoredApiToken();
+        if (token){
+          const baseHeaders = (firstOpts && firstOpts.headers) ? firstOpts.headers : {};
+          const headers = (baseHeaders && typeof baseHeaders === 'object' && !Array.isArray(baseHeaders)) ? { ...baseHeaders } : {};
+          if (!headers['authorization'] && !headers['Authorization']){
+            headers['authorization'] = 'Bearer ' + token;
+          }
+          firstOpts = { ...firstOpts, headers };
+        }
+      }
+
+      let res = await __origFetch(input, firstOpts);
+
+      if (isApi && res && res.status === 401 && !getStoredApiToken()){
+        if (!__apiTokenPromptedOnce){
+          __apiTokenPromptedOnce = true;
+          let entered = '';
+          try{
+            entered = window.prompt('请输入 Arcana API Token，用于访问 /api 和 /v2 接口：', '');
+          } catch {}
+          if (entered){
+            setStoredApiToken(entered);
+            const token2 = getStoredApiToken();
+            if (token2){
+              const baseHeaders2 = (init && init.headers) ? init.headers : {};
+              const headers2 = (baseHeaders2 && typeof baseHeaders2 === 'object' && !Array.isArray(baseHeaders2)) ? { ...baseHeaders2 } : {};
+              if (!headers2['authorization'] && !headers2['Authorization']){
+                headers2['authorization'] = 'Bearer ' + token2;
+              }
+              const retryOpts = { ...(init || {}), headers: headers2 };
+              try{
+                res = await __origFetch(input, retryOpts);
+              } catch {}
+            }
+          }
+        }
+      }
+
+      return res;
+    };
+  }
+} catch {}
 
 // --- Quota warning helper (alert once) ---
 let __arcana_storageQuotaWarned = false;
@@ -1166,7 +1246,6 @@ try {
         loaded = true;
         try { await loadConfigUI(); } catch(e){}
       }
-      try { await loadTimerSettingsUI(); } catch(e){}
     }
   });
 } catch {}
@@ -1253,29 +1332,14 @@ try{
   }
 } catch {}
 
-async function loadTimerSettingsUI(){
-  try{
-    const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-    const url = '/api/timer-settings?agentId=' + encodeURIComponent(aid);
-    const r = await fetch(url);
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const j = await r.json();
-    const comp = j && j.settings && j.settings.compaction ? j.settings.compaction : (j && j.settings) ? j.settings : {};
-    const t = (comp && typeof comp.thresholdTokens !== 'undefined') ? comp.thresholdTokens : '';
-    let fb = (comp && typeof comp.fallbackBytes !== 'undefined') ? comp.fallbackBytes : '';
-    const fcLegacy = (comp && typeof comp.fallbackChars !== 'undefined') ? comp.fallbackChars : '';
-    if ((fb === '' || fb == null) && (fcLegacy || fcLegacy === 0)) fb = fcLegacy;
-    if (qs('timer-threshold-tokens')) qs('timer-threshold-tokens').value = (t || t === 0) ? String(t) : '';
-    if (qs('timer-fallback-bytes')) qs('timer-fallback-bytes').value = (fb || fb === 0) ? String(fb) : '';
-  }catch(e){ appendLog('[cron] 读取定时器设置失败'); }
-}
-
 async function loadConfigUI(){
   try{
     // Global default config
     let globalCfg = {};
     try{
-      const r = await fetch('/api/config');
+      const token = getStoredApiToken();
+      const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
+      const r = await fetch('/api/config', headers ? { headers } : undefined);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       globalCfg = await r.json();
     }catch(e){ appendLog('[config] 读取全局配置失败'); globalCfg = {}; }
@@ -1291,7 +1355,9 @@ async function loadConfigUI(){
     try{
       const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
       const url = '/api/agent-config?agentId=' + encodeURIComponent(aid);
-      const r2 = await fetch(url);
+      const token2 = getStoredApiToken();
+      const headers2 = token2 ? { 'authorization':'Bearer ' + token2 } : undefined;
+      const r2 = await fetch(url, headers2 ? { headers: headers2 } : undefined);
       if (!r2.ok) throw new Error('HTTP ' + r2.status);
       const agentCfg = await r2.json();
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = agentCfg.provider || '';
@@ -1321,7 +1387,9 @@ async function saveGlobalConfigUI(){
     };
     const key = (qs('cfg-key-global')||{}).value || '';
     if (key) payload.key = key;
-    const r = await fetch('/api/config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    const r = await fetch('/api/config', { method:'POST', headers, body: JSON.stringify(payload) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 保存全局配置失败'); return; }
     if (qs('cfg-key-global')) qs('cfg-key-global').value = '';
@@ -1342,7 +1410,9 @@ async function saveAgentConfigUI(){
     };
     const key = (qs('cfg-key-agent')||{}).value || '';
     if (key) payload.key = key;
-    const r = await fetch('/api/agent-config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    const r = await fetch('/api/agent-config', { method:'POST', headers, body: JSON.stringify(payload) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 保存 Agent 配置失败'); return; }
     if (qs('cfg-key-agent')) qs('cfg-key-agent').value = '';
@@ -1356,7 +1426,9 @@ async function clearAgentConfigUI(){
   try{
     const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
     const body = { agentId: aid, clear: true };
-    const r = await fetch('/api/agent-config', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    const r = await fetch('/api/agent-config', { method:'POST', headers, body: JSON.stringify(body) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 清除 Agent 配置失败'); return; }
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
@@ -1366,30 +1438,14 @@ async function clearAgentConfigUI(){
   }catch(e){ appendLog('[config] 清除 Agent 配置失败'); }
 }
 
-async function saveTimerSettingsUI(){
-  try{
-    const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-    const tRaw = (qs('timer-threshold-tokens')||{}).value || '';
-    const fRaw = (qs('timer-fallback-bytes')||{}).value || '';
-    const tNum = Number(tRaw);
-    const fNum = Number(fRaw);
-    const comp = {};
-    if (Number.isFinite(tNum) && tNum > 0) comp.thresholdTokens = tNum;
-    if (Number.isFinite(fNum) && fNum > 0) comp.fallbackBytes = fNum;
-    const body = { agentId: aid, settings: { compaction: comp } };
-    const r = await fetch('/api/timer-settings', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok || !j.ok){ appendLog('[cron] 保存定时器设置失败'); return; }
-    appendLog('[cron] 已保存定时器设置');
-  }catch(e){ appendLog('[cron] 保存定时器设置失败'); }
-}
-
 async function runDoctorUI(){
   try{
     appendLog('[doctor] 正在运行...');
     const sid = getCurrentSessionId();
     const url = sid ? ('/api/doctor?sessionId=' + encodeURIComponent(sid)) : '/api/doctor';
-    const r = await fetch(url);
+    const token = getStoredApiToken();
+    const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
+    const r = await fetch(url, headers ? { headers } : undefined);
     const j = await r.json();
     appendLog('[doctor] 结果: ok ' + (j.summary?.ok||0) + ' warn ' + (j.summary?.warn||0) + ' fail ' + (j.summary?.fail||0));
     ;(j.checks||[]).forEach(c=>{ appendLog(' - [' + c.status + '] ' + c.title + (c.details && c.details.model ? (': '+c.details.model) : '')); });
@@ -1400,7 +1456,9 @@ async function createSupportBundleUI(){
   try{
     appendLog('[support] 创建中...');
     const sid = getCurrentSessionId();
-    const r = await fetch('/api/support-bundle', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid }) });
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    const r = await fetch('/api/support-bundle', { method:'POST', headers, body: JSON.stringify({ sessionId: sid }) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[support] 失败'); return; }
     appendLog('[support] 完成: ' + (j.tarPath || j.dir));
@@ -1424,7 +1482,6 @@ try { qs('cfg-save-agent').addEventListener('click', ()=>{ saveAgentConfigUI().c
 try { qs('cfg-clear-agent').addEventListener('click', ()=>{ clearAgentConfigUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-run-doctor').addEventListener('click', ()=>{ runDoctorUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-support-bundle').addEventListener('click', ()=>{ createSupportBundleUI().catch(()=>{}) }) } catch {}
-try { qs('timer-save').addEventListener('click', ()=>{ saveTimerSettingsUI().catch(()=>{}) }) } catch {}
 
 // --- Sessions state ---
 const CKEY = 'arcana.currentSessionId';
@@ -1580,7 +1637,11 @@ function primeLastSeenFromList(items){
 function _collapse(s, n){ try{ return String(s||'').replace(/\s+/g,' ').trim().slice(0, n||200) }catch{ return '' } }
 async function _fetchJsonExpectOk(url, opts, label){
   try{
-    const r = await fetch(url, opts);
+    const token = getStoredApiToken();
+    const headers = (opts && opts.headers) ? { ...opts.headers } : {};
+    if (token){ headers['authorization'] = 'Bearer ' + token; }
+    const finalOpts = opts ? { ...opts, headers } : { headers };
+    const r = await fetch(url, finalOpts);
     const ct = (r.headers && r.headers.get) ? (r.headers.get('content-type') || '') : '';
     if (!ct.includes('application/json')){
       let preview = '';
@@ -1604,7 +1665,9 @@ async function loadSession(id, agentId){
   try{
     const aid = String(agentId || DEFAULT_AGENT_ID);
     const url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid);
-    const r = await fetch(url);
+    const token = getStoredApiToken();
+    const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
+    const r = await fetch(url, headers ? { headers } : undefined);
     if (r.status === 404) return null;
     const ct = (r.headers && r.headers.get) ? (r.headers.get('content-type') || '') : '';
     if (!r.ok){ try { const body = await r.clone().text(); if (body) appendLog('[sessions] load HTTP ' + r.status + ' ' + _collapse(body)) } catch {}; throw new Error('HTTP ' + r.status) }
@@ -2125,7 +2188,9 @@ async function sendWithGatewayV2(){
   messages.scrollTop = messages.scrollHeight;
   try{
     const body = { agentId, sessionKey: gatewayV2SessionKey, text };
-    const r = await fetch('/v2/turn', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    const r = await fetch('/v2/turn', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
     try { j = await r.json(); } catch {}
     if (!r.ok || !j || !j.ok || !j.event){
@@ -2169,7 +2234,9 @@ try {
       const aid = currentAgentId || DEFAULT_AGENT_ID;
       const ws = (!hasAgents || !currentAgentId) ? String(currentWorkspace || '').trim() : '';
       const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
-      await fetch('/api/abort', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ sessionId: sid, agentId: aid, workspace: ws || undefined, policy }) });
+      const token = getStoredApiToken();
+      const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+      await fetch('/api/abort', { method:'POST', headers, body: JSON.stringify({ sessionId: sid, agentId: aid, workspace: ws || undefined, policy }) });
     } catch {}
   });
 } catch {}
@@ -2198,7 +2265,9 @@ async function ensureTransportReady(){
     gatewayV2ProbePromise = (async ()=>{
       let isV2 = false;
       try{
-        const r = await fetch('/v2/health', { method:'GET' });
+        const token = getStoredApiToken();
+        const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
+        const r = await fetch('/v2/health', headers ? { method:'GET', headers } : { method:'GET' });
         if (r && r.ok){
           let j = null;
           try { j = await r.json(); } catch {}
@@ -2239,6 +2308,13 @@ function setupGatewayV2WebSocket(){
     } catch{
       url = '/v2/stream';
     }
+    try{
+      const token = getStoredApiToken();
+      if (token){
+        const sep = url.includes('?') ? '&' : '?';
+        url = url + sep + 'token=' + encodeURIComponent(token);
+      }
+    } catch{}
     let ws;
     try { ws = new WebSocket(url); } catch { return; }
     gatewayV2Ws = ws;
@@ -2333,12 +2409,16 @@ let sseReconnectTimer = null;
 
 function buildEventsUrl(){
   try{
+    const token = getStoredApiToken();
     if (toolStreamEnabled){
       const sid = getCurrentSessionId() || currentId || '';
       if (sid){
-        return '/api/events?toolStream=1&toolStreamSessionId=' + encodeURIComponent(sid);
+        let url = '/api/events?toolStream=1&toolStreamSessionId=' + encodeURIComponent(sid);
+        if (token){ url += '&token=' + encodeURIComponent(token); }
+        return url;
       }
     }
+    if (token){ return '/api/events?token=' + encodeURIComponent(token); }
   } catch{}
   return '/api/events';
 }

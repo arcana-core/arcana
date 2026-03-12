@@ -13,3 +13,5 @@ tmp-pw-*/
 *.tmp
 *.swp
 
+whiteboard/data/boards/
+whiteboard/data/control_token

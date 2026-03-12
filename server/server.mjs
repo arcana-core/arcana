@@ -30,16 +30,17 @@ import {
 import { getSessionIdForKey, resolveSessionIdForKey, setSessionIdForKey } from '../src/session-key-store.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../src/arcana-home.js';
 import { loadAgentTemplate } from '../src/agent-templates.js';
-import { 
-  loadCronSettings as cronLoadSettings, saveCronSettings as cronSaveSettings, acquireSessionTurnLock, releaseSessionTurnLock } from '../src/cron/store.js';
+import { acquireSessionTurnLock, releaseSessionTurnLock } from '../src/cron/store.js';
 import { DEFAULT_CONTEXT_POLICY, buildSessionPrelude, trimUserMessage, compactSession } from '../src/context-manager.js';
 // Tier1 memory triggers (direct daily append)
 
 
 import { detectProblemMention, detectCorrectionMention, truncateText } from '../src/memory-triggers.js';
+import { loadOrCreateApiToken, isAuthorizedRequest, tokenHint, getApiTokenFilePath } from '../src/auth/api-token.js';
 import { buildErrorStack } from '../src/util/error.js';
 const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..'); // arcana/
 let workspaceRoot = null; // set on start
+let apiToken = '';
 
 const DEFAULT_AGENT_ID = 'default';
 
@@ -2625,41 +2626,6 @@ async function handlePostAgentConfig(req, res) {
   }
 }
 
-async function handleGetTimerSettings(req, res) {
-  try {
-    const url = new URL(req.url, 'http://localhost');
-    const agentIdParam = String(url.searchParams.get('agentId') || '').trim();
-    const agentId = agentIdParam || DEFAULT_AGENT_ID;
-    const meta = findAgentMeta(agentId) || ensureDefaultAgentExists();
-    const ws = (meta && meta.workspaceRoot) ? meta.workspaceRoot : workspaceRoot;
-    const settings = cronLoadSettings({ agentId, workspaceRoot: ws });
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, settings }));
-  } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'cron_settings_read_failed', message: e?.message || String(e) }));
-  }
-}
-
-async function handlePostTimerSettings(req, res) {
-  try {
-    const bufs = []; for await (const chunk of req) bufs.push(chunk);
-    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    let agentId = '';
-    try {
-      if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null) {
-        agentId = String(body.agentId || '').trim();
-      }
-    } catch {}
-    if (!agentId) agentId = DEFAULT_AGENT_ID;
-    const meta = findAgentMeta(agentId) || ensureDefaultAgentExists();
-    const ws = (meta && meta.workspaceRoot) ? meta.workspaceRoot : workspaceRoot;
-    const settingsRaw = body && body.settings && typeof body.settings === 'object' ? body.settings : {};
-    const settings = cronSaveSettings(settingsRaw, { agentId, workspaceRoot: ws });
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: true, settings }));
-  } catch (e) {
-    res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ ok: false, error: 'cron_settings_write_failed', message: e?.message || String(e) }));
-  }
-}
-
 async function handlePostConfig(req, res) {
   try {
     const bufs = []; for await (const chunk of req) bufs.push(chunk);
@@ -2881,14 +2847,24 @@ function createRequestHandler() {
     const url = new URL(req.url, 'http://localhost');
     // CORS for dev
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'content-type');
+    res.setHeader('Access-Control-Allow-Headers', 'content-type, x-arcana-token, authorization');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
     if (req.method === 'OPTIONS') { res.writeHead(200).end(); return; }
 
-    if (req.method === 'GET' && url.pathname === '/health') { res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, plugins: (pluginFiles?.length || 0) })); return; }
+    if (req.method === 'GET' && url.pathname === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true, plugins: (pluginFiles?.length || 0) }));
+      return;
+    }
+
+    if (url.pathname.startsWith('/api/')){
+      if (!isAuthorizedRequest(req, apiToken)){
+        res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+        return;
+      }
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/events') { await handleEvents(req, res); return; }
 
-    
     if (req.method === 'GET' && url.pathname === '/api/secrets') { await handleGetSecrets(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/secrets') { await handlePostSecrets(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/secrets/import') { await handlePostSecretsImport(req, res); return; }
@@ -2924,8 +2900,6 @@ function createRequestHandler() {
     if (req.method === 'POST' && url.pathname === '/api/config') { await handlePostConfig(req, res); return; }
     if (req.method === 'GET' && url.pathname === '/api/agent-config') { await handleGetAgentConfig(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/agent-config') { await handlePostAgentConfig(req, res); return; }
-    if (req.method === 'GET' && (url.pathname === '/api/timer-settings' || url.pathname === '/api/cron-settings')) { await handleGetTimerSettings(req, res); return; }
-    if (req.method === 'POST' && (url.pathname === '/api/timer-settings' || url.pathname === '/api/cron-settings')) { await handlePostTimerSettings(req, res); return; }
     if (req.method === 'GET' && url.pathname === '/api/tool-output') { await handleGetToolOutput(req, res); return; }
 
     await serveStatic(req, res);
@@ -2938,12 +2912,28 @@ export async function startArcanaWebServer({ port, workspaceRoot: wsRoot } = {})
   try { ensureArcanaHomeDir(); } catch {}
   try { ensureDefaultAgentExists(); } catch {}
 
+  apiToken = loadOrCreateApiToken();
+  try {
+    const hint = tokenHint(apiToken);
+    let tokenPath = '';
+    try { tokenPath = getApiTokenFilePath(); } catch {}
+    if (tokenPath){
+      console.log('[arcana:web] API token ' + hint + ' (file: ' + tokenPath + ', localStorage key: arcana.apiToken.v1)');
+    } else {
+      console.log('[arcana:web] API token ' + hint + ' (localStorage key: arcana.apiToken.v1)');
+    }
+  } catch {}
+
   const server = http.createServer(createRequestHandler());
   const desiredPort = typeof port === 'number' ? port : (process.env.PORT ? Number(process.env.PORT) : 5678);
-  await new Promise((resolve) => { server.listen(desiredPort, () => resolve()); });
+  const bindHost = process.env.ARCANA_BIND_HOST && String(process.env.ARCANA_BIND_HOST).trim()
+    ? String(process.env.ARCANA_BIND_HOST).trim()
+    : '127.0.0.1';
+  await new Promise((resolve) => { server.listen(desiredPort, bindHost, () => resolve()); });
   const bound = server.address();
   const actualPort = bound && typeof bound.port === 'number' ? bound.port : desiredPort;
-  console.log('[arcana:web] http://localhost:' + actualPort + '  (plugins: ' + (pluginFiles ? pluginFiles.length : 0) + ')');
+  const hostLabel = (bound && typeof bound.address === 'string' && bound.address) ? bound.address : bindHost;
+  console.log('[arcana:web] http://' + hostLabel + ':' + actualPort + '  (plugins: ' + (pluginFiles ? pluginFiles.length : 0) + ')');
 
   return { server, port: actualPort };
 }

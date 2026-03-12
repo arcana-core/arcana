@@ -68,6 +68,7 @@ export function createProxyWebRenderTool(client){
   const Params = Type.Object({
     action: Type.String({ description: "start|status|navigate|snapshot|open|close" }),
     url: Type.Optional(Type.String()),
+    proxy: Type.Optional(Type.String({ description: "Proxy mode: 'system' (default), 'none' to bypass, or a proxy URL like socks5://127.0.0.1:1086" })),
     waitUntil: Type.Optional(Type.String()),
     maxChars: Type.Optional(Type.Number()),
     headless: Type.Optional(Type.Boolean()),
@@ -112,6 +113,7 @@ export function createProxyWebExtractTool(client){
   const Params = Type.Object({
     mode: Type.Optional(Type.String({ description: "article|main|full" })),
     selector: Type.Optional(Type.String()),
+    proxy: Type.Optional(Type.String({ description: "Proxy mode: 'system' (default), 'none' to bypass, or a proxy URL like socks5://127.0.0.1:1086" })),
     maxChars: Type.Optional(Type.Number()),
     timeout: Type.Optional(Type.Number()),
     autoScroll: Type.Optional(Type.Boolean()),
@@ -149,6 +151,7 @@ export function createProxyWebExtractTool(client){
 export function createProxyWebSearchTool(client){
   const Params = Type.Object({
     query: Type.String(),
+    proxy: Type.Optional(Type.String({ description: "Proxy mode: 'system' (default), 'none' to bypass, or a proxy URL like socks5://127.0.0.1:1086" })),
     engine: Type.Optional(Type.String()),
     timeout: Type.Optional(Type.Number()),
   });

@@ -110,37 +110,49 @@ export async function startToolDaemon({ workspaceRoot, port }){
               }
               if (name === "web_render"){
                 const action = String(args.action||"").toLowerCase();
+                const webgl = (args && typeof args.webgl === "boolean") ? args.webgl : false;
                 if (action === "start"){
-                  const r = await bm.start({ headers: req.headers, headless: (typeof args.headless === "boolean") ? args.headless : true, engine: args.engine, forceRestart: Boolean(args.forceRestart) });
+                  const r = await bm.start({ headers: req.headers, proxy: args.proxy, headless: (typeof args.headless === "boolean") ? args.headless : true, engine: args.engine, forceRestart: Boolean(args.forceRestart), webgl });
                   return finish(200, { content:[{ type:"text", text:"started" }], details:r });
                 }
                 if (action === "status"){
-                  const s = await bm.status({ headers: req.headers });
+                  const s = await bm.status({ headers: req.headers, proxy: args.proxy });
                   return finish(200, { content:[{ type:"text", text:"status" }], details:s });
                 }
                 if (action === "open"){
-                  const r = await bm.open({ headers: req.headers, url: args.url, headless:false, engine: args.engine, forceRestart: Boolean(args.forceRestart), waitUntil: args.waitUntil, timeoutMs: args.timeoutMs });
+                  const r = await bm.open({ headers: req.headers, proxy: args.proxy, url: args.url, headless:false, engine: args.engine, forceRestart: Boolean(args.forceRestart), waitUntil: args.waitUntil, timeoutMs: args.timeoutMs, webgl });
                   const text = r && r.url ? ("opened " + r.url) : "opened";
                   return finish(200, { content:[{ type:"text", text }], details:r });
                 }
                 if (action === "close"){
-                  const r = await bm.close({ headers: req.headers });
+                  const r = await bm.close({ headers: req.headers, proxy: args.proxy });
                   return finish(200, { content:[{ type:"text", text:"closed" }], details:r });
                 }
                 if (action === "reset" || action === "reset_profile"){
-                  const r = await bm.resetProfile({ headers: req.headers, profileKey: args && args.profileKey ? String(args.profileKey) : null });
+                  const r = await bm.resetProfile({ headers: req.headers, proxy: args.proxy, profileKey: args && args.profileKey ? String(args.profileKey) : null });
                   return finish(200, { content:[{ type:"text", text:"reset" }], details:r });
                 }
                 if (action === "navigate"){
-                  const r = await bm.navigate({ headers: req.headers, url: args.url, waitUntil: args.waitUntil, timeoutMs: args.timeoutMs });
+                  const r = await bm.navigate({ headers: req.headers, proxy: args.proxy, url: args.url, waitUntil: args.waitUntil, timeoutMs: args.timeoutMs, webgl });
                   return finish(200, { content:[{ type:"text", text: "navigated " + (r && r.url ? r.url : "") }], details:r });
                 }
                 if (action === "snapshot"){
-                  const r = await bm.extract({ headers: req.headers, maxChars: Number(args.maxChars||20000), autoScroll: Boolean(args.autoScroll) });
-                  return finish(200, { content:[{ type:"text", text: "[external:web_render]\n" + (r.text||"") }], details:{ url: r.url, title: r.title, tookMs: r.tookMs } });
+                  const screenshotPath = (args && typeof args.screenshotPath === "string" && args.screenshotPath) ? String(args.screenshotPath) : undefined;
+                  const fullPage = (args && typeof args.fullPage === "boolean") ? args.fullPage : undefined;
+                  let screenshotRes = null;
+                  if (screenshotPath || typeof fullPage === "boolean"){
+                    screenshotRes = await bm.screenshot({ headers: req.headers, proxy: args.proxy, path: screenshotPath, fullPage });
+                  } else {
+                    screenshotRes = await bm.screenshot({ headers: req.headers, proxy: args.proxy });
+                  }
+                  const r = await bm.extract({ headers: req.headers, proxy: args.proxy, maxChars: Number(args.maxChars||20000), autoScroll: Boolean(args.autoScroll) });
+                  const details = { url: r.url, title: r.title, tookMs: r.tookMs };
+                  if (screenshotRes && typeof screenshotRes.path === "string") details.screenshotPath = screenshotRes.path;
+                  if (screenshotRes && typeof screenshotRes.ok === "boolean") details.screenshotOk = screenshotRes.ok;
+                  return finish(200, { content:[{ type:"text", text: "[external:web_render]\n" + (r.text||"") }], details });
                 }
                 if (action === "click"){
-                  const r = await bm.click({ headers: req.headers, selector: args.selector, text: args.text, nth: args.nth, timeoutMs: args.timeoutMs });
+                  const r = await bm.click({ headers: req.headers, proxy: args.proxy, selector: args.selector, text: args.text, nth: args.nth, timeoutMs: args.timeoutMs });
                   let label = ""; if (r.selector) label = "selector " + r.selector; else if (r.text) label = "text " + r.text;
                   const text = label ? ("clicked " + label) : "clicked";
                   return finish(200, { content:[{ type:"text", text }], details:r });
@@ -148,7 +160,7 @@ export async function startToolDaemon({ workspaceRoot, port }){
                 return finish(400, { ok:false, error:"unknown_action" });
               }
               if (name === "web_extract"){
-                const r = await bm.extract({ headers: req.headers, maxChars: Number(args.maxChars||20000), autoScroll: Boolean(args.autoScroll) });
+                const r = await bm.extract({ headers: req.headers, proxy: args.proxy, maxChars: Number(args.maxChars||20000), autoScroll: Boolean(args.autoScroll) });
                 const wrapped = "[external:web_extract]\n" + String(r.text||"");
                 return finish(200, { content:[{ type:"text", text: wrapped }], details:{ url: r.url, title: r.title, tookMs: r.tookMs } });
               }
@@ -160,8 +172,8 @@ export async function startToolDaemon({ workspaceRoot, port }){
                 let timeoutMs = undefined;
                 if (args && typeof args.timeoutMs === "number" && args.timeoutMs > 0) timeoutMs = args.timeoutMs;
                 else if (args && typeof args.timeout === "number" && args.timeout > 0) timeoutMs = Math.floor(args.timeout * 1000);
-                await bm.navigate({ headers: req.headers, url: url, waitUntil: wait, timeoutMs: timeoutMs });
-                const r = await bm.snapshot({ headers: req.headers, maxChars: 20000 });
+                await bm.navigate({ headers: req.headers, proxy: args.proxy, url: url, waitUntil: wait, timeoutMs: timeoutMs });
+                const r = await bm.snapshot({ headers: req.headers, proxy: args.proxy, maxChars: 20000 });
                 const header = "[external:web_search]\nurl=" + r.url + " title=" + (r.title||"") + "\n";
                 return finish(200, { content:[{ type:"text", text: header + (r.text||"") }], details:{ provider:"browser", engine, url: r.url, title: r.title, tookMs: r.tookMs } });
               }

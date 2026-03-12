@@ -137,6 +137,7 @@ async function stopAll(reason) {
     tasks.push(stopOne(id, reason));
   }
   try { await Promise.allSettled(tasks); } catch { /* ignore */ }
+  state.started = false;
 }
 
 function installHooksOnce() {
@@ -193,6 +194,10 @@ export async function reloadServices({ workspaceRoot } = {}) {
     const id = serviceIdFromFilename(file);
     const existing = state.services.get(id);
     if (!existing) {
+      await startOne(file, root);
+      continue;
+    }
+    if (existing.status === "stopped") {
       await startOne(file, root);
       continue;
     }

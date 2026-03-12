@@ -6,9 +6,13 @@
   "main": "src/main.js",
   "scripts": {
     "dev": "electron .",
-    "start": "electron ."
+    "start": "electron .",
+    "dist": "electron-builder -c electron-builder.config.cjs",
+    "dist:mac": "electron-builder --mac dmg -c electron-builder.config.cjs"
   },
   "devDependencies": {
-    "electron": "^31.0.0"
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "@electron/notarize": "latest"
   }
 }

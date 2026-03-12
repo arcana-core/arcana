@@ -61,8 +61,7 @@ Compaction
 - Cron agentTurn jobs track an approximate per-session token count. By default, when a session exceeds 200000 tokens (or if token usage is unavailable and the combined history text exceeds 600000 UTF-8 bytes), older messages are compacted.
 - Compaction keeps only the most recent 50 messages and summarizes earlier messages into the session summary field.
 - Prompt construction uses a bounded history prelude (recent messages + summary) to reduce context-window overflow risk.
-- These thresholds (tokens and fallback bytes) can be configured per agent from the web UI advanced settings panel under 设置 / 诊断 (the "会话压缩设置" section).
-- Cron settings are stored per agent under .arcana/agents/<agentId>/cron/settings.json and are also accessible via the HTTP endpoints /api/cron-settings and /api/timer-settings (compatibility alias).
+ 
 
 Timeouts and locks
 - Cron agentTurn jobs have a hard timeout. By default each agentTurn is limited to 60000 ms; this can be overridden per job via payload.timeoutMs or globally via the ARCANA_CRON_ARCANA_TIMEOUT_MS environment variable. On timeout, the tool host is best-effort cancelled and the run is recorded with error="timeout".

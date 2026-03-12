@@ -6,14 +6,6 @@ import { getContext, runWithContext } from '../event-bus.js';
 
 const DEFAULT_AGENT_ID = 'default';
 
-// Default per-agent history compaction thresholds for cron agentTurn
-// payloads. Stored under .arcana/agents/<agentId>/cron/settings.json.
-const DEFAULT_CRON_COMPACTION = {
-  thresholdTokens: 200000,
-  fallbackBytes: 600000,
-  keepRecentMessages: 50,
-};
-
 function nowIso(){ return new Date().toISOString(); }
 function nowMs(){ return Date.now(); }
 
@@ -110,12 +102,6 @@ function lockFilePath(options){
   return join(baseDir, 'jobs.lock');
 }
 
-function settingsPath(options){
-  const { workspaceRoot, agentId } = resolveAgentContext(options);
-  const baseDir = ensureCronBaseDir(workspaceRoot, agentId);
-  return join(baseDir, 'settings.json');
-}
-
 // Basic lock around jobs.json writes to avoid corruption across concurrent processes.
 // We create .lock with O_EXCL and remove it after the write. If lock exists and is stale (>30s), steal it.
 function acquireLock(timeoutMs = 5000, options){
@@ -154,59 +140,6 @@ export function listJobs(options){
     if (Array.isArray(raw)) return raw;
   } catch {}
   return [];
-}
-
-export function loadCronSettings(options){
-  const env = resolveAgentContext(options);
-  const p = settingsPath(options);
-  const base = { compaction: { ...DEFAULT_CRON_COMPACTION } };
-  if (!existsSync(p)) return base;
-  try {
-    const raw = JSON.parse(readFileSync(ensureReadInWorkspace(p, env.workspaceRoot), 'utf-8'));
-    const out = { compaction: { ...DEFAULT_CRON_COMPACTION } };
-    if (raw && typeof raw === 'object'){
-      const src = raw.compaction && typeof raw.compaction === 'object' ? raw.compaction : raw;
-      const t = Number(src.thresholdTokens);
-      const fb = Number(src.fallbackBytes);
-      const k = Number(src.keepRecentMessages);
-      if (Number.isFinite(t) && t > 0) out.compaction.thresholdTokens = t;
-      if (Number.isFinite(fb) && fb > 0) { out.compaction.fallbackBytes = fb; }
-      if (Number.isFinite(k) && k > 0) out.compaction.keepRecentMessages = k;
-    }
-    return out;
-  } catch {
-    return base;
-  }
-}
-
-export function saveCronSettings(settings, options){
-  const env = resolveAgentContext(options);
-  const p = settingsPath(options);
-  const tmp = p + '.tmp';
-  const current = loadCronSettings(options) || { compaction: { ...DEFAULT_CRON_COMPACTION } };
-  const incoming = settings && typeof settings === 'object' ? settings : {};
-  const srcComp = incoming.compaction && typeof incoming.compaction === 'object' ? incoming.compaction : incoming;
-
-  const baseComp = current.compaction && typeof current.compaction === 'object' ? current.compaction : { ...DEFAULT_CRON_COMPACTION };
-  const nextComp = { ...DEFAULT_CRON_COMPACTION, ...baseComp };
-
-  function pickNumber(v){
-    const n = Number(v);
-    return (Number.isFinite(n) && n > 0) ? n : null;
-  }
-
-  const t = pickNumber(srcComp.thresholdTokens);
-  const fb = pickNumber(srcComp.fallbackBytes);
-  const k = pickNumber(srcComp.keepRecentMessages);
-  if (t != null) nextComp.thresholdTokens = t;
-  if (fb != null) nextComp.fallbackBytes = fb;
-  if (k != null) nextComp.keepRecentMessages = k;
-
-  const finalSettings = { compaction: nextComp };
-
-  writeFileSync(ensureWriteInWorkspace(tmp, env.workspaceRoot), JSON.stringify(finalSettings, null, 2), 'utf-8');
-  renameSync(tmp, ensureWriteInWorkspace(p, env.workspaceRoot));
-  return finalSettings;
 }
 
 function saveJobsArray(arr, options){
@@ -603,8 +536,6 @@ export default {
   acquireJobRunLock,
   releaseJobRunLock,
   listAgentIdsWithJobs,
-  loadCronSettings,
-  saveCronSettings,
   isSessionTurnLocked,
   acquireSessionTurnLock,
   releaseSessionTurnLock,

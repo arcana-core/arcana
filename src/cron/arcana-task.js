@@ -5,7 +5,6 @@ import { resolveSessionIdForKey, setSessionIdForKey } from '../session-key-store
 import { createWriteStream } from 'node:fs';
 import { arcanaHomePath } from '../arcana-home.js';
 import { getContext, runWithContext, emit } from '../event-bus.js';
-import { loadCronSettings } from './store.js';
 import { DEFAULT_CONTEXT_POLICY, compactSession } from '../context-manager.js';
 import { buildErrorStack } from '../util/error.js';
 
@@ -197,17 +196,9 @@ async function summarizeSessionChunk({ workspaceRoot, agentHomeRoot, existingSum
 
 async function compactSessionIfNeeded({ sessionId, agentId, workspaceRoot, agentHomeRoot, deltaTokens }){
   try {
-    const settings = loadCronSettings({ workspaceRoot, agentId }) || {};
-    const comp = settings && settings.compaction && typeof settings.compaction === 'object' ? settings.compaction : {};
-    const thresholdTokensRaw = comp.thresholdTokens;
-    const fallbackBytesRaw = comp.fallbackBytes;
-    const keepRecentRaw = comp.keepRecentMessages;
-    const thresholdTokensVal = Number(thresholdTokensRaw);
-    const fallbackBytesVal = Number(fallbackBytesRaw);
-    const keepRecentVal = Number(keepRecentRaw);
-    const thresholdTokens = (Number.isFinite(thresholdTokensVal) && thresholdTokensVal > 0) ? thresholdTokensVal : 200000;
-    const fallbackBytes = (Number.isFinite(fallbackBytesVal) && fallbackBytesVal > 0) ? fallbackBytesVal : 600000;
-    const keepRecentMessages = (Number.isFinite(keepRecentVal) && keepRecentVal > 0) ? keepRecentVal : 50;
+    const thresholdTokens = 200000;
+    const fallbackBytes = 600000;
+    const keepRecentMessages = 50;
 
     let sessionObj = loadSession(sessionId, { agentId });
     if (!sessionObj) return;

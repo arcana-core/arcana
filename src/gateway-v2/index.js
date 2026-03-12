@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 
+import { loadOrCreateApiToken, isAuthorizedRequest, tokenHint, getApiTokenFilePath } from '../auth/api-token.js';
 import { nowMs, iso, readBodyJson } from './util.js';
 import { logError } from '../util/error.js';
 import { createWsHub } from './ws-hub.js';
@@ -25,6 +26,7 @@ import { createEngine } from './runtime/engine.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WEB_ROOT = resolvePath(__dirname, "..", "..", "web");
+let apiToken = "";
 
 function contentTypeForPath(filePath){
   try {
@@ -79,6 +81,18 @@ export async function startGatewayV2({ port } = {}) {
   const desiredPort = typeof port === 'number' && Number.isFinite(port)
     ? port
     : (process.env.PORT ? Number(process.env.PORT) : 8787);
+
+  apiToken = loadOrCreateApiToken();
+  try {
+    const hint = tokenHint(apiToken);
+    let tokenPath = '';
+    try { tokenPath = getApiTokenFilePath(); } catch {}
+    if (tokenPath){
+      console.log('[arcana:gateway-v2] API token ' + hint + ' (file: ' + tokenPath + ', localStorage key: arcana.apiToken.v1)');
+    } else {
+      console.log('[arcana:gateway-v2] API token ' + hint + ' (localStorage key: arcana.apiToken.v1)');
+    }
+  } catch {}
 
   const wsHub = createWsHub();
   const trace = createTraceEmitter({ wsHub });
@@ -168,6 +182,13 @@ export async function startGatewayV2({ port } = {}) {
       }
 
       const u = new URL(url, 'http://localhost');
+
+      if (u.pathname.startsWith('/v2/')){
+        if (!isAuthorizedRequest(req, apiToken)){
+          sendJson(res, 401, { ok: false, error: 'unauthorized' });
+          return;
+        }
+      }
 
       if (method === 'GET' && u.pathname === '/v2/health'){
         sendJson(res, 200, {
@@ -457,6 +478,10 @@ export async function startGatewayV2({ port } = {}) {
         socket.destroy();
         return;
       }
+      if (!isAuthorizedRequest(req, apiToken)){
+        try { socket.destroy(); } catch {}
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit('connection', ws, req);
       });
@@ -465,13 +490,18 @@ export async function startGatewayV2({ port } = {}) {
     }
   });
 
+  const bindHost = process.env.ARCANA_BIND_HOST && String(process.env.ARCANA_BIND_HOST).trim()
+    ? String(process.env.ARCANA_BIND_HOST).trim()
+    : '127.0.0.1';
+
   await new Promise((resolve) => {
-    server.listen(desiredPort, () => resolve());
+    server.listen(desiredPort, bindHost, () => resolve());
   });
 
   const bound = server.address();
   const actualPort = bound && typeof bound.port === 'number' ? bound.port : desiredPort;
-  console.log('[arcana:gateway-v2] listening on http://localhost:' + actualPort);
+  const hostLabel = (bound && typeof bound.address === 'string' && bound.address) ? bound.address : bindHost;
+  console.log('[arcana:gateway-v2] listening on http://' + hostLabel + ':' + actualPort);
 
   return {
     server,
@@ -490,4 +520,3 @@ export async function startGatewayV2({ port } = {}) {
 }
 
 export default { startGatewayV2 };
-
