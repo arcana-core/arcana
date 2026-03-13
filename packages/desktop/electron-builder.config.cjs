@@ -21,13 +21,12 @@ module.exports = {
   },
   afterSign: 'scripts/notarize.cjs',
   extraResources: [
-    { from: '../server', to: 'server' },
-    { from: '../src', to: 'src' },
-    { from: '../web', to: 'web' },
-    { from: '../skills', to: 'skills' },
-    { from: '../plugins', to: 'plugins' },
-    { from: '../tools', to: 'tools' },
-    { from: '../node_modules', to: 'node_modules' },
+    { from: '../../server', to: 'server' },
+    { from: '../../src', to: 'src' },
+    { from: '../../web', to: 'web' },
+    { from: '../../skills', to: 'skills' },
+    { from: '../../plugins', to: 'plugins' },
+    { from: '../../tools', to: 'tools' },
+    { from: '../../node_modules', to: 'node_modules' },
   ],
 };
-

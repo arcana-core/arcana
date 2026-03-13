@@ -10,10 +10,12 @@ export class BrowserManager {
   }
 
   _profileKeyFromHeaders(headers, { proxy } = {}){
-    // Compose a stable key from agent + session headers when set.
+    // Compose a stable key from agent headers, optionally per-session.
     const a = String(headers["x-arcana-agent-id"] || headers["X-Arcana-Agent-Id"] || "default");
     const s = String(headers["x-arcana-session-id"] || headers["X-Arcana-Session-Id"] || "");
-    const base = a + (s ? ("__" + s) : "");
+    const isoHeader = String(headers["x-arcana-browser-isolate"] || headers["X-Arcana-Browser-Isolate"] || "").trim();
+    const isolate = (process.env.ARCANA_BROWSER_ISOLATE_BY_SESSION === "1") || isoHeader === "1"; // Opt into session-scoped profile.
+    const base = (isolate && s) ? (a + "__" + s) : a;
     const spec = normalizeProxySpec(proxy);
     const withProxy = (spec && spec.mode && spec.mode !== "system")
       ? (base + "__px_" + String(spec.key || ""))
@@ -97,10 +99,12 @@ export class BrowserManager {
     const entry = await this.profiles.getOrStartProfile(key, { proxy });
     const startTs = Date.now();
     const result = await entry.page.evaluate(function(maxC){
-      function cleanup(el){ var qs=el.querySelectorAll("script,style,nav,footer,header,iframe,svg"); for (var i=0;i<qs.length;i++){ var n=qs[i]; if (n && n.parentNode) n.parentNode.removeChild(n); } }
+      function cleanup(el){ if(!el) return; var qs=el.querySelectorAll("script,style,nav,footer,header,iframe,svg"); for (var i=0;i<qs.length;i++){ var n=qs[i]; if (n && n.parentNode) n.parentNode.removeChild(n); } }
       function text(el){ var w=document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null); var out=[]; var len=0; var cap=maxC; while(w.nextNode()){ var t=(w.currentNode.nodeValue||"").replace(/\s+/g," ").trim(); if(!t) continue; out.push(t); len+=t.length+1; if(len>cap) break; } return out.join("\n"); }
-      var root=document.querySelector("article")||document.querySelector("main")||document.body; cleanup(root);
-      var title=document.title||undefined; var body=text(root);
+      var root=document.querySelector("article")||document.querySelector("main")||document.body||document.documentElement;
+      var title=document.title||undefined; if(!root) return { title:title, body:"" };
+      cleanup(root);
+      var body=text(root);
       return { title: title, body: body };
     }, Number(maxChars||20000));
     return { ok:true, url: entry.page.url?.(), title: result.title, text: result.body, tookMs: Date.now()-startTs };
@@ -126,10 +130,12 @@ export class BrowserManager {
       } catch {}
     }
     const result = await entry.page.evaluate(function(maxC){
-      function cleanup(el){ var qs=el.querySelectorAll("script,style,nav,footer,header,iframe,svg"); for (var i=0;i<qs.length;i++){ var n=qs[i]; if (n && n.parentNode) n.parentNode.removeChild(n); } }
+      function cleanup(el){ if(!el) return; var qs=el.querySelectorAll("script,style,nav,footer,header,iframe,svg"); for (var i=0;i<qs.length;i++){ var n=qs[i]; if (n && n.parentNode) n.parentNode.removeChild(n); } }
       function text(el){ var w=document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null); var out=[]; var len=0; var cap=maxC; while(w.nextNode()){ var t=(w.currentNode.nodeValue||"").replace(/\s+/g," ").trim(); if(!t) continue; out.push(t); len+=t.length+1; if(len>cap) break; } return out.join("\n"); }
-      var root=document.querySelector("article")||document.querySelector("main")||document.body; cleanup(root);
-      var title=document.title||undefined; var body=text(root);
+      var root=document.querySelector("article")||document.querySelector("main")||document.body||document.documentElement;
+      var title=document.title||undefined; if(!root) return { title:title, body:"" };
+      cleanup(root);
+      var body=text(root);
       return { title: title, body: body };
     }, Number(maxChars||20000));
     return { ok:true, url: entry.page.url?.(), title: result.title, text: result.body, tookMs: Date.now()-startTs };
@@ -146,8 +152,38 @@ export class BrowserManager {
     let target;
     if (sel) target = entry.page.locator(sel).nth(n);
     else target = entry.page.getByText(txt, { exact:false }).nth(n);
-    await target.click({ timeout: t });
-    return { ok:true, selector: sel, text: txt, nth: n, timeoutMs: t, url: entry.page.url?.() };
+    try {
+      try {
+        entry.page.waitForNavigation({ timeout: t }).catch(function(){});
+      } catch {}
+      try {
+        entry.page.waitForEvent("popup", { timeout: t }).then(function(p){
+          try {
+            if (!p) return;
+            entry.page = p;
+            try {
+              if (p.url && typeof p.url === "function"){ entry.lastUrl = p.url(); }
+            } catch {}
+            try {
+              p.on("framenavigated", function(){ try { entry.lastUrl = p.url(); } catch {} });
+              p.on("close", function(){ try { entry.lastUrl = entry.lastUrl || null; } catch {} });
+            } catch {}
+          } catch {}
+        }).catch(function(){});
+      } catch {}
+      await target.click({ timeout: t });
+    } catch (e) {
+      throw e;
+    }
+    let url = null;
+    try {
+      if (entry.page && entry.page.url && typeof entry.page.url === "function"){ url = entry.page.url(); }
+      else if (entry.lastUrl){ url = entry.lastUrl; }
+    } catch {
+      url = entry.lastUrl || null;
+    }
+    entry.lastUrl = url;
+    return { ok:true, selector: sel, text: txt, nth: n, timeoutMs: t, url: url };
   }
 }
 

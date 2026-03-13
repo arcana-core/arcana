@@ -96,7 +96,32 @@ async function startOne(filePath, workspaceRoot) {
     }
 
     const ctx = { workspaceRoot, servicePath: filePath, serviceId: id, logDir };
-    const handle = await starter(ctx);
+    const STARTUP_TIMEOUT_MS = 30000;
+    const startPromise = starter(ctx);
+    const TIMEOUT = Symbol("timeout");
+    const result = await Promise.race([
+      startPromise.then(function(h){ return { handle: h }; }),
+      new Promise(function(resolve){ setTimeout(function(){ resolve(TIMEOUT); }, STARTUP_TIMEOUT_MS); })
+    ]);
+
+    if (result === TIMEOUT) {
+      entry.status = "timeout";
+      await appendLog(managerLog, "service start() timed out after " + String(STARTUP_TIMEOUT_MS / 1000) + "s id=" + id + " (continuing to next service)");
+      // If the promise eventually resolves, attach the handle
+      startPromise.then(function(handle) {
+        entry.handle = handle || null;
+        entry.stop = (handle && typeof handle.stop === "function") ? handle.stop.bind(handle) : null;
+        entry.status = "running";
+        appendLog(managerLog, "service eventually started (after timeout) id=" + id).catch(function(){});
+      }).catch(function(err) {
+        entry.status = "error";
+        entry.error = String(err && err.stack ? err.stack : err);
+        appendLog(managerLog, "service start() failed after timeout id=" + id + ": " + entry.error).catch(function(){});
+      });
+      return;
+    }
+
+    var handle = result.handle;
     entry.handle = handle || null;
     entry.stop = (handle && typeof handle.stop === "function") ? handle.stop.bind(handle) : null;
     entry.status = "running";

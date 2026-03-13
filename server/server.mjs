@@ -665,6 +665,67 @@ function initSessionUsageFromStore({ agentId, sessionId }){
     sessionUsageTotalsById.set(sidKey, num);
   } catch {}
 }
+
+// Normalize a raw usage-like object into { inputTokens, outputTokens, totalTokens }
+// using common field names. Returns null when no non-zero fields are found.
+function normalizeUsageObject(raw){
+  try {
+    if (!raw || typeof raw !== 'object') return null;
+    let input = Number(
+      raw.inputTokens ??
+      raw.input_tokens ??
+      raw.prompt_tokens ??
+      raw.promptTokens ??
+      raw.input ??
+      raw.prompt ??
+      0
+    ) || 0;
+    let output = Number(
+      raw.outputTokens ??
+      raw.output_tokens ??
+      raw.completion_tokens ??
+      raw.completionTokens ??
+      raw.output ??
+      0
+    ) || 0;
+    let total = Number(
+      raw.totalTokens ??
+      raw.total_tokens ??
+      raw.total ??
+      0
+    ) || 0;
+    if (!Number.isFinite(input) || input < 0) input = 0;
+    if (!Number.isFinite(output) || output < 0) output = 0;
+    if (!Number.isFinite(total) || total < 0) total = 0;
+    if (!total && (input || output)) total = input + output;
+    input = input ? Math.floor(input) : 0;
+    output = output ? Math.floor(output) : 0;
+    total = total ? Math.floor(total) : 0;
+    if (!input && !output && !total) return null;
+    const out = { inputTokens: input, outputTokens: output, totalTokens: total };
+    return out;
+  } catch { return null; }
+}
+
+// Extract a normalized usage object from a tool_execution_end event, if present.
+function extractUsageFromToolEvent(ev){
+  try {
+    if (!ev || !ev.result) return null;
+    const r = ev.result;
+    const candidates = [];
+    if (r && typeof r === 'object'){
+      if (r.details && r.details.usage) candidates.push(r.details.usage);
+      if (r.usage) candidates.push(r.usage);
+      if (r.response && r.response.usage) candidates.push(r.response.usage);
+      if (r.result && r.result.usage) candidates.push(r.result.usage);
+    }
+    for (const raw of candidates){
+      const norm = normalizeUsageObject(raw);
+      if (norm) return norm;
+    }
+    return null;
+  } catch { return null; }
+}
 // Context overflow detection (similar to pi-ai patterns)
 const CONTEXT_OVERFLOW_PATTERNS = [
   /prompt is too long/i,
@@ -1602,16 +1663,16 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
       if (t === 'tool_execution_end') {
         let errorSummary = '';
         // Best-effort failure capture for optional memory triggers
-        if (String(ev.toolName||'') === "codex"){
-          const sidKey = String(sessionId||"default");
-          const t = Number((ev && ev.result && ev.result.details && ev.result.details.usage && (ev.result.details.usage.totalTokens || ev.result.details.usage.total_tokens)) || 0) || 0;
-          if (t>0){
+        const toolUsage = extractUsageFromToolEvent(ev);
+        try {
+          if (toolUsage && toolUsage.totalTokens > 0){
+            const sidKey = String(sessionId||"default");
             const prevTotal = sessionUsageTotalsById.get(sidKey) || 0;
-            const nextTotal = prevTotal + t;
+            const nextTotal = prevTotal + (toolUsage.totalTokens || 0);
             sessionUsageTotalsById.set(sidKey, nextTotal);
             try { schedulePersistSessionTokens({ agentId: effectiveAgentId, sessionId, tokens: nextTotal }); } catch {}
           }
-        }
+        } catch {}
         try {
           const isErr = !!(ev?.isError || ev?.error || (ev?.result && ((ev.result.details && ev.result.details.ok===false) || ev.result.error)));
           if (isErr) {
@@ -1673,6 +1734,8 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
             errorSummary,
             sessionId,
             cached: cachedFlag,
+            usage: toolUsage || undefined,
+            usageSource: toolUsage ? 'tool' : undefined,
           });
         } catch {}
         try { persistToolResultToDisk({ agentId: effectiveAgentId, sessionId, event: ev }); } catch {}
@@ -2494,7 +2557,7 @@ async function handleLocalFile(req, res) {
     const filePath = runWithContext({ sessionId: sid || undefined, agentId: ctx.agentId, agentHomeRoot: ctx.agentHomeDir, workspaceRoot: ws }, () => ensureReadAllowed(p));
     const data = await readFile(filePath);
     const type = extname(filePath).toLowerCase();
-    const ct = type === '.png' ? 'image/png' : type === '.jpg' || type === '.jpeg' ? 'image/jpeg' : type === '.webp' ? 'image/webp' : 'application/octet-stream';
+    const ct = type === '.png' ? 'image/png' : type === '.jpg' || type === '.jpeg' ? 'image/jpeg' : type === '.gif' ? 'image/gif' : type === '.webp' ? 'image/webp' : 'application/octet-stream';
     res.writeHead(200, { 'content-type': ct, 'cache-control': 'no-store' });
     res.end(data);
   } catch (e) {

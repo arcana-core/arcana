@@ -58,7 +58,22 @@ export class ToolDaemonClient{
       if (timeoutMs > 0){
         timeoutHandle = setTimeout(function(){ try { ctrl.abort(); } catch {} }, timeoutMs);
       }
-      const res = await fetch(url, { method: "POST", headers: { ...this._authHeaders(), "content-type":"application/json" }, body: payload, signal: ctrl.signal });
+      let res;
+try {
+  res = await fetch(url, { method: "POST", headers: { ...this._authHeaders(), "content-type":"application/json" }, body: payload, signal: ctrl.signal });
+} catch (fetchErr) {
+  const fetchMsg = String(fetchErr?.message || fetchErr || "");
+  const isDown = /ECONNREFUSED|fetch failed|ECONNRESET|EPIPE|socket hang up|network/i.test(fetchMsg);
+  if (isDown) {
+    const wrapped = new Error(
+      "Tool daemon is not reachable at " + this.baseUrl + " — it may have crashed or not been started. " +
+      "Restart it with: services action=restart id=tool-daemon  (Original: " + fetchMsg + ")"
+    );
+    wrapped.code = "TOOL_DAEMON_DOWN";
+    throw wrapped;
+  }
+  throw fetchErr;
+}
       const text = await res.text();
       try { return JSON.parse(text); } catch { return { ok:false, error:"invalid_json", raw:text }; }
     } finally {

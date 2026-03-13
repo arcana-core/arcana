@@ -4,6 +4,6 @@ const { contextBridge, ipcRenderer } = require('electron');
 try {
   contextBridge.exposeInMainWorld('arcana', {
     pickWorkspace: (opts) => ipcRenderer.invoke('arcana:pickWorkspace', opts || {}),
+    getApiToken: () => ipcRenderer.invoke('arcana:getApiToken'),
   });
 } catch {}
-

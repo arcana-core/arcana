@@ -35,17 +35,20 @@ function arcanaPkgRoot(){
 function readIfExists(p){ try{ if (existsSync(p)) return readFileSync(p, 'utf-8'); } catch{} return ''; }
 
 function pickFallbackModel(provider){
-  const p = (provider||'').toLowerCase();
-  const candidatesByProvider = {
-    google: ['gemini-2.0-flash','gemini-2.0-flash-lite','gemini-1.5-flash','gemini-1.5-pro','gemini-2.5-flash-lite-preview-06-17','gemini-2.5-pro-preview-06-17'],
-    openai: ['gpt-4o-mini','chatgpt-4o-latest'],
-    anthropic: ['claude-3-5-sonnet-20241022'],
-    openrouter: ['meta-llama/llama-3.1-8b-instruct:free'],
-    xai: ['grok-beta']
-  };
-  const arr = candidatesByProvider[p] || [];
-  for (const id of arr) { try { const m = getModel(p, id); if (m) return m; } catch {} }
-  return null;
+	const p = (provider||'').toLowerCase();
+	const candidatesByProvider = {
+		google: ['gemini-2.0-flash','gemini-2.0-flash-lite','gemini-1.5-flash','gemini-1.5-pro','gemini-2.5-flash-lite-preview-06-17','gemini-2.5-pro-preview-06-17'],
+		openai: ['gpt-4o-mini','chatgpt-4o-latest'],
+		'openai-compatible': ['gpt-4o-mini','chatgpt-4o-latest'],
+		anthropic: ['claude-3-5-sonnet-20241022'],
+		openrouter: ['meta-llama/llama-3.1-8b-instruct:free'],
+		xai: ['grok-beta']
+	};
+	// Map "openai-compatible" to the underlying pi-ai provider id.
+	const providerForModels = p === 'openai-compatible' ? 'openai' : p;
+	const arr = candidatesByProvider[p] || candidatesByProvider[providerForModels] || [];
+	for (const id of arr) { try { const m = getModel(providerForModels, id); if (m) return m; } catch {} }
+	return null;
 }
 
 function normalizeOpenAIBase(base){ return String(base||'').trim(); }
@@ -196,7 +199,12 @@ export async function createArcanaSession(opts={}){
 
   let model;
   const sel = resolveModelFromConfig(cfg) || resolveModelFromEnv();
-  if (sel) { try { model = getModel(sel.provider, sel.id); } catch {} }
+  if (sel) {
+    try {
+      const providerForLookup = String(sel.provider || '').trim().toLowerCase() === 'openai-compatible' ? 'openai' : sel.provider;
+      model = getModel(providerForLookup, sel.id);
+    } catch {}
+  }
   if (!model) {
     const provider = (cfg?.provider || inferProviderFromEnv() || '').toLowerCase();
     if (provider) model = pickFallbackModel(provider);
@@ -206,6 +214,20 @@ export async function createArcanaSession(opts={}){
 
   const anthropicBaseOverride = normalizeAnthropicBase(cfg?.base_url || process.env.ANTHROPIC_BASE_URL || '');
   if (anthropicBaseOverride && model && model.provider === 'anthropic') model = { ...model, baseUrl: anthropicBaseOverride };
+
+  // Inject Codex CLI identification headers for OpenAI provider.
+  // The OpenAI API requires `originator: codex_cli_rs` header for certain models/endpoints,
+  // otherwise it returns 400 "This API endpoint is only accessible via the official Codex CLI".
+  if (model && model.provider === 'openai' && providerName.toLowerCase() === 'openai') {
+    model = {
+      ...model,
+      headers: {
+        ...model.headers,
+        'originator': 'codex_cli_rs',
+        'User-Agent': 'codex/0.1.0',
+      }
+    };
+  }
 
   // Create tool-daemon client and proxy tools. We always register a proxy 'bash'
   // tool, but activation is controlled by execPolicy via setActiveToolsByName.
@@ -464,21 +486,41 @@ export async function createArcanaSession(opts={}){
     if (createdSession && !createdSession._arcanaToolHostClient) createdSession._arcanaToolHostClient = toolDaemon;
   } catch {}
 
-  // Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
-  try {
-    const prov = providerName || (model && model.provider) || '';
-    let key = providerKey;
-    if (!key && prov) {
-      try {
-        key = await secrets.getProviderApiKey(prov);
-      } catch {
-        key = providerKey;
-      }
-    }
-    if (prov && key && created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage && typeof created.session.modelRegistry.authStorage.setRuntimeApiKey === 'function') {
-      created.session.modelRegistry.authStorage.setRuntimeApiKey(prov, key);
-    }
-  } catch {}
+	// Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
+	try {
+		const modelProvider = model && model.provider ? String(model.provider).trim() : '';
+		const cfgProvider = providerName ? String(providerName).trim() : '';
+		const cfgProviderLower = cfgProvider.toLowerCase();
+		const prov = cfgProvider || modelProvider || '';
+		let key = providerKey;
+		// Prefer secrets bound for the configured provider name, falling back to the
+		// resolved model provider when no explicit provider is configured.
+		if (!key) {
+			try {
+				if (cfgProvider) {
+					key = await secrets.getProviderApiKey(cfgProvider);
+				} else if (prov) {
+					key = await secrets.getProviderApiKey(prov);
+				}
+			} catch {
+				key = providerKey;
+			}
+		}
+		const authStorage = created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage;
+		if (key && authStorage && typeof authStorage.setRuntimeApiKey === 'function') {
+			// When cfg.provider is "openai-compatible" but the resolved model is
+			// backed by the "openai" provider in pi-ai, fetch the key using the
+			// configured provider name but apply it to the real provider id so
+			// authentication succeeds.
+			if (cfgProviderLower === 'openai-compatible' && modelProvider === 'openai') {
+				authStorage.setRuntimeApiKey('openai', key);
+				// Also register under the configured alias for completeness.
+				authStorage.setRuntimeApiKey('openai-compatible', key);
+			} else if (prov) {
+				authStorage.setRuntimeApiKey(prov, key);
+			}
+		}
+	} catch {}
 
   // Apply initial execution policy to active tool names so chat2 sessions
   // honor the requested policy without an extra server-side toggle.

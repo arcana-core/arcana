@@ -1,7 +1,7 @@
 import { join, basename } from 'node:path';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
-import { getModel } from '@mariozechner/pi-ai';
+import { getModel, getProviders } from '@mariozechner/pi-ai';
 import { loadArcanaConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { resolveWorkspaceRoot } from './workspace-guard.js';
 import { loadArcanaPlugins } from './plugin-loader.js';
@@ -25,12 +25,14 @@ function pickFallbackModel(provider){
   const candidatesByProvider = {
     google: ['gemini-2.0-flash','gemini-2.0-flash-lite','gemini-1.5-flash','gemini-1.5-pro','gemini-2.5-flash-lite-preview-06-17','gemini-2.5-pro-preview-06-17'],
     openai: ['gpt-4o-mini','chatgpt-4o-latest'],
+    'openai-compatible': ['gpt-4o-mini','chatgpt-4o-latest'],
     anthropic: ['claude-3-5-sonnet-20241022'],
     openrouter: ['meta-llama/llama-3.1-8b-instruct:free'],
     xai: ['grok-beta']
   };
-  const arr = candidatesByProvider[p] || [];
-  for (const id of arr) { try { const m = getModel(p, id); if (m) return m; } catch {} }
+  const providerForModels = p === 'openai-compatible' ? 'openai' : p;
+  const arr = candidatesByProvider[p] || candidatesByProvider[providerForModels] || [];
+  for (const id of arr) { try { const m = getModel(providerForModels, id); if (m) return m; } catch {} }
   return null;
 }
 
@@ -56,7 +58,17 @@ export async function runDoctor({ cwd } = {}){
   const cfg = loadArcanaConfig();
   const cfgOk = !!cfg;
   const prov = String(cfg?.provider || inferProviderFromEnv() || '').trim();
-  const providerKnown = !prov || ['openai','anthropic','google','openrouter','xai'].includes(prov.toLowerCase());
+  let providerKnown = true;
+  let providerList = [];
+  try {
+    providerList = getProviders().map(p => String(p || '').toLowerCase()).filter(Boolean);
+  } catch {
+    providerList = ['openai','anthropic','google','openrouter','xai'];
+  }
+  if (prov) {
+    const pLower = prov.toLowerCase();
+    providerKnown = providerList.includes(pLower) || pLower === 'openai-compatible' || pLower === 'generic';
+  }
   const cfgDetails = cfgOk ? { path: redactPath(cfg.path), provider: cfg.provider||'', model: cfg.model||'', base_url: cfg.base_url||'' } : {};
   checks.push({
     id: 'config',
@@ -64,7 +76,7 @@ export async function runDoctor({ cwd } = {}){
     status: status(cfgOk && providerKnown, cfgOk && !providerKnown),
     code: cfgOk ? (providerKnown ? 'CONFIG_FOUND' : 'CONFIG_PROVIDER_UNKNOWN') : 'CONFIG_NOT_FOUND',
     details: cfgDetails,
-    next: cfgOk ? (providerKnown ? [] : ['Set a supported provider: openai|anthropic|google|openrouter|xai']) : ['Create arcana.config.json or set env ARCANA_MODEL/ARCANA_PROVIDER']
+    next: cfgOk ? (providerKnown ? [] : ['Set a supported provider: one of the providers supported by @mariozechner/pi-ai (see its README), plus openai-compatible or generic for OpenAI-compatible/custom gateways.']) : ['Create arcana.config.json or set env ARCANA_MODEL/ARCANA_PROVIDER']
   });
 
   // env & model resolution
@@ -73,7 +85,10 @@ export async function runDoctor({ cwd } = {}){
   let model = null; let modelCode = 'MODEL_UNAVAILABLE'; let modelNext = [];
   const provider = (cfg?.provider || inferProviderFromEnv() || '').toLowerCase();
   if (modelSel) {
-    try { model = getModel(modelSel.provider, modelSel.id); } catch {}
+    try {
+      const providerForLookup = String(modelSel.provider || '').trim().toLowerCase() === 'openai-compatible' ? 'openai' : modelSel.provider;
+      model = getModel(providerForLookup, modelSel.id);
+    } catch {}
     if (!model) modelNext.push('Check model id or provider in config/env.');
   } else if (provider) {
     model = pickFallbackModel(provider);
@@ -85,7 +100,7 @@ export async function runDoctor({ cwd } = {}){
   try {
     const agentHomeRoot = resolveAgentHomeRoot();
     const { bindings } = await secrets.listNames(agentHomeRoot);
-    const providersNeedingKeys = ['openai','anthropic','google','openrouter','xai'];
+    const providersNeedingKeys = ['openai','openai-compatible','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'];
     secretsFlags = {};
     for (const provId of providersNeedingKeys){
       const name = providerApiKeyName(provId);
@@ -97,7 +112,7 @@ export async function runDoctor({ cwd } = {}){
   } catch {
     secretsFlags = {};
   }
-  const providerRequiresKey = ['openai','anthropic','google','openrouter','xai'].includes(provider);
+  const providerRequiresKey = ['openai','openai-compatible','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'].includes(provider);
   const hasSecretForProvider = providerRequiresKey ? !!secretsFlags[provider] : false;
   const needKey = providerRequiresKey && !hasSecretForProvider && !cfg?.key;
   const envOk = !needKey;

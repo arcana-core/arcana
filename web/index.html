@@ -7,17 +7,9 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="mac-window">
-    <div class="mac-titlebar">
-      <div class="mac-traffic-lights" aria-hidden="true">
-        <span class="mac-light mac-light-close"></span>
-        <span class="mac-light mac-light-minimize"></span>
-        <span class="mac-light mac-light-fullscreen"></span>
-      </div>
-      <div class="mac-title">Arcana</div>
-    </div>
-    <!-- Layout: left agents/sessions/chat, right tabbed display -->
-    <div class="layout">
+  <div class="electron-titlebar" aria-hidden="true"></div>
+  <!-- Layout: left agents/sessions/chat, right tabbed display -->
+  <div class="layout">
       <div class="left" style="flex:0 0 42%;min-width:360px;max-width:640px;border-right:1px solid #e7e7e7;background:#f5f5f5;display:flex;position:relative;">
       <div class="sidebar-group">
         <div id="agents-panel" class="agents-panel">
@@ -58,7 +50,29 @@
         <div style="font-size:12px;color:#666;margin-bottom:4px;">全局默认配置</div>
         <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
           <div>Provider</div>
-          <input id="cfg-provider-global" placeholder="openai|anthropic|google|openrouter|xai" />
+          <select id="cfg-provider-global">
+            <option value="">(auto)</option>
+            <option value="openai">OpenAI</option>
+            <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
+            <option value="azure-openai-responses">Azure OpenAI Responses</option>
+            <option value="openai-codex">OpenAI Codex</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="google">Google AI Studio</option>
+            <option value="google-vertex">Google Vertex AI</option>
+            <option value="google-gemini-cli">Google Gemini CLI</option>
+            <option value="mistral">Mistral</option>
+            <option value="groq">Groq</option>
+            <option value="cerebras">Cerebras</option>
+            <option value="xai">xAI</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="vercel-ai-gateway">Vercel AI Gateway</option>
+            <option value="minimax">MiniMax</option>
+            <option value="github-copilot">GitHub Copilot</option>
+            <option value="antigravity">Antigravity</option>
+            <option value="amazon-bedrock">Amazon Bedrock</option>
+            <option value="moonshot">Moonshot</option>
+            <option value="generic">自定义/Generic</option>
+          </select>
           <div>Model</div>
           <input id="cfg-model-global" placeholder="provider:model-id 或仅 model-id" />
           <div>Base URL</div>
@@ -73,7 +87,29 @@
         <div style="font-size:12px;color:#666;margin-bottom:4px;">当前 Agent 覆盖</div>
         <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
           <div>Provider</div>
-          <input id="cfg-provider-agent" placeholder="留空则使用全局默认" />
+          <select id="cfg-provider-agent">
+            <option value="">(inherit global)</option>
+            <option value="openai">OpenAI</option>
+            <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
+            <option value="azure-openai-responses">Azure OpenAI Responses</option>
+            <option value="openai-codex">OpenAI Codex</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="google">Google AI Studio</option>
+            <option value="google-vertex">Google Vertex AI</option>
+            <option value="google-gemini-cli">Google Gemini CLI</option>
+            <option value="mistral">Mistral</option>
+            <option value="groq">Groq</option>
+            <option value="cerebras">Cerebras</option>
+            <option value="xai">xAI</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="vercel-ai-gateway">Vercel AI Gateway</option>
+            <option value="minimax">MiniMax</option>
+            <option value="github-copilot">GitHub Copilot</option>
+            <option value="antigravity">Antigravity</option>
+            <option value="amazon-bedrock">Amazon Bedrock</option>
+            <option value="moonshot">Moonshot</option>
+            <option value="generic">自定义/Generic</option>
+          </select>
           <div>Model</div>
           <input id="cfg-model-agent" placeholder="留空则使用全局默认" />
           <div>Base URL</div>
@@ -145,7 +181,6 @@
 	        </div>
       </div>
     </div>
-  </div>
   </div>
   <script src='app.js'></script>
 </body>

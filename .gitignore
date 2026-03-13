@@ -12,6 +12,6 @@ tmp-pw-*/
 *.log
 *.tmp
 *.swp
-
+dist/
 whiteboard/data/boards/
 whiteboard/data/control_token

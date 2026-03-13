@@ -14,4 +14,9 @@ This launches the Electron app, starts Arcana's local web server on a random fre
 
 Security defaults: nodeIntegration=false, contextIsolation=true.
 
+Storage isolation: the app sets a persistent Electron partition for its `BrowserWindow` so cookies/localStorage/IndexedDB are isolated from other Electron or browser instances.
+
+- Default partition: `persist:arcana-desktop`
+- Override: set env var `ARCANA_ELECTRON_PARTITION` to a trimmed, non-empty value before launch (e.g., `ARCANA_ELECTRON_PARTITION=persist:arcana-dev npm run dev`).
+
 Note: Auto-update and installers are not included in this phase.

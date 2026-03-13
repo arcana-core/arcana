@@ -45,7 +45,7 @@ export function applyProviderEnv(cfg) {
   const provider = (cfg.provider || "openai").toLowerCase();
   const base = cfg.base_url?.trim();
 
-  if (provider === "openai") {
+  if (provider === "openai" || provider === "openai-compatible") {
     if (base) {
       process.env.OPENAI_BASE_URL = base;      // common convention
       process.env.OPENAI_API_BASE = base;      // alt convention

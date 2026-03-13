@@ -149,7 +149,8 @@ export async function startToolDaemon({ workspaceRoot, port }){
                   const details = { url: r.url, title: r.title, tookMs: r.tookMs };
                   if (screenshotRes && typeof screenshotRes.path === "string") details.screenshotPath = screenshotRes.path;
                   if (screenshotRes && typeof screenshotRes.ok === "boolean") details.screenshotOk = screenshotRes.ok;
-                  return finish(200, { content:[{ type:"text", text: "[external:web_render]\n" + (r.text||"") }], details });
+                  const header = "[external:web_render]\nurl=" + (r.url||"") + " title=" + (r.title||"") + "\n";
+                  return finish(200, { content:[{ type:"text", text: header + (r.text||"") }], details });
                 }
                 if (action === "click"){
                   const r = await bm.click({ headers: req.headers, proxy: args.proxy, selector: args.selector, text: args.text, nth: args.nth, timeoutMs: args.timeoutMs });
@@ -161,7 +162,8 @@ export async function startToolDaemon({ workspaceRoot, port }){
               }
               if (name === "web_extract"){
                 const r = await bm.extract({ headers: req.headers, proxy: args.proxy, maxChars: Number(args.maxChars||20000), autoScroll: Boolean(args.autoScroll) });
-                const wrapped = "[external:web_extract]\n" + String(r.text||"");
+                const header = "[external:web_extract]\nurl=" + (r.url||"") + " title=" + (r.title||"") + "\n";
+                const wrapped = header + String(r.text||"");
                 return finish(200, { content:[{ type:"text", text: wrapped }], details:{ url: r.url, title: r.title, tookMs: r.tookMs } });
               }
               if (name === "web_search"){

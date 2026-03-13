@@ -4,6 +4,23 @@ const input = document.querySelector('#input');
 const sendBtn = document.querySelector('#send');
 let activeAssistant = null; // current assistant bubble to stream text into
 
+// Detect Electron + macOS to enable custom draggable titlebar
+let __arcana_isElectron = false;
+let __arcana_isElectronMac = false;
+try{
+  const hasArcanaBridge = (typeof window !== 'undefined') && !!(window.arcana);
+  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent : '';
+  const platform = (typeof navigator !== 'undefined' && navigator.platform) ? navigator.platform : '';
+  __arcana_isElectron = !!(hasArcanaBridge || (ua && ua.includes('Electron')));
+  if (__arcana_isElectron){
+    try{ document.documentElement.classList.add('is-electron'); } catch {}
+    if (platform && platform.includes('Mac')){
+      __arcana_isElectronMac = true;
+      try{ document.documentElement.classList.add('is-electron-mac'); } catch {}
+    }
+  }
+} catch {}
+
 const GATEWAY_V2_SESSION_KEY_LS = 'arcana.v2.sessionKey.v1';
 const API_TOKEN_LS_KEY = 'arcana.apiToken.v1';
 let gatewayV2Enabled = false;
@@ -13,6 +30,7 @@ let gatewayV2SessionKey = '';
 let gatewayV2Ws = null;
 const gatewayV2Pending = new Map();
 let __apiTokenPromptedOnce = false;
+let __apiTokenHydratedOnce = false;
 
 // Gateway v2 runner auto-start dedupe cache
 let __v2RunnerLastKey = '';
@@ -74,6 +92,72 @@ function ensureGatewayV2SessionKey(){
   } catch { return 'session'; }
 }
 
+async function bindGatewayV2ReactorToSession(sessionId){
+  try{
+    if (!gatewayV2Enabled) return;
+    const sid = String(sessionId || '');
+    if (!sid) return;
+    const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const sessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey();
+    const sk = String(sessionKey || '');
+    if (!sk) return;
+    const qs = 'agentId=' + encodeURIComponent(agentId) + '&sessionKey=' + encodeURIComponent(sk) + '&scope=reactor';
+
+    let value = null;
+    let version = undefined;
+    let canPatch = false;
+    try{
+      const token = getStoredApiToken();
+      const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
+      const r = await fetch('/v2/state?' + qs, headers ? { method:'GET', headers } : { method:'GET' });
+      let j = null;
+      try { j = await r.json(); } catch {}
+      if (r && r.ok && j && typeof j === 'object' && j.ok === true && j.state && typeof j.state === 'object'){
+        const s = j.state;
+        const hasVersion = Object.prototype.hasOwnProperty.call(s, 'version');
+        const hasObjectValue = s.value && typeof s.value === 'object';
+        if (hasObjectValue) value = s.value;
+        if (hasVersion) version = s.version;
+        if (hasVersion && (hasObjectValue || s.value === null)) canPatch = true;
+      }
+    } catch {}
+
+    if (!canPatch) return;
+
+    const next = { ...(value || {}), sessionId: sid };
+    const body = { agentId, sessionKey: sk, scope:'reactor', expectedVersion: version, value: next };
+    const token2 = getStoredApiToken();
+    const headers2 = token2 ? { 'content-type':'application/json', 'authorization':'Bearer ' + token2 } : { 'content-type':'application/json' };
+    const r2 = await fetch('/v2/state', { method:'PATCH', headers: headers2, body: JSON.stringify(body) });
+    if (r2 && r2.status === 409){
+      try{
+        let value2 = null;
+        let version2 = undefined;
+        let canPatch2 = false;
+        const token3 = getStoredApiToken();
+        const headers3 = token3 ? { 'authorization':'Bearer ' + token3 } : undefined;
+        const r3 = await fetch('/v2/state?' + qs, headers3 ? { method:'GET', headers: headers3 } : { method:'GET' });
+        let j3 = null;
+        try { j3 = await r3.json(); } catch {}
+        if (r3 && r3.ok && j3 && typeof j3 === 'object' && j3.ok === true && j3.state && typeof j3.state === 'object'){
+          const s3 = j3.state;
+          const hasVersion2 = Object.prototype.hasOwnProperty.call(s3, 'version');
+          const hasObjectValue2 = s3.value && typeof s3.value === 'object';
+          if (hasObjectValue2) value2 = s3.value;
+          if (hasVersion2) version2 = s3.version;
+          if (hasVersion2 && (hasObjectValue2 || s3.value === null)) canPatch2 = true;
+        }
+        if (!canPatch2) return;
+        const next2 = { ...(value2 || {}), sessionId: sid };
+        const body2 = { agentId, sessionKey: sk, scope:'reactor', expectedVersion: version2, value: next2 };
+        const token4 = getStoredApiToken();
+        const headers4 = token4 ? { 'content-type':'application/json', 'authorization':'Bearer ' + token4 } : { 'content-type':'application/json' };
+        try { await fetch('/v2/state', { method:'PATCH', headers: headers4, body: JSON.stringify(body2) }); } catch {}
+      } catch {}
+    }
+  } catch {}
+}
+
 function getStoredApiToken(){
   try{
     if (typeof localStorage === 'undefined') return '';
@@ -107,7 +191,19 @@ try{
 
       let firstOpts = init || {};
       if (isApi){
-        const token = getStoredApiToken();
+        let token = getStoredApiToken();
+        if (!token && !__apiTokenHydratedOnce && __arcana_isElectron){
+          __apiTokenHydratedOnce = true;
+          try{
+            if (window.arcana && typeof window.arcana.getApiToken === 'function'){
+              const hydrated = await window.arcana.getApiToken();
+              if (hydrated){
+                setStoredApiToken(hydrated);
+                token = getStoredApiToken();
+              }
+            }
+          } catch {}
+        }
         if (token){
           const baseHeaders = (firstOpts && firstOpts.headers) ? firstOpts.headers : {};
           const headers = (baseHeaders && typeof baseHeaders === 'object' && !Array.isArray(baseHeaders)) ? { ...baseHeaders } : {};
@@ -175,7 +271,14 @@ const mainLogsSaveTimers = new Map(); // sessionId -> timeout id
 //   order: string[],
 //   selectedId: string|null,
 //   turnStatus: Map<turnIndex, 'running'|'done'>,
-//   turnUsage: Map<turnIndex, { startSessionTokens:number, lastSessionTokens:number, lastContextTokens:number }>,
+//   // Per-turn usage, indexed by turn index
+//   //   startSessionTokens: number (session total at turn start)
+//   //   lastSessionTokens: number (latest known session total)
+//   //   lastContextTokens: number (latest known context window)
+//   //   turnTokens: number (LLM + tools tokens this turn)
+//   //   toolTokens: number (tool-only tokens this turn)
+//   //   llmTokens: number (LLM-only tokens this turn)
+//   turnUsage: Map<turnIndex, { startSessionTokens:number, lastSessionTokens:number, lastContextTokens:number, turnTokens:number, toolTokens:number, llmTokens:number }>,
 // }
 const toolPanels = new Map();
 const lastToolTurnBySession = new Map(); // sessionId -> current turn index (0-based)
@@ -288,7 +391,10 @@ function serializeToolPanel(panel){
         const s0 = (typeof v.startSessionTokens === 'number' && v.startSessionTokens >= 0) ? v.startSessionTokens : 0;
         const s1 = (typeof v.lastSessionTokens === 'number' && v.lastSessionTokens >= 0) ? v.lastSessionTokens : s0;
         const c1 = (typeof v.lastContextTokens === 'number' && v.lastContextTokens >= 0) ? v.lastContextTokens : 0;
-        tu.push([idx, { startSessionTokens: s0, lastSessionTokens: s1, lastContextTokens: c1 }]);
+        const tt = (typeof v.turnTokens === 'number' && v.turnTokens >= 0) ? v.turnTokens : 0;
+        const toolT = (typeof v.toolTokens === 'number' && v.toolTokens >= 0) ? v.toolTokens : 0;
+        const llmT = (typeof v.llmTokens === 'number' && v.llmTokens >= 0) ? v.llmTokens : 0;
+        tu.push([idx, { startSessionTokens: s0, lastSessionTokens: s1, lastContextTokens: c1, turnTokens: tt, toolTokens: toolT, llmTokens: llmT }]);
       });
       out.turnUsage = tu;
     }
@@ -354,7 +460,10 @@ function deserializeToolPanel(obj){
       const s0 = (typeof rawUsage.startSessionTokens === 'number' && rawUsage.startSessionTokens >= 0) ? rawUsage.startSessionTokens : 0;
       const s1 = (typeof rawUsage.lastSessionTokens === 'number' && rawUsage.lastSessionTokens >= 0) ? rawUsage.lastSessionTokens : s0;
       const c1 = (typeof rawUsage.lastContextTokens === 'number' && rawUsage.lastContextTokens >= 0) ? rawUsage.lastContextTokens : 0;
-      panel.turnUsage.set(idx, { startSessionTokens: s0, lastSessionTokens: s1, lastContextTokens: c1 });
+      const tt = (typeof rawUsage.turnTokens === 'number' && rawUsage.turnTokens >= 0) ? rawUsage.turnTokens : 0;
+      const toolT = (typeof rawUsage.toolTokens === 'number' && rawUsage.toolTokens >= 0) ? rawUsage.toolTokens : 0;
+      const llmT = (typeof rawUsage.llmTokens === 'number' && rawUsage.llmTokens >= 0) ? rawUsage.llmTokens : 0;
+      panel.turnUsage.set(idx, { startSessionTokens: s0, lastSessionTokens: s1, lastContextTokens: c1, turnTokens: tt, toolTokens: toolT, llmTokens: llmT });
     }
 
     try{
@@ -703,8 +812,8 @@ function formatToolUpdateInfo(raw){
 function upsertToolAction(data){
   try{
     const sid = String(data.sessionId || getCurrentSessionId() || '');
-    if (!sid) return;
-    const panel = getToolPanel(sid); if (!panel) return;
+  if (!sid) return;
+  const panel = getToolPanel(sid); if (!panel) return;
     const id = String(data.toolCallId || data.id || data.toolName || (panel.order.length + 1));
     const now = new Date();
     const ts = now.toLocaleTimeString();
@@ -916,20 +1025,23 @@ function renderToolsPanel(sessionId){
     let startSess = 0;
     let lastSess = 0;
     let lastCtx = 0;
+    let turnTokens = 0;
     if (usage && typeof usage === 'object'){
       if (typeof usage.startSessionTokens === 'number' && usage.startSessionTokens >= 0) startSess = usage.startSessionTokens;
       if (typeof usage.lastSessionTokens === 'number' && usage.lastSessionTokens >= 0) lastSess = usage.lastSessionTokens;
       if (typeof usage.lastContextTokens === 'number' && usage.lastContextTokens >= 0) lastCtx = usage.lastContextTokens;
+      if (typeof usage.turnTokens === 'number' && usage.turnTokens >= 0) turnTokens = usage.turnTokens;
     }
     if (lastSess < startSess) lastSess = startSess;
     const delta = Math.max(0, lastSess - startSess);
+    const tokValue = (typeof turnTokens === 'number' && turnTokens > 0) ? turnTokens : delta;
 
     const badges = document.createElement('div');
     badges.className = 'tools-turn-badges';
 
     const tokBadge = document.createElement('div');
     tokBadge.className = 'tools-turn-badge tools-turn-badge-tok';
-    tokBadge.textContent = 'TOK ' + formatCompactNumber(delta);
+    tokBadge.textContent = 'TOK ' + formatCompactNumber(tokValue);
 
     const ctxBadge = document.createElement('div');
     ctxBadge.className = 'tools-turn-badge tools-turn-badge-ctx';
@@ -1466,10 +1578,53 @@ async function createSupportBundleUI(){
     if (linkWrap){
       linkWrap.innerHTML = '';
       if (j.tarPath){
+        const tarPath = String(j.tarPath || '');
+        const url = '/api/local-file?path=' + encodeURIComponent(tarPath) + (sid ? ('&sessionId=' + encodeURIComponent(sid)) : '');
         const a = document.createElement('a');
-        a.href = '/api/local-file?path=' + encodeURIComponent(j.tarPath) + (sid ? ('&sessionId=' + encodeURIComponent(sid)) : '');
         a.textContent = '下载支持包 (tar.gz)';
-        a.target = '_blank';
+
+        const tokenForDownload = getStoredApiToken();
+        if (tokenForDownload){
+          a.href = '#';
+          a.addEventListener('click', async (ev)=>{
+            try{ ev.preventDefault(); } catch {}
+            try{
+              const tokenNow = getStoredApiToken();
+              if (!tokenNow){
+                try{ window.open(url, '_blank'); } catch {}
+                return;
+              }
+              const headersDl = { 'authorization':'Bearer ' + tokenNow };
+              const res = await fetch(url, { headers: headersDl });
+              if (!res || !res.ok){
+                try{ appendLog('[support] 下载失败 HTTP ' + (res ? res.status : '?')); } catch {}
+                return;
+              }
+              const blob = await res.blob();
+              let filename = '';
+              try{
+                const idx = tarPath.lastIndexOf('/');
+                filename = (idx >= 0) ? tarPath.slice(idx + 1) : tarPath;
+              } catch {}
+              if (!filename) filename = 'support-bundle.tar.gz';
+              const blobUrl = URL.createObjectURL(blob);
+              const tmpA = document.createElement('a');
+              tmpA.href = blobUrl;
+              tmpA.download = filename;
+              try{ document.body.appendChild(tmpA); } catch {}
+              try{ tmpA.click(); } catch {}
+              setTimeout(()=>{
+                try{ if (tmpA.parentNode) tmpA.parentNode.removeChild(tmpA); } catch {}
+                try{ URL.revokeObjectURL(blobUrl); } catch {}
+              }, 0);
+            } catch(e){
+              try{ appendLog('[support] 下载失败'); } catch {}
+            }
+          });
+        } else {
+          a.href = url;
+          a.target = '_blank';
+        }
         linkWrap.appendChild(a);
       }
     }
@@ -1939,8 +2094,16 @@ function renderSessionList(items){
 }
 
 async function openSession(id){
+  const prevId = currentId;
   setCurrent(id);
   renderMessages([]); // clear
+  if (prevId && prevId !== id){
+    try{ gatewayV2Pending.clear(); } catch{}
+    activeAssistant = null;
+  }
+  try{
+    bindGatewayV2ReactorToSession(id).catch(()=>{});
+  } catch{}
   const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
   // Restore fullshell policy for this session (or pending fallback)
   try{
@@ -2366,6 +2529,14 @@ function handleGatewayV2Envelope(payload){
       if (evType === 'assistant_message'){
         const data = ev.data || {};
         const replyId = data && data.replyToEventId ? String(data.replyToEventId) : '';
+        const msgSessionId = data && data.sessionId ? String(data.sessionId) : '';
+        if (!msgSessionId || msgSessionId !== currentId){
+          if (replyId && gatewayV2Pending.has(replyId)){
+            gatewayV2Pending.delete(replyId);
+          }
+          try{ requestRefreshList(); } catch{}
+          return;
+        }
         const text = data && data.text ? String(data.text) : '';
         let bubble = null;
         if (replyId && gatewayV2Pending.has(replyId)){
@@ -2564,15 +2735,16 @@ function setupSseConnection(){
                 if (!panel.turnStatus) panel.turnStatus = new Map();
                 panel.turnStatus.set(idx, 'running');
                 if (!panel.turnUsage) panel.turnUsage = new Map();
-                if (snap){
-                  const start = (typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : 0;
-                  const ctx = (typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
-                  panel.turnUsage.set(idx, {
-                    startSessionTokens: start,
-                    lastSessionTokens: start,
-                    lastContextTokens: ctx,
-                  });
-                }
+                const start = (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : 0;
+                const ctx = (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
+                panel.turnUsage.set(idx, {
+                  startSessionTokens: start,
+                  lastSessionTokens: start,
+                  lastContextTokens: ctx,
+                  turnTokens: 0,
+                  toolTokens: 0,
+                  llmTokens: 0,
+                });
                 try{ scheduleSaveToolPanel(sid2); } catch {}
               }
             }
@@ -2619,10 +2791,16 @@ function setupSseConnection(){
                 }
                 const lastSessionTokens = (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : start;
                 const lastContextTokens = (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
+                const curTurn = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
+                const curTool = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
+                const curLlm = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
                 panel.turnUsage.set(idx, {
                   startSessionTokens: start,
                   lastSessionTokens,
                   lastContextTokens,
+                  turnTokens: curTurn,
+                  toolTokens: curTool,
+                  llmTokens: curLlm,
                 });
                 try{ scheduleSaveToolPanel(sid2); } catch {}
               }
@@ -2681,6 +2859,35 @@ function setupSseConnection(){
         const isErr = !!(data.isError || data.error);
         let errMsg = '';
         if (isErr){ const cand = data.error?.message || data.error || data.result?.error?.message || data.result?.error || data.result?.stderr || data.result?.stdout; if (typeof cand === 'string') errMsg = cand; else if (cand) { try { errMsg = JSON.stringify(cand) } catch { errMsg = String(cand) } } }
+        try {
+          const targetId = data.sessionId || sid;
+          const sid2 = String(targetId || '');
+          if (sid2 && data.usage && typeof data.usage.totalTokens === 'number'){
+            const idx = lastToolTurnBySession.get(sid2);
+            if (typeof idx === 'number' && !Number.isNaN(idx)){
+              const panel = getToolPanel(sid2);
+              if (panel){
+                if (!panel.turnUsage) panel.turnUsage = new Map();
+                const existing = panel.turnUsage.get(idx) || {};
+                const curTurn = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
+                const curTool = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
+                const curLlm = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
+                const add = Number(data.usage.totalTokens) || 0;
+                const nextTurn = curTurn + (add > 0 ? add : 0);
+                const nextTool = curTool + (add > 0 ? add : 0);
+                panel.turnUsage.set(idx, {
+                  startSessionTokens: (typeof existing.startSessionTokens === 'number' && existing.startSessionTokens >= 0) ? existing.startSessionTokens : 0,
+                  lastSessionTokens: (typeof existing.lastSessionTokens === 'number' && existing.lastSessionTokens >= 0) ? existing.lastSessionTokens : 0,
+                  lastContextTokens: (typeof existing.lastContextTokens === 'number' && existing.lastContextTokens >= 0) ? existing.lastContextTokens : 0,
+                  turnTokens: nextTurn,
+                  toolTokens: nextTool,
+                  llmTokens: curLlm,
+                });
+                try{ scheduleSaveToolPanel(sid2); } catch {}
+              }
+            }
+          }
+        } catch {}
         try { upsertToolAction(data); } catch {}
         const cachedFlag = data.cached ? ' cached' : '';
         logTools(sid, 'tool end: ' + (data.toolName||'') + (isErr ? (' error: ' + (errMsg||'')) : ' ok') + cachedFlag);
@@ -2823,10 +3030,19 @@ function setupSseConnection(){
                 }
                 const lastSessionTokens = (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : start;
                 const lastContextTokens = (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
+                const add = (typeof data.totalTokens === 'number' && data.totalTokens > 0) ? Number(data.totalTokens) || 0 : 0;
+                const curTurn = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
+                const curTool = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
+                const curLlm = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
+                const nextLlm = curLlm + add;
+                const nextTurn = curTurn + add;
                 panel.turnUsage.set(idx, {
                   startSessionTokens: start,
                   lastSessionTokens,
                   lastContextTokens,
+                  turnTokens: nextTurn,
+                  toolTokens: curTool,
+                  llmTokens: nextLlm,
                 });
                 try{ scheduleSaveToolPanel(sid2); } catch {}
               }
@@ -2863,8 +3079,12 @@ function setupSseConnection(){
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
+        // Extract MEDIA refs from text so they render as images instead of raw text
+        const extracted = extractMediaFromAssistantText(data.text || '');
+        const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : (data.text || '');
+        const mediaRefsFromText = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
         try {
-          const txt = typeof data.text === "string" ? data.text : "";
+          const txt = typeof cleanText === "string" ? cleanText : "";
           let ti = Number(lastToolTurnBySession.get(String(sid2)));
           if (!Number.isFinite(ti)) ti = 0;
           upsertLlmAction(String(sid2), ti, { argsSummary: "Output: " + txt.length + " chars" });
@@ -2874,8 +3094,39 @@ function setupSseConnection(){
         setTyping(activeAssistant, false);
         {
         const parts = ensureBubbleParts(activeAssistant);
-        if (parts && parts.text) parts.text.textContent = data.text || '';
-        else activeAssistant.textContent = data.text || '';
+        if (parts && parts.text) parts.text.textContent = cleanText;
+        else activeAssistant.textContent = cleanText;
+        // Render MEDIA refs as images (client-side fallback for missing assistant_image events)
+        if (parts && parts.media && mediaRefsFromText.length){
+          let sidCurrent = '';
+          try { sidCurrent = String((typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || ''); } catch{}
+          for (const refRaw of mediaRefsFromText){
+            const ref = String(refRaw || '').trim();
+            if (!ref) continue;
+            // Skip if this image is already rendered (avoid duplicates with assistant_image SSE)
+            const existingSrcs = new Set();
+            try { for (const img of parts.media.querySelectorAll('img')) existingSrcs.add(img.src); } catch{}
+            const lower = ref.toLowerCase();
+            let src = ref;
+            if (!(lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:'))){
+              const pathParam = encodeURIComponent(ref);
+              const sidParam = sidCurrent ? '&sessionId=' + encodeURIComponent(sidCurrent) : '';
+              src = '/api/local-file?path=' + pathParam + sidParam;
+            }
+            // Check for duplicate by comparing the path portion
+            let isDup = false;
+            try { for (const existing of existingSrcs) { if (existing.includes(encodeURIComponent(ref)) || existing === src) { isDup = true; break; } } } catch{}
+            if (!isDup){
+              const img = document.createElement('img');
+              img.src = src;
+              img.style.maxWidth = '100%';
+              img.style.borderRadius = '6px';
+              img.style.display = 'block';
+              img.style.marginTop = '8px';
+              parts.media.appendChild(img);
+            }
+          }
+        }
       }
         messages.scrollTop = messages.scrollHeight;
         try { if (currentId) markSessionSeen(currentId); } catch {}

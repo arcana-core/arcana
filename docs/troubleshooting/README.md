@@ -9,7 +9,8 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
   - Create arcana.config.json in the repo root (or point ARCANA_CONFIG at a config file) or set ARCANA_MODEL/ARCANA_PROVIDER
 
 - Unknown provider (CONFIG_PROVIDER_UNKNOWN)
-  - Use one of: openai, anthropic, google, openrouter, xai
+  - Use a provider supported by @mariozechner/pi-ai (see its README Supported Providers section), for example openai, azure-openai-responses, anthropic, google, google-vertex, mistral, groq, cerebras, xai, openrouter, vercel-ai-gateway, minimax, amazon-bedrock, moonshot.
+  - Arcana also accepts `openai-compatible` for OpenAI-compatible APIs (e.g. Ollama, vLLM, LM Studio) and `generic` for fully custom gateways.
 
 - API key missing (ENV_API_KEY_MISSING)
 - Open the Secrets UI and bind providers/<provider>/api_key for your chosen provider（例如在 Secrets 区域为 providers/openai/api_key 保存 API Key，值会加密写入内部密码箱）。
@@ -29,6 +30,10 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
 - Playwright launch failed (PLAYWRIGHT_LAUNCH_FAILED)
   - npx playwright install; set ARCANA_PW_ENGINE=chromium|firefox|webkit
   - To debug with a visible browser, set ARCANA_PW_HEADLESS=false or call the web_render tool with action=open on a machine with a GUI.
+
+- Web tools returning empty or inconsistent text
+  - The tool-daemon browser reuses a profile per agent by default so web_render and web_extract calls share cookies and navigation history across tool calls.
+  - To isolate profiles per session (for example in multi-tenant setups), set ARCANA_BROWSER_ISOLATE_BY_SESSION=1 before starting services or pass the header x-arcana-browser-isolate=1 to the tool-daemon.
 
 - Unexpected automatic memory writes
   - Automatic Tier1 memory triggers are disabled by default.

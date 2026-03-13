@@ -14,7 +14,9 @@
     "support-bundle": "node ./bin/arcana.js support-bundle",
     "web:search": "node ./bin/arcana.js web search",
     "cron:once": "node ./bin/arcana.js cron once",
-    "cron:serve": "node ./bin/arcana.js cron serve"
+    "cron:serve": "node ./bin/arcana.js cron serve",
+    "gateway": "node ./bin/arcana.js gateway serve",
+    "gateway:serve": "node ./bin/arcana.js gateway serve"
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.54.0",

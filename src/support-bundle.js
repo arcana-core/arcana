@@ -50,7 +50,7 @@ async function envSummary(){
   try {
     const agentHomeRoot = resolveAgentHomeRoot();
     const { bindings } = await secrets.listNames(agentHomeRoot);
-    const providers = ['openai','anthropic','google','openrouter','xai'];
+    const providers = ['openai','openai-compatible','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'];
     const flags = {};
     for (const prov of providers){
       const name = providerApiKeyName(prov);
