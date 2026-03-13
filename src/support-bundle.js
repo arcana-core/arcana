@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import * as fs from 'node:fs';
 import { join, basename } from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -83,6 +84,166 @@ function versionSummary(){
   };
 }
 
+function networkSummary(){
+  const summary = {};
+  try {
+    const ifaces = os.networkInterfaces() || {};
+    for (const name of Object.keys(ifaces)){
+      const addrs = Array.isArray(ifaces[name]) ? ifaces[name] : [];
+      const info = {
+        address_count: 0,
+        ipv4_count: 0,
+        ipv6_count: 0,
+        internal: false,
+        has_external_ipv4: false,
+        has_external_ipv6: false,
+      };
+      for (const addr of addrs){
+        info.address_count += 1;
+        const family = addr && addr.family;
+        const isV6 = family === 'IPv6' || family === 6;
+        if (isV6){
+          info.ipv6_count += 1;
+        } else {
+          info.ipv4_count += 1;
+        }
+        const isInternal = !!(addr && addr.internal);
+        if (isInternal){
+          info.internal = true;
+        } else if (isV6){
+          info.has_external_ipv6 = true;
+        } else {
+          info.has_external_ipv4 = true;
+        }
+      }
+      summary[name] = info;
+    }
+  } catch {
+    return {};
+  }
+  return summary;
+}
+
+function safeDiskStats(path){
+  try{
+    if (!path) return null;
+    if (typeof fs.statfsSync !== 'function') return null;
+  } catch {
+    return null;
+  }
+  try{
+    const st = fs.statfsSync(path);
+    if (!st) return null;
+    const blockSize = typeof st.bsize === 'number' && st.bsize > 0 ? st.bsize : 1;
+    const total = typeof st.blocks === 'number' ? st.blocks * blockSize : null;
+    const free = typeof st.bfree === 'number' ? st.bfree * blockSize : null;
+    const available = typeof st.bavail === 'number' ? st.bavail * blockSize : null;
+    return {
+      path: redactPath(path),
+      total_bytes: total,
+      free_bytes: free,
+      available_bytes: available,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function systemSummary({ baseDir, cwd }){
+  const sys = {};
+  try{
+    const now = new Date();
+    const workspaceCwd = cwd || process.cwd();
+    let workspaceRoot = '';
+    try {
+      workspaceRoot = resolveWorkspaceRoot();
+    } catch {}
+    let agentHomeRoot = '';
+    try {
+      agentHomeRoot = resolveAgentHomeRoot();
+    } catch {}
+
+    sys.workspace_root = workspaceRoot ? redactPath(workspaceRoot) : '';
+    sys.homedir = '<HOME>';
+    sys.cwd = redactPath(workspaceCwd);
+    if (agentHomeRoot) sys.agent_home_root = redactPath(agentHomeRoot);
+
+    try{
+      sys.os = {
+        platform: os.platform(),
+        arch: os.arch(),
+        release: os.release(),
+        version: os.version ? os.version() : '',
+        type: os.type(),
+      };
+    } catch {}
+
+    try{
+      let timeZone = '';
+      try{
+        const tz = Intl && Intl.DateTimeFormat().resolvedOptions().timeZone;
+        if (typeof tz === 'string') timeZone = tz;
+      } catch {}
+      sys.runtime = {
+        node_version: process.version,
+        process_versions: process.versions,
+        uptime_seconds: typeof process.uptime === 'function' ? process.uptime() : null,
+        timestamp: now.toISOString(),
+        timezone: timeZone,
+      };
+    } catch {}
+
+    try{
+      sys.loadavg = os.loadavg();
+    } catch {}
+
+    try{
+      sys.memory = {
+        total_bytes: os.totalmem(),
+        free_bytes: os.freemem(),
+      };
+    } catch {}
+
+    try{
+      const cpus = os.cpus() || [];
+      const cpuCount = cpus.length || 0;
+      const models = [];
+      for (const c of cpus){
+        if (c && typeof c.model === 'string' && !models.includes(c.model)) models.push(c.model);
+      }
+      sys.cpu = {
+        count: cpuCount,
+        model: models.length ? models[0] : '',
+        models,
+      };
+    } catch {}
+
+    try{
+      sys.network = networkSummary();
+    } catch {}
+
+    try{
+      const disk = {};
+      if (workspaceRoot){
+        const wsStats = safeDiskStats(workspaceRoot);
+        if (wsStats) disk.workspace_root = wsStats;
+      }
+      const bundleStats = safeDiskStats(baseDir);
+      if (bundleStats) disk.bundle_output_dir = bundleStats;
+      sys.disk = disk;
+    } catch {}
+
+  } catch (err){
+    sys.error = 'system_info_error';
+    try{
+      const workspaceRoot = resolveWorkspaceRoot();
+      sys.workspace_root = redactPath(workspaceRoot);
+    } catch {}
+    sys.homedir = '<HOME>';
+  }
+  return sys;
+}
+
 export async function createSupportBundle({ outDir, cwd }={}){
   const stamp = new Date().toISOString().replace(/[:.]/g,'-');
   const baseDir = (outDir && outDir.trim()) ? outDir.trim() : join(process.cwd(), 'arcana-support-' + stamp);
@@ -111,12 +272,11 @@ export async function createSupportBundle({ outDir, cwd }={}){
   };
   writeFileSync(join(baseDir,'plugins.json'), JSON.stringify(pluginInfo, null, 2));
 
-  // system info minimal
-  const sys = {
-    workspace_root: redactPath(resolveWorkspaceRoot()),
-    homedir: '<HOME>',
-  };
-  writeFileSync(join(baseDir,'system.json'), JSON.stringify(sys, null, 2));
+  // system info snapshot (privacy-conscious, redacted paths)
+  try {
+    const sys = systemSummary({ baseDir, cwd: cwd||process.cwd() });
+    writeFileSync(join(baseDir,'system.json'), JSON.stringify(sys, null, 2));
+  } catch {}
 
   // Try to create tar.gz if tar is available
   let tarPath = '';

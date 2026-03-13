@@ -42,7 +42,7 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
 
 Support Bundle
 - Run: node ./bin/arcana.js support-bundle --out ./tmp/arcana-support
-- The bundle contains: doctor.json, config.sanitized.json, env.sanitized.json, versions.json, plugins.json, system.json
+- The bundle contains: doctor.json, config.sanitized.json, env.sanitized.json, versions.json, plugins.json, system.json (with OS/runtime/disk/network summary; still redacted, no IPs or MACs)
 - Secrets/tokens are redacted; personal absolute paths are replaced with <HOME>/…/basename
 
 - Tool execution timeouts
