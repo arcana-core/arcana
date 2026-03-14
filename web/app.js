@@ -3336,8 +3336,40 @@ function renderLiveInfo(){
 
 // --- Vault (Env) UI ---
 
+let __arcana_secretsStartupCheckScheduled = false;
+
+function scheduleSecretsStartupCheck(){
+  try{
+    if (__arcana_secretsStartupCheckScheduled) return;
+    __arcana_secretsStartupCheckScheduled = true;
+  } catch {}
+  try{
+    setTimeout(async ()=>{
+      try{
+        const r = await fetch('/api/secrets/status', { method:'GET', cache:'no-store' });
+        if (!r || !r.ok) return;
+        let j = null;
+        try { j = await r.json(); } catch { j = null; }
+        if (!j || typeof j !== 'object') return;
+        const initialized = !!j.initialized;
+        const locked = !!j.locked;
+        if (!initialized || locked){
+          try { openSecrets().catch(()=>{}); } catch {}
+        }
+      } catch {}
+    }, 250);
+  } catch {}
+}
+
 async function openSecrets(){
+  // Idempotent: if a secrets overlay is already present, do nothing.
+  try{
+    const existing = document.querySelector('[data-arcana-secrets-overlay="1"]');
+    if (existing) return;
+  } catch {}
+
   const overlay = document.createElement('div');
+  try { overlay.dataset.arcanaSecretsOverlay = '1'; } catch {}
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:10000;';
   const dialog = document.createElement('div');
   dialog.style.cssText = 'width:640px;max-width:95vw;max-height:90vh;overflow:auto;background:#fff;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.25);padding:14px;';
@@ -3585,6 +3617,7 @@ async function openSecrets(){
 }
 
 try { (document.getElementById('cfg-secrets')||{}).addEventListener('click', ()=>{ openSecrets().catch(()=>{}) }) } catch {}
+try { scheduleSecretsStartupCheck(); } catch {}
 
 
 // Virtual LLM action per turn (no actual tool events)
