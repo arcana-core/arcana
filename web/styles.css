@@ -206,3 +206,8 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
   /* Stacked layout: chat fills full width */
   .left > .wechat{width:100% !important}
 }
+/* Message column container for bubble + timestamp */
+.msg-col{display:flex;flex-direction:column;max-width:100%;min-width:0}
+/* Message timestamp - WhatsApp style, below bubble */
+.msg-time{font-size:11px;color:#999;margin-top:2px;padding:0 4px}
+.msg.me .msg-time{text-align:right}

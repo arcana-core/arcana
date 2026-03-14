@@ -1217,21 +1217,33 @@ async function pickWorkspace(){
   });
 }
 
-function appendMessage(role, text = ''){
-  const wrap = document.createElement('div');
-  wrap.className = 'msg ' + (role === 'user' ? 'me' : 'other');
-  const avatar = document.createElement('img');
-  avatar.className = 'avatar';
-  avatar.alt = role;
-  avatar.src = avatarPath(role);
-  const bubble = document.createElement('div');
-  bubble.className = 'bubble';
-  bubble.textContent = text;
-  wrap.appendChild(avatar);
-  wrap.appendChild(bubble);
-  messages.appendChild(wrap);
-  messages.scrollTop = messages.scrollHeight;
-  return bubble;
+function appendMessage(role, text = '', ts = ''){
+	const wrap = document.createElement('div');
+	wrap.className = 'msg ' + (role === 'user' ? 'me' : 'other');
+	const avatar = document.createElement('img');
+	avatar.className = 'avatar';
+	avatar.alt = role;
+	avatar.src = avatarPath(role);
+	const col = document.createElement('div');
+	col.className = 'msg-col';
+	const bubble = document.createElement('div');
+	bubble.className = 'bubble';
+	bubble.textContent = text;
+	col.appendChild(bubble);
+	const timeEl = document.createElement('div');
+	timeEl.className = 'msg-time';
+	if (ts) {
+		try { const d = new Date(ts); if (!isNaN(d.getTime())) timeEl.textContent = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch {}
+	}
+	if (!timeEl.textContent) {
+		try { timeEl.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch {}
+	}
+	col.appendChild(timeEl);
+	wrap.appendChild(avatar);
+	wrap.appendChild(col);
+	messages.appendChild(wrap);
+	messages.scrollTop = messages.scrollHeight;
+	return bubble;
 }
 
 function ensureBubbleParts(bubble){
@@ -1971,7 +1983,7 @@ function renderSessionList(items){
     const prefix = unread ? unreadDot : (running ? runningSpinner : '');
     div.innerHTML = prefix + title + metaTime + metaWs;
     const del = document.createElement('button');
-    del.className = 'del'; del.textContent = '删'; del.title = '删除会话';
+    del.className = 'del'; del.textContent = '×'; del.title = '删除会话';
     del.addEventListener('click', async (ev)=>{
       try{
         ev.stopPropagation && ev.stopPropagation(); ev.preventDefault && ev.preventDefault();
@@ -2177,7 +2189,7 @@ function renderMessages(msgs){
       const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
       const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
       const displayText = isHb ? '💓 ' + cleanText : cleanText;
-      const bubble = appendMessage('assistant', displayText);
+      const bubble = appendMessage('assistant', displayText, m.ts || '');
       if (isHb && bubble) bubble.classList.add('heartbeat-msg');
       if (bubble && mediaRefs.length){
         const parts = ensureBubbleParts(bubble) || {};
@@ -2208,7 +2220,7 @@ function renderMessages(msgs){
         }
       }
     } else {
-      appendMessage(role || 'user', rawText);
+      appendMessage(role || 'user', rawText, m.ts || '');
     }
   }
   messages.scrollTop = messages.scrollHeight;
