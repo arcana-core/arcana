@@ -42,10 +42,10 @@ async function search(query, engine){
 async function serve(port){
   const desiredPort = typeof port === 'number' && Number.isFinite(port) ? port : undefined;
   if (desiredPort) process.env.PORT = String(desiredPort);
-  const mod = await import('../server/server.mjs');
-  const fn = mod && (mod.startArcanaWebServer || mod.default?.startArcanaWebServer);
+  const mod = await import('./gateway-v2/index.js');
+  const fn = mod && (mod.startGatewayV2 || mod.default?.startGatewayV2);
   if (typeof fn !== 'function'){
-    throw new Error('startArcanaWebServer not exported from server/server.mjs');
+    throw new Error('startGatewayV2 not exported from src/gateway-v2/index.js');
   }
   const workspaceRoot = String(process.env.ARCANA_WORKSPACE || process.cwd());
   await fn({ port: desiredPort, workspaceRoot });

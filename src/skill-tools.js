@@ -61,6 +61,14 @@ export async function loadSkillTools(skills){
             const sep = href.includes('?') ? '&' : '?';
             href = href + sep + 'mtime=' + String(m);
           } catch {}
+          try {
+            if (skillFile) {
+              const skSt = statSync(skillFile);
+              const sm = skSt.mtimeMs || 0;
+              const sep2 = href.includes('?') ? '&' : '?';
+              href = href + sep2 + 'skillMtime=' + String(sm);
+            }
+          } catch {}
           const mod = await import(href);
           const fn = (mod && mod.default && typeof mod.default === 'function') ? mod.default : null;
           if (!fn) { errors.push({ skill: s.name, tool: name, error: 'no_default_factory' }); continue; }
@@ -81,4 +89,3 @@ export async function loadSkillTools(skills){
 }
 
 export default { loadSkillTools };
-

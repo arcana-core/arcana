@@ -27,8 +27,8 @@ Adapter Contract (recommended)
 - Normalize inbound events into a plain object (example fields):
   - `sessionId`, `text`, `isGroup`, `mentionMe`, `chatId`, `threadId`, `messageId`, `senderId`, `senderName`, `ts`, `dedupeKey`.
 - Provide callbacks:
-  - `onExecuteTurn(msg, prompt, batch)` -> call `/api/chat2` with `prompt`, then reply.
-  - `onExecuteSteer(msg)` -> call `/api/steer`.
+  - `onExecuteTurn(msg, prompt, batch)` -> call Gateway v2 (`/v2/turn-sync`) with `prompt`, then reply.
+  - `onExecuteSteer(msg)` -> (optional, legacy) use steering semantics if you still integrate with `/api/steer`; new adapters should prefer sending another turn via Gateway v2 instead of in-flight steering.
   - `onLocalReply(msg, text)` -> reply without calling Arcana.
 
 Reference Implementation

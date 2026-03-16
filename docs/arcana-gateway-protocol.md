@@ -1,10 +1,10 @@
-# Arcana Gateway Protocol (v2, Proposed)
+# Arcana Gateway Protocol (v2)
 
-This document describes a proposed Gateway control-plane protocol for Arcana v2.
+This document describes the Gateway control-plane protocol for Arcana v2.
 It focuses on HTTP and WebSocket APIs, the core resource model, and how the
-model maps onto the current implementation. Nothing in this document implies
-that the v2 Gateway exists today; the current system still uses `/api/chat2`,
-`/api/events`, and in-process helpers such as `src/event-bus.js`.
+model maps onto the current implementation. The v2 Gateway is implemented
+under `src/gateway-v2` and exposes `/v2/*` HTTP and WebSocket endpoints.
+Arcana's legacy chat HTTP server (`server/server.mjs`) is now wrapped by Gateway v2 for the desktop and CLI. Chat flows use the `/v2/*` HTTP endpoints plus the `/v2/stream` WebSocket; the old `/api/chat2` endpoint remains removed, and the SSE stream `/api/events` is only used by the legacy server when started directly.
 
 ## Goals
 
@@ -12,7 +12,7 @@ that the v2 Gateway exists today; the current system still uses `/api/chat2`,
   (web UI, CLI, channel bridges, cron, heartbeat, services).
 - Normalize how agents, sessions, events, traces, and state are modeled.
 - Offer a WebSocket stream for low-latency event and trace delivery.
-- Keep the design close to the existing `/api/chat2` and SSE event stream so
+- Keep the design close to the existing SSE event stream so
   the Gateway can be implemented as a thin layer over the current code.
 
 ## Resource model
@@ -133,8 +133,7 @@ events on the Gateway stream.
 
 ## HTTP control-plane API (Proposed)
 
-All endpoints are versioned under `/v2/gateway`. They are intended to be thin
-wrappers around the existing `/api/*` handlers.
+All endpoints are versioned under `/v2/gateway` (logical). Today the concrete HTTP surface lives under `/v2/*` (see `src/gateway-v2/index.js`), and chat flows use `/v2/turn` + `/v2/turn-sync` directly.
 
 ### Create or load a session
 
@@ -196,9 +195,9 @@ Response (non-streaming):
 }
 ```
 
-Implementation note: this wraps `POST /api/chat2`. The `policy`, `agentId`, and
-`sessionId` fields map directly onto the existing handler in
-`server/server.mjs`.
+Implementation note: in the current codebase this is implemented by Gateway v2
+endpoints (see `src/gateway-v2/index.js` and `reactor-runner.js`) and fully
+replaces the legacy `POST /api/chat2` handler (which has been removed).
 
 ### Append external events
 
@@ -236,17 +235,18 @@ before deciding whether to enqueue a new turn.
 
 Returns the current `SessionState` derived from recent events and traces.
 
-## WebSocket event stream (Proposed)
+## WebSocket event stream
 
-The WebSocket endpoint replaces the current SSE endpoint `/api/events`. It uses
-the same event shapes but allows bi-directional control messages.
+The WebSocket endpoint replaces the SSE endpoint `/api/events` for the chat UI.
+The current implementation streams all events on `/v2/stream` without an explicit
+subscribe handshake; the subscribe message shape below is the long-term design.
 
-- Endpoint: `GET ws://<host>/v2/gateway/ws` (or `wss://` in production).
+- Endpoint: `GET ws://<host>/v2/stream` (or `wss://` in production).
 - Messages are JSON objects per frame.
 
-### Client subscribe message
+### Client subscribe message (design)
 
-After connecting, clients send a subscribe request:
+In the full design, clients send a subscribe request after connecting:
 
 ```jsonc
 {
@@ -287,16 +287,12 @@ messages carrying the full trace document.
 This section connects the proposed Gateway model to existing code. All mappings
 are descriptive; they do not imply that the Gateway endpoints exist yet.
 
-### `/api/chat2` (server/server.mjs)
+### Gateway v2 chat (src/gateway-v2)
 
-- `POST /api/chat2` corresponds to `POST /v2/gateway/sessions/:sessionId/turns`.
-- Fields:
-  - `message` maps to the Gateway `message` field.
-  - `policy` maps to the Gateway `policy` field.
-  - `agentId` and `sessionId` are shared.
-- The handler lives in `server/server.mjs` (`handleChat2`). It resolves the
-  agent via `agentId`, loads the session from the sessions store, and runs a
-  prompt inside an async-local context.
+- Synchronous chat requests use `/v2/turn-sync` with `{ text, policy, agentId, sessionKey }`.
+- Asynchronous chat requests use `/v2/turn` plus the `/v2/stream` WebSocket.
+- The default runner (`reactor`) lives in `src/gateway-v2/reactor-runner.js` and
+  uses `runArcanaTask` to execute turns.
 
 ### Event bus and `/api/events`
 
@@ -315,17 +311,20 @@ are descriptive; they do not imply that the Gateway endpoints exist yet.
 - Cron jobs today use `runArcanaTask` (`src/cron/arcana-task.js`) to run
   background turns and write results into sessions. They also send Feishu
   replies in some cases.
-- In the Gateway model, cron becomes an ingress source that appends
+- In the Gateway model, cron is conceptually an ingress source that appends
   `source: "cron"` events (for example `cron.job_started`, `cron.job_finished`)
-  via `POST /v2/gateway/sessions/:sessionId/events`, and optionally starts
-  turns via `POST /v2/gateway/sessions/:sessionId/turns`.
+  and triggers turns. In the current implementation, cron runs are wired
+  directly through `runArcanaTask` and share the same event bus + state as
+  Gateway chat turns.
 - Usage metrics already emitted as `llm_usage` events can be wrapped into
   trace spans with `traceId`/`spanId` linked back to the originating job.
 
 ### Channel runtime (`docs/channel-runtime.md`)
 
 - The current Channel Runtime describes how channel adapters normalize inbound
-  messages and call `/api/chat2` or `/api/steer` directly.
+  messages and call Gateway v2 chat (`/v2/turn` or `/v2/turn-sync`). The legacy
+  `/api/steer` endpoint remains available only for backwards compatibility and is
+  no longer used by new channel bridges (they send a new turn instead of in-flight steering).
 - In the Gateway model, a `ChannelPlugin` or adapter would:
   - Normalize inbound events to the `Event` schema.
   - Append them via `POST /v2/gateway/sessions/:sessionId/events`.

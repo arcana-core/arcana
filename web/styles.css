@@ -1,11 +1,11 @@
 :root{--bg:#ededed;--header:#f7f7f7;--text:#111;--sub:#666;--bubble:#fff;--me:#07c160}
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);font:16px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;color:var(--text)}
-.wechat{display:flex;flex-direction:column;height:100%;width:100%;max-width:none;margin:0;background:#f5f5f5}
+body{margin:0;background:var(--bg);font:16px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;color:var(--text);overflow:hidden}
+.wechat{display:flex;flex-direction:column;height:100%;width:auto;min-width:0;max-width:none;margin:0;background:#f5f5f5}
 .chat-header{height:48px;background:var(--header);display:flex;align-items:center;justify-content:center;position:sticky;top:0;z-index:2;border-bottom:1px solid #e7e7e7}
 .chat-header .title{font-weight:600}
-.chat-body{flex:1;overflow:auto;padding:12px 12px 8px;display:flex;flex-direction:column;gap:10px;background:linear-gradient(#f5f5f5,#f0f0f0)}
+.chat-body{flex:1;overflow:auto;min-height:0;padding:12px 12px 8px;display:flex;flex-direction:column;gap:10px;background:linear-gradient(#f5f5f5,#f0f0f0)}
 .msg{display:flex;align-items:flex-end;gap:8px;max-width:90%}
 .msg.other{align-self:flex-start}
 .msg.me{align-self:flex-end;flex-direction:row-reverse}
@@ -70,14 +70,17 @@ body{margin:0;background:var(--bg);font:16px/1.4 -apple-system,BlinkMacSystemFon
 .sidebar{overflow:auto}
 .sidebar button#new-session{width:100%;height:34px;border:1px solid #e1e1e1;border-radius:6px;background:#fff;cursor:pointer}
 .sidebar button#new-session:hover{background:#f6f6f6}
-.sess-item{font-size:14px;color:#333;border-top:1px solid #f2f2f2;padding:6px 10px;cursor:pointer}
+.sess-item{font-size:14px;color:#333;border-top:1px solid #f2f2f2;padding:6px 10px;cursor:pointer;overflow:hidden;min-width:0}
 .sess-item:first-child{border-top:none}
 .sess-item:hover{background:#f8f8f8}
 .sess-item.active{background:#eef;font-weight:600}
 .sess-item .meta{display:block;color:#999;font-size:12px;margin-top:2px}
+.sess-item .meta.ws{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .sess-item .sess-unread-dot{display:inline-block;width:8px;height:8px;background:#07c160;border-radius:50%;margin-right:4px;vertical-align:baseline}
 .sess-item .sess-typing-dot{display:inline-block;width:6px;height:6px;background:#bdbdbd;border-radius:50%;margin-left:6px;vertical-align:baseline;opacity:.2;animation:arcana-blink 1.2s infinite}
 .sess-item .sess-running-spinner{display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid rgba(59,130,246,.3);border-top-color:#3b82f6;margin-left:6px;vertical-align:middle;animation:arcana-spin 0.8s linear infinite}
+.sess-row{display:flex;align-items:center;min-width:0}
+.sess-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sess-item{position:relative;padding-right:28px}
 .sess-item .del{position:absolute;right:8px;top:6px;border:none;background:transparent;color:#999;font-size:12px;cursor:pointer;padding:2px;border-radius:4px;z-index:1;opacity:1;pointer-events:auto}
 .sess-item .del:focus{outline:1px solid #ddd}
@@ -90,12 +93,12 @@ body{margin:0;background:var(--bg);font:16px/1.4 -apple-system,BlinkMacSystemFon
 
 /* Polish to align example.png */
 body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100%)}
-.layout{display:flex;width:100%;flex-direction:row;height:100vh;justify-content:flex-start;gap:16px;padding:8px 8px 0}
-.left{display:flex !important;gap:16px;flex:1 1 0 !important;width:auto !important;max-width:none !important;min-width:0;background:transparent}
+.layout{display:flex;width:100%;flex-direction:row;height:100vh;justify-content:flex-start;gap:16px;padding:8px 8px 0;overflow:hidden}
+.left{display:flex !important;flex-wrap:nowrap;height:100%;min-height:0;gap:16px;flex:1 1 0 !important;width:auto !important;max-width:none !important;min-width:0;background:transparent;align-items:stretch;overflow:hidden}
 .right{flex:0 0 30% !important;width:30% !important}
 /* Flex chat container within .left to prevent overflow */
-.left > .wechat{flex:1 1 auto;min-width:0;width:auto !important}
-#sidebar{width:260px !important;border-right:none;border:1px solid #e9e9e9;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.06);background:#fff;overflow:auto}
+.left > .wechat{flex:1 1 360px;min-width:320px;min-height:0;width:auto !important;max-width:100%}
+#sidebar{width:260px !important;border-right:none;border:1px solid #e9e9e9;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.06);background:#fff;flex:1 1 auto;overflow:auto;min-height:0}
 .wechat{background:#fff;border:1px solid #e9e9e9;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.06);position:relative}
 .chat-header{height:52px;background:#fafafa;border-bottom:1px solid #ececec;border-radius:12px 12px 0 0}
 .chat-body{padding:16px 18px 8px;background:linear-gradient(#fafafa,#f7f7f7)}
@@ -145,8 +148,11 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 .tools-card:hover{background:#fff;border-color:#dbe1f0;box-shadow:0 4px 10px rgba(15,23,42,.08)}
 .tools-card.selected{border-color:#3b82f6;box-shadow:0 0 0 1px rgba(59,130,246,.35),0 6px 16px rgba(15,23,42,.16);background:#f5f7ff}
 .tools-card-header{display:flex;align-items:center;gap:6px}
+.tools-card-header-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px;margin-left:4px}
 .tools-card-name{font-size:13px;font-weight:600;color:#111827;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tools-card-status{font-size:11px;font-weight:500;color:#6b7280;text-transform:uppercase;letter-spacing:.08em}
+.tools-card-badges{display:flex;gap:4px;align-items:center;justify-content:flex-end}
+.tools-card-badge{transform:scale(.96);transform-origin:right center}
 .tools-card-args{font-size:11px;color:#4b5563;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tools-pill{flex:0 0 auto;min-width:22px;height:18px;border-radius:999px;padding:0 6px;font-size:10px;display:flex;align-items:center;justify-content:center;font-weight:600;color:#111827}
 .tools-pill-web{background:#e0f2fe;border:1px solid #7dd3fc}
@@ -183,7 +189,7 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 
 
 /* Agents + sessions columns */
-.sidebar-group{display:flex;flex-direction:row;gap:10px;flex:0 0 auto;max-width:none;}
+.sidebar-group{flex:0 0 430px;min-width:320px;min-height:0;display:flex;flex-direction:row;gap:10px;max-width:none;height:100%;overflow:hidden;}
 .agents-panel{flex:0 0 160px;max-width:180px;border:1px solid #e9e9e9;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.05);background:#fff;display:flex;flex-direction:column;max-height:50vh;overflow:hidden;}
 .agents-header{padding:6px 10px 4px;font-size:13px;font-weight:600;color:#555;border-bottom:1px solid #f0f0f0;}
 #agents-list{flex:1;overflow:auto;padding:4px 0;}
@@ -194,9 +200,17 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 .agent-item .agent-id{flex:1;overflow:hidden;text-overflow:ellipsis;}
 .agent-empty{font-size:12px;color:#999;padding:4px 10px;}
 
+/* Intermediate layout: stack sidebar-group above chat */
+@media (max-width: 1100px){
+  .left{flex-direction:column;flex-wrap:nowrap;overflow:auto;}
+  .sidebar-group{width:100%;height:auto;overflow:visible;}
+  .left > .wechat{width:100%;}
+}
+
 /* Responsive layout for smaller screens */
 @media (max-width: 900px){
-  .layout{flex-direction:column !important;height:auto;}
+  body{overflow:auto;}
+  .layout{flex-direction:column !important;height:auto;overflow:visible;}
   .left{width:100% !important;max-width:none !important;flex:0 0 100% !important;flex-direction:column !important;}
   .right{width:100% !important;max-width:none !important;flex:0 0 100% !important;margin-top:12px;}
   .sidebar-group{flex-direction:column;flex:0 0 auto;max-width:none;width:100%;}
@@ -204,7 +218,7 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
   #sidebar{flex:1;}
   #session-list{max-height:260px;overflow:auto;}
   /* Stacked layout: chat fills full width */
-  .left > .wechat{width:100% !important}
+  .left > .wechat{width:100% !important;min-width:0;flex-basis:auto}
 }
 /* Message column container for bubble + timestamp */
 .msg-col{display:flex;flex-direction:column;max-width:100%;min-width:0}

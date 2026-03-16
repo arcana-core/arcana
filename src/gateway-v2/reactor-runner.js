@@ -112,6 +112,15 @@ export const reactorRunner = {
       return { ok: true, ran: false, lastSeenTs: newLastSeenTs, outputs: [], nextWakeDelayMs: null };
     }
 
+    // Use the most recent message's policy (open|restricted) when available
+    let execPolicy = undefined;
+    try {
+      const lastMsg = messageEvents[messageEvents.length - 1];
+      const rawPol = lastMsg && lastMsg.data && lastMsg.data.policy ? String(lastMsg.data.policy) : '';
+      const p = rawPol.trim().toLowerCase();
+      if (p === 'open' || p === 'restricted') execPolicy = p;
+    } catch {}
+
     const userText = messageEvents
       .map((e) => {
         const d = e && e.data;
@@ -135,6 +144,7 @@ export const reactorRunner = {
       sessionKey,
       logPath,
       agentId,
+      execPolicy,
     });
 
     const sessionId = result && result.sessionId;

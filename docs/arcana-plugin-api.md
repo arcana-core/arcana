@@ -52,7 +52,7 @@ Notes (Proposed):
 
 Channel plugins own ingress and egress for external messaging systems (Feishu,
 Slack, etc.). Today, this behavior is implemented by skills such as
-`skills/feishu` plus scripts that call `/api/chat2` directly.
+`skills/feishu` plus scripts that call Gateway v2 (`/v2/turn-sync`) directly.
 
 In v2, a ChannelPlugin is responsible for:
 
@@ -117,8 +117,8 @@ export default async function channelPlugin(context) {
 
 The Gateway control-plane (see `docs/arcana-gateway-protocol.md`) provides the
 `routeToSession`, `appendEvents`, `startTurn`, and `subscribe` helpers in this
-context. Today, channel bridges instead call `/api/chat2` and read from
-`/api/events`.
+context. Today, channel bridges call Gateway v2 (`/v2/turn-sync`) and read from
+`/v2/stream`.
 
 ### SinkPlugin (Proposed)
 
@@ -282,6 +282,6 @@ Existing code references:
 - `src/plugin-loader.js` discovers plugin modules and registers tools.
 - `src/session.js` integrates plugin tools with built-in tools and skill tools.
 - `skills/feishu/SKILL.md` documents a concrete messaging skill and describes
-  a WebSocket bridge that calls `/api/chat2` directly. In v2, that bridge
+  a WebSocket bridge that calls Gateway v2 (`/v2/turn-sync`) directly. In v2, that bridge
   would be re-expressed as a ChannelPlugin using the Gateway helpers.
 

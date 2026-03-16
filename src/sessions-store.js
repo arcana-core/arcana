@@ -233,10 +233,46 @@ export function appendMessage(sessionId, { role, text, agentId } = {}){
       const currentTitle = String(obj.title || '').trim();
       if (!currentTitle || currentTitle === '新会话'){
         const autoTitle = deriveSessionTitleFromText(textStr);
-        if (autoTitle) obj.title = autoTitle;
+      if (autoTitle) obj.title = autoTitle;
       }
     }
     // appendMessage should always bump updatedAt
+    saveSessionInternal(obj, obj.agentId, { touchUpdatedAt: true });
+    return obj;
+  } finally {
+    releaseSessionLock(lockPath);
+  }
+}
+
+export function upsertLastMessage(sessionId, { role, text, agentId } = {}){
+  const id = String(sessionId || '').trim();
+  if (!id) return null;
+  const normAgentId = normalizeAgentId(agentId);
+  const lockPath = acquireSessionLock(normAgentId, id);
+  if (!lockPath) return null;
+  try {
+    const existing = loadSession(id, { agentId: normAgentId });
+    const obj = existing || {
+      id,
+      title: '新会话',
+      workspace: undefined,
+      agentId: normAgentId,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      messages: [],
+    };
+    obj.agentId = normalizeAgentId(obj.agentId || normAgentId);
+    obj.messages = Array.isArray(obj.messages) ? obj.messages : [];
+    const roleStr = String(role || 'assistant');
+    const textStr = String(text || '');
+    const msgs = obj.messages;
+    const last = msgs.length ? msgs[msgs.length - 1] : null;
+    if (last && last.role === roleStr){
+      last.text = textStr;
+    } else {
+      msgs.push({ role: roleStr, text: textStr, ts: nowIso() });
+    }
+    // upsertLastMessage should always bump updatedAt
     saveSessionInternal(obj, obj.agentId, { touchUpdatedAt: true });
     return obj;
   } finally {
@@ -332,6 +368,7 @@ export default {
   loadSession,
   saveSession,
   appendMessage,
+  upsertLastMessage,
   deleteSession,
   buildHistoryPreludeText,
 };

@@ -23,6 +23,8 @@ try{
 
 const GATEWAY_V2_SESSION_KEY_LS = 'arcana.v2.sessionKey.v1';
 const API_TOKEN_LS_KEY = 'arcana.apiToken.v1';
+const VOICE_INGRESS_BASE_URL = 'http://127.0.0.1:28920/voice';
+const VOICE_TRIGGER_CN = '\u6253\u5f00\u8bed\u97f3';
 let gatewayV2Enabled = false;
 let gatewayV2Detected = false;
 let gatewayV2ProbePromise = null;
@@ -39,11 +41,14 @@ let __v2RunnerInFlight = null;
 async function ensureV2RunnerStarted(){
   try{
     if (!gatewayV2Enabled) return;
-    // ensure session key exists
-    try { if (!gatewayV2SessionKey) gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
-    const sessionKey = String(gatewayV2SessionKey || '');
-    if (!sessionKey) return;
     const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    let sessionId = '';
+    try {
+      const sidFn = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId : null;
+      sessionId = String((sidFn ? sidFn() : currentId) || '');
+    } catch {}
+    const sessionKey = getGatewayV2SessionKeyFor(agentId, sessionId);
+    if (!sessionKey) return;
     const key = String(agentId || '') + '|' + sessionKey;
     if (__v2RunnerLastKey === key){
       // already attempted for this key; if a start is in-flight, await best-effort
@@ -92,14 +97,136 @@ function ensureGatewayV2SessionKey(){
   } catch { return 'session'; }
 }
 
+function getGatewayV2SessionKeyFor(agentId, sessionId){
+  try{
+    const aid = String(agentId || DEFAULT_AGENT_ID);
+    const sid = String(sessionId || '').trim();
+    if (sid){
+      const key = 'sess:' + aid + ':' + sid;
+      try { localStorage.setItem(GATEWAY_V2_SESSION_KEY_LS, key); } catch {}
+      try { gatewayV2SessionKey = key; } catch {}
+      return key;
+    }
+  } catch {}
+  try { gatewayV2SessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey(); } catch {}
+  return String(gatewayV2SessionKey || 'session');
+}
+
+function getGatewayV2SessionKeyForCurrent(){
+  try{
+    const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    let sid = '';
+    try {
+      const sidFn = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId : null;
+      sid = String((sidFn ? sidFn() : currentId) || '');
+    } catch {}
+    return getGatewayV2SessionKeyFor(agentId, sid);
+  } catch {
+    try { gatewayV2SessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey(); } catch {}
+    return String(gatewayV2SessionKey || 'session');
+  }
+}
+
+function hasVoiceOpenIntent(text){
+  try{
+    const raw = String(text || '');
+    const t = raw.trim();
+    if (!t) return false;
+    const lower = t.toLowerCase();
+
+    // Preserve legacy exact triggers
+    if (t === VOICE_TRIGGER_CN || lower === '/voice' || lower === '/mic') return true;
+
+    const compact = t.replace(/\s+/g, '');
+    if (!compact) return false;
+
+    // Guard against explicit negatives combined with voice
+    const hasVoiceWord = compact.includes('\u8bed\u97f3'); // "\u8bed\u97f3" = "voice (CN)"
+    const hasNegation = (
+      compact.includes('\u4e0d\u8981') || // "\u4e0d\u8981" = "do not want"
+      compact.includes('\u4e0d\u60f3') || // "\u4e0d\u60f3" = "do not want"
+      compact.includes('\u5173\u95ed') || // "\u5173\u95ed" = "close"
+      compact.includes('\u5173\u6389')    // "\u5173\u6389" = "shut down"
+    );
+    if (hasVoiceWord && hasNegation) return false;
+
+    // Chinese intent patterns, matched as substrings (not exact matches)
+    const cnPhrases = [
+      '\u6253\u5f00\u8bed\u97f3\u901a\u8bdd', // "open voice call"
+      '\u5f00\u542f\u8bed\u97f3\u901a\u8bdd', // "enable voice call"
+      '\u5f00\u59cb\u8bed\u97f3\u901a\u8bdd', // "start voice call"
+      '\u6253\u5f00\u8bed\u97f3',           // "open voice"
+      '\u5f00\u542f\u8bed\u97f3',           // "enable voice"
+      '\u5f00\u59cb\u8bed\u97f3',           // "start voice"
+      '\u8bed\u97f3\u8f93\u5165'            // "voice input"
+    ];
+    for (let i = 0; i < cnPhrases.length; i++){
+      if (compact.includes(cnPhrases[i])) return true;
+    }
+
+    // English intent patterns, matched case-insensitively
+    const lowerNormalized = lower.replace(/\s+/g, ' ').trim();
+    const enPhrases = [
+      'voice input',
+      'start voice',
+      'start voice input',
+      'open voice',
+      'enable voice',
+      'voice mode'
+    ];
+    for (let i = 0; i < enPhrases.length; i++){
+      if (lowerNormalized.includes(enPhrases[i])) return true;
+    }
+
+    return false;
+  } catch { return false; }
+}
+
+function maybeOpenVoiceIngress(trimmedText){
+  try{
+    const raw = String(trimmedText || '');
+    const t = raw.trim();
+    if (!t) return false;
+    if (!hasVoiceOpenIntent(t)) return false;
+    const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const sessionKey = getGatewayV2SessionKeyForCurrent();
+    const base = VOICE_INGRESS_BASE_URL || '';
+    if (!base || !agentId || !sessionKey) return false;
+    let url = base;
+    let sep = '?';
+    if (url.indexOf('?') !== -1) sep = '&';
+    url = url + sep + 'agentId=' + encodeURIComponent(agentId) + '&sessionKey=' + encodeURIComponent(sessionKey);
+    let win = null;
+    try { win = window.open(url, '_blank', 'noopener'); } catch {}
+    if (!win){
+      let navigated = false;
+      try{
+        if (window && window.location && typeof window.location.assign === 'function'){
+          window.location.assign(url);
+          navigated = true;
+        }
+      } catch {}
+      if (!navigated){
+        try { alert('Voice console URL: ' + url); } catch {}
+      }
+    }
+    try{
+      if (input){
+        input.value = '';
+        autoResize();
+      }
+    } catch {}
+    return true;
+  } catch { return false; }
+}
+
 async function bindGatewayV2ReactorToSession(sessionId){
   try{
     if (!gatewayV2Enabled) return;
     const sid = String(sessionId || '');
     if (!sid) return;
     const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-    const sessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey();
-    const sk = String(sessionKey || '');
+    const sk = getGatewayV2SessionKeyFor(agentId, sid);
     if (!sk) return;
     const qs = 'agentId=' + encodeURIComponent(agentId) + '&sessionKey=' + encodeURIComponent(sk) + '&scope=reactor';
 
@@ -167,11 +294,21 @@ function getStoredApiToken(){
 }
 
 function setStoredApiToken(token){
+  let stored = false;
   try{
     if (typeof localStorage === 'undefined') return;
     const v = String(token || '').trim();
     if (!v) return;
     localStorage.setItem(API_TOKEN_LS_KEY, v);
+    stored = true;
+  } catch {}
+  if (!stored) return;
+  try{
+    // Best-effort: once a token is stored, try to hydrate agents and sessions.
+    (async ()=>{
+      try { await loadAgents(); } catch {}
+      try { await refreshList(); } catch {}
+    })();
   } catch {}
 }
 
@@ -333,6 +470,8 @@ function serializeToolPanel(panel){
         endedAt: a.endedAt,
         sessionId: a.sessionId,
         turnIndex: a.turnIndex,
+        ctxTokens: (typeof a.ctxTokens === 'number' && a.ctxTokens >= 0) ? a.ctxTokens : undefined,
+        tokTokens: (typeof a.tokTokens === 'number' && a.tokTokens >= 0) ? a.tokTokens : undefined,
         log: a.log,
       });
     }
@@ -417,6 +556,8 @@ function deserializeToolPanel(obj){
       if (typeof raw.log === 'string'){
         log = raw.log.length > TOOL_PANELS_MAX_LOG_CHARS ? raw.log.slice(-TOOL_PANELS_MAX_LOG_CHARS) : raw.log;
       }
+      const ctxTokens = (typeof raw.ctxTokens === 'number' && raw.ctxTokens >= 0) ? raw.ctxTokens : undefined;
+      const tokTokens = (typeof raw.tokTokens === 'number' && raw.tokTokens >= 0) ? raw.tokTokens : undefined;
       const action = {
         id,
         toolName: String(raw.toolName || ''),
@@ -428,6 +569,8 @@ function deserializeToolPanel(obj){
         endedAt: String(raw.endedAt || ''),
         sessionId: String(raw.sessionId || ''),
         turnIndex,
+        ctxTokens,
+        tokTokens,
         log,
       };
       panel.actions.set(id, action);
@@ -833,6 +976,8 @@ function upsertToolAction(data){
         endedAt: '',
         sessionId: sid,
         turnIndex: turnIdx,
+        ctxTokens: undefined,
+        tokTokens: undefined,
         log: '',
       };
       panel.actions.set(id, action);
@@ -865,6 +1010,26 @@ function upsertToolAction(data){
     if (data.type === 'tool_execution_end'){
       action.status = data.isError || data.error ? 'error' : 'done';
       action.endedAt = ts;
+      try{
+        const usage = data && data.usage ? data.usage : null;
+        if (usage && typeof usage.totalTokens === 'number' && usage.totalTokens >= 0){
+          action.tokTokens = Number(usage.totalTokens) || 0;
+        }
+        let ctxVal = undefined;
+        if (typeof data.contextTokens === 'number' && data.contextTokens >= 0){
+          ctxVal = Number(data.contextTokens) || 0;
+        } else {
+          try{
+            const snap = ensureLiveForSession(sid);
+            if (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0){
+              ctxVal = Number(snap.contextTokens) || 0;
+            }
+          } catch {}
+        }
+        if (typeof ctxVal === 'number' && ctxVal >= 0){
+          action.ctxTokens = ctxVal;
+        }
+      } catch {}
     }
     if (data.type === 'tool_execution_update'){
       const raw = (typeof data.partialResult !== 'undefined') ? data.partialResult : data.update;
@@ -1043,12 +1208,7 @@ function renderToolsPanel(sessionId){
     tokBadge.className = 'tools-turn-badge tools-turn-badge-tok';
     tokBadge.textContent = 'TOK ' + formatCompactNumber(tokValue);
 
-    const ctxBadge = document.createElement('div');
-    ctxBadge.className = 'tools-turn-badge tools-turn-badge-ctx';
-    ctxBadge.textContent = 'CTX ' + formatCompactNumber(lastCtx);
-
     badges.appendChild(tokBadge);
-    badges.appendChild(ctxBadge);
 
     label.appendChild(labelText);
     label.appendChild(badges);
@@ -1081,12 +1241,39 @@ function renderToolsPanel(sessionId){
       const nameEl = document.createElement('div');
       nameEl.className = 'tools-card-name';
       nameEl.textContent = a.toolName || '(unnamed)';
+
+      const headerRight = document.createElement('div');
+      headerRight.className = 'tools-card-header-right';
       const statusEl = document.createElement('div');
       statusEl.className = 'tools-card-status';
       statusEl.textContent = a.status === 'running' ? 'Running' : a.status === 'error' ? 'Error' : 'Done';
+
+      const badgeRow = document.createElement('div');
+      badgeRow.className = 'tools-card-badges';
+      const tokForCard = (typeof a.tokTokens === 'number' && a.tokTokens > 0) ? a.tokTokens : null;
+      const ctxForCard = (typeof a.ctxTokens === 'number' && a.ctxTokens >= 0) ? a.ctxTokens : null;
+      if (tokForCard != null){
+        const tokBadge = document.createElement('div');
+        tokBadge.className = 'tools-turn-badge tools-turn-badge-tok tools-card-badge';
+        tokBadge.textContent = 'TOK ' + formatCompactNumber(tokForCard);
+        badgeRow.appendChild(tokBadge);
+      }
+      if (ctxForCard != null){
+        const ctxBadge = document.createElement('div');
+        ctxBadge.className = 'tools-turn-badge tools-turn-badge-ctx tools-card-badge';
+        ctxBadge.textContent = 'CTX ' + formatCompactNumber(ctxForCard);
+        badgeRow.appendChild(ctxBadge);
+      }
+      if (badgeRow.childNodes.length){
+        headerRight.appendChild(badgeRow);
+      }
+
       header.appendChild(pill);
       header.appendChild(nameEl);
       header.appendChild(statusEl);
+      if (headerRight.childNodes.length){
+        header.appendChild(headerRight);
+      }
       const argsEl = document.createElement('div');
       argsEl.className = 'tools-card-args';
       argsEl.textContent = a.argsSummary || '';
@@ -1672,6 +1859,14 @@ let currentAgentId = localStorage.getItem(AKEY) || '';
 let hasAgents = false;
 let currentWorkspace = '';
 
+// Small retry/backoff for agents loading (primarily for Electron)
+const AGENTS_RETRY_BASE_MS = 300;
+const AGENTS_RETRY_MAX_MS = 2000;
+const AGENTS_RETRY_MAX_ATTEMPTS = 3;
+let __agentsRetryAttempt = 0;
+let __agentsRetryBackoffMs = 0;
+let __agentsRetryTimer = null;
+
 // Live Info backing state: global + per-session
 // Per-agent model label cache (from config UI fetches)
 // Keyed by agentId; use DEFAULT_AGENT_ID for global default.
@@ -1919,6 +2114,34 @@ async function setCurrentAgent(id){
   }
 }
 
+function __resetAgentsRetryState(){
+  try{
+    __agentsRetryAttempt = 0;
+    __agentsRetryBackoffMs = 0;
+    if (__agentsRetryTimer){
+      try{ clearTimeout(__agentsRetryTimer); } catch{}
+      __agentsRetryTimer = null;
+    }
+  } catch {}
+}
+
+function __scheduleAgentsRetry(){
+  try{
+    if (!__arcana_isElectron) return;
+    if (AGENTS_RETRY_MAX_ATTEMPTS && __agentsRetryAttempt >= AGENTS_RETRY_MAX_ATTEMPTS) return;
+    const base = (typeof __agentsRetryBackoffMs === 'number' && __agentsRetryBackoffMs > 0) ? __agentsRetryBackoffMs : AGENTS_RETRY_BASE_MS;
+    const delay = base > 0 ? base : AGENTS_RETRY_BASE_MS;
+    __agentsRetryBackoffMs = Math.min(AGENTS_RETRY_MAX_MS, delay * 2);
+    __agentsRetryAttempt++;
+    if (__agentsRetryTimer){
+      try{ clearTimeout(__agentsRetryTimer); } catch{}
+    }
+    __agentsRetryTimer = setTimeout(()=>{
+      try{ loadAgents().catch(()=>{}); } catch{}
+    }, delay);
+  } catch {}
+}
+
 async function loadAgents(){
   try{
     const list = await listAgents();
@@ -1938,13 +2161,25 @@ async function loadAgents(){
     renderAgentsList();
     // Ensure config UI reflects the resolved current agent on first load
     try { await loadConfigUI(); } catch {}
+    try{ __resetAgentsRetryState(); } catch {}
   } catch(e){
     hasAgents = false;
     agents = [];
     currentAgentId = '';
     try { localStorage.removeItem(AKEY); } catch {}
-    const panel = qs('agents-panel');
-    if (panel) panel.style.display = 'none';
+    try{
+      const panel = qs('agents-panel');
+      const box = qs('agents-list');
+      if (panel) panel.style.display = '';
+      if (box){
+        box.innerHTML = '';
+        const err = document.createElement('div');
+        err.className = 'agent-empty';
+        err.textContent = '加载 Agent 列表失败，请检查 Arcana API Token 或服务器设置。';
+        box.appendChild(err);
+      }
+    } catch {}
+    try{ __scheduleAgentsRetry(); } catch {}
     appendLog('[agents] 加载失败');
   }
 }
@@ -1981,7 +2216,7 @@ function renderSessionList(items){
     const metaTime = it.updatedAt ? ('<span class=meta>' + new Date(it.updatedAt).toLocaleString() + '</span>') : '';
     const metaWs = it.workspace ? ('<span class=meta ws>' + it.workspace + '</span>') : '';
     const prefix = unread ? unreadDot : (running ? runningSpinner : '');
-    div.innerHTML = prefix + title + metaTime + metaWs;
+    div.innerHTML = '<div class=sess-row>' + prefix + '<span class="sess-title">' + title + '</span></div>' + metaTime + metaWs;
     const del = document.createElement('button');
     del.className = 'del'; del.textContent = '×'; del.title = '删除会话';
     del.addEventListener('click', async (ev)=>{
@@ -2294,7 +2529,7 @@ async function sendWithSession(){
   if (!text) return;
   await ensureSession();
   const sidAtSend = currentId;
-  // For non-agent sessions, ensure we have a workspace so /api/chat2 accepts the request
+  // For non-agent sessions, ensure we have a workspace so legacy HTTP chat APIs accept the request
   if (!hasAgents || !currentAgentId){
     if (!currentWorkspace && sidAtSend){
       try {
@@ -2314,7 +2549,7 @@ async function sendWithSession(){
       const ws = String(currentWorkspace || '').trim();
       if (ws) payload.workspace = ws;
     }
-    const r = await fetch('/api/chat2', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) });
+    const r = await fetch('/v2/turn-sync', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ agentId: payload.agentId, sessionKey: payload.sessionId, sessionId: payload.sessionId, text: payload.message, policy: payload.policy }) });
     let j = null; try { j = await r.json(); } catch {}
     if (!r.ok){
       const parts = [];
@@ -2351,7 +2586,11 @@ async function sendWithGatewayV2(){
     return;
   }
   const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-  try { gatewayV2SessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey(); } catch {}
+  const sessionKey = getGatewayV2SessionKeyForCurrent();
+  if (!sessionKey){
+    await sendWithSession();
+    return;
+  }
   // Ensure reactor runner is started (best-effort)
   try { await ensureV2RunnerStarted(); } catch {}
   appendMessage('user', text);
@@ -2362,33 +2601,61 @@ async function sendWithGatewayV2(){
   setTyping(bubble, true);
   messages.scrollTop = messages.scrollHeight;
   try{
-    const body = { agentId, sessionKey: gatewayV2SessionKey, text };
+    const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
+    const sessionId = (typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || '';
+    const body = { agentId, sessionKey, sessionId, text, policy };
     const token = getStoredApiToken();
     const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
     const r = await fetch('/v2/turn', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
     try { j = await r.json(); } catch {}
-    if (!r.ok || !j || !j.ok || !j.event){
+    if (!r.ok || !j || j.ok === false){
       setTyping(bubble, false);
-      bubble.textContent = !r.ok ? ('[error] HTTP ' + r.status) : '[error] Bad response';
+      const sid = getCurrentSessionId() || currentId || '';
+      const bodyErr = j && j.error ? String(j.error) : '';
+      let msg = '';
+      if (!r.ok){
+        msg = '[error] HTTP ' + r.status + (bodyErr ? (' ' + bodyErr) : '');
+      } else {
+        msg = '[error] ' + (bodyErr || 'Bad response');
+      }
+      bubble.textContent = msg;
+      try { if (sid) logMain(sid, msg); } catch {}
       return;
     }
-    const ev = j.event || {};
-    const evId = ev.eventId ? String(ev.eventId) : '';
-    if (evId){
-      gatewayV2Pending.set(evId, bubble);
-    } else {
-      setTyping(bubble, false);
-    }
+    // On success, still rely on Gateway v2 event stream (assistant_text/thinking_*)
+    // for streaming updates, but perform a final sync so the last message
+    // is never lost even if some events were dropped.
+    try{
+      const sidFromServer = j && j.sessionId ? String(j.sessionId) : '';
+      if (sidFromServer){
+        // Keep current session in sync with the backing Gateway session.
+        if (!currentId || currentId !== sidFromServer){
+          setCurrent(sidFromServer);
+        }
+        // Reload messages from the server so the final assistant message
+        // matches persisted history (covers rare event-stream drops).
+        await openSession(sidFromServer);
+      } else {
+        // Fallback: if we did not get a sessionId, at least refresh the list.
+        requestRefreshList();
+      }
+    } catch{}
   } catch(e){
     setTyping(bubble, false);
-    bubble.textContent = '[error] ' + (((e && e.message) || e));
+    const sid = getCurrentSessionId() || currentId || '';
+    const msg = '[error] ' + (((e && e.message) || e));
+    bubble.textContent = msg;
+    try { if (sid) logMain(sid, msg); } catch {}
   } finally {
     messages.scrollTop = messages.scrollHeight;
   }
 }
 
 async function handleSend(){
+  const trimmed = String((input && input.value) || '').trim();
+  if (!trimmed) return;
+  if (maybeOpenVoiceIngress(trimmed)) return;
   const mode = await ensureTransportReady();
   if (mode === 'v2'){
     await sendWithGatewayV2();
@@ -2405,6 +2672,16 @@ try {
   const stopBtn = document.querySelector('#stop');
   if (stopBtn) stopBtn.addEventListener('click', async ()=>{
     try{
+      const mode = await ensureTransportReady();
+      if (mode === 'v2'){
+        const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+        const sessionKey = getGatewayV2SessionKeyForCurrent();
+        if (!sessionKey) return;
+        const token = getStoredApiToken();
+        const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+        await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
+        return;
+      }
       const sid = getCurrentSessionId(); if (!sid) return;
       const aid = currentAgentId || DEFAULT_AGENT_ID;
       const ws = (!hasAgents || !currentAgentId) ? String(currentWorkspace || '').trim() : '';
@@ -2421,7 +2698,6 @@ async function ensureTransportReady(){
   try{
     if (gatewayV2Detected){
     if (gatewayV2Enabled){
-      try { if (!gatewayV2SessionKey) gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
       try { setupGatewayV2WebSocket(); } catch {}
       try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
       return 'v2';
@@ -2454,7 +2730,6 @@ async function ensureTransportReady(){
       gatewayV2Detected = true;
       gatewayV2Enabled = isV2;
       if (isV2){
-        try { gatewayV2SessionKey = ensureGatewayV2SessionKey(); } catch {}
         try { setupGatewayV2WebSocket(); } catch {}
         try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
         return 'v2';
@@ -2514,10 +2789,10 @@ function handleGatewayV2Envelope(payload){
     if (!payload || typeof payload !== 'object') return;
     // Top-level gateway v2 error events
     if (payload.type === 'turn.error' || payload.type === 'scheduler.wake_error'){
-      const a = String(payload.agentId || (hasAgents && currentAgentId) || DEFAULT_AGENT_ID);
-      const s = String(payload.sessionKey || '');
       const curAgent = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-      const expectedKey = gatewayV2SessionKey || ensureGatewayV2SessionKey();
+      const a = String(payload.agentId || curAgent);
+      const s = String(payload.sessionKey || '');
+      const expectedKey = getGatewayV2SessionKeyForCurrent();
       if (a !== curAgent) return;
       if (s && expectedKey && s !== expectedKey) return;
       const err = (typeof payload.error === 'string' && payload.error) ? payload.error : (typeof payload.message === 'string' ? payload.message : 'error');
@@ -2535,7 +2810,7 @@ function handleGatewayV2Envelope(payload){
       const agentId = ev.agentId || DEFAULT_AGENT_ID;
       const sessionKey = ev.sessionKey || '';
       const currentAgent = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-      const expectedKey = gatewayV2SessionKey || ensureGatewayV2SessionKey();
+      const expectedKey = getGatewayV2SessionKeyForCurrent();
       if (agentId !== currentAgent) return;
       if (sessionKey && expectedKey && sessionKey !== expectedKey) return;
       if (evType === 'assistant_message'){
@@ -2578,6 +2853,8 @@ function handleGatewayV2Envelope(payload){
         return;
       }
     }
+    // Fallback: treat other payloads as SSE-style events from the event bus
+    handleArcanaEvent(payload);
   } catch {}
 }
 
@@ -2682,19 +2959,16 @@ async function fetchSelectedToolOutput(){
   }
 }
 
-function setupSseConnection(){
-  try {
-    if (gatewayV2Enabled) return;
-    try { if (window.__arcana_global_es){ try { window.__arcana_global_es.close() } catch {} window.__arcana_global_es = null } } catch {}
-    const es = new EventSource(buildEventsUrl()); window.__arcana_global_es = es;
-    es.onmessage = (ev)=>{
-    try{
-      sseBackoffMs = SSE_BACKOFF_BASE_MS;
-      const data = JSON.parse(ev.data);
 
+function handleArcanaEvent(data){
       // Logs panel + lifecycle
       const sid = data.sessionId || currentId;
-            if (data.type === 'open_vault' || data.type === 'open_secrets'){
+      if (data.type === 'open_vault'){
+        try { openSecrets(Array.isArray(data.names) ? data.names : undefined, { autoCloseOnUnlock:true }).catch(()=>{}) } catch {}
+        logMain(sid, 'open vault (unlock-only)' + (Array.isArray(data.names) && data.names.length ? (': ' + data.names.join(', ')) : ''));
+        return;
+      }
+      if (data.type === 'open_secrets'){
         try { openSecrets(Array.isArray(data.names) ? data.names : []).catch(()=>{}) } catch {}
         logMain(sid, 'open secrets' + (Array.isArray(data.names) && data.names.length ? (': ' + data.names.join(', ')) : ''));
         return;
@@ -3057,6 +3331,13 @@ function setupSseConnection(){
                   llmTokens: nextLlm,
                 });
                 try{ scheduleSaveToolPanel(sid2); } catch {}
+                if (sid2 === getCurrentSessionId()){
+                  if (activeLogTab === 'tools'){
+                    renderToolsPanel(sid2);
+                  } else if (activeLogTab === 'details'){
+                    renderToolDetails(sid2);
+                  }
+                }
               }
             }
           }
@@ -3194,6 +3475,19 @@ function setupSseConnection(){
         try{ attachSubagentOutputToToolAction(sid2, { subagentId: data.id, agent: data.agent, code: data.code, ok: data.ok, kind: 'end' }); } catch {}
         return;
       }
+}
+
+function setupSseConnection(){
+  try {
+    if (gatewayV2Enabled) return;
+    try { if (window.__arcana_global_es){ try { window.__arcana_global_es.close() } catch {} window.__arcana_global_es = null } } catch {}
+    const es = new EventSource(buildEventsUrl()); window.__arcana_global_es = es;
+    es.onmessage = (ev)=>{
+    try{
+      sseBackoffMs = SSE_BACKOFF_BASE_MS;
+      const data = JSON.parse(ev.data);
+
+      handleArcanaEvent(data);
     }catch{}
   };
   es.onerror = ()=>{
@@ -3365,20 +3659,32 @@ function scheduleSecretsStartupCheck(){
         if (!j || typeof j !== 'object') return;
         const initialized = !!j.initialized;
         const locked = !!j.locked;
-        if (!initialized || locked){
-          try { openSecrets().catch(()=>{}); } catch {}
+        if (!initialized){
+          // For uninitialized vault, always show full secrets manager so user can set it up.
+          try { openSecrets().catch(()=>{}) } catch {}
+        } else if (locked){
+          // On startup when vault is locked, only prompt for unlock and auto-close afterwards.
+          try { openSecrets(undefined, { reason:'startup', autoCloseOnUnlock:true }).catch(()=>{}) } catch {}
         }
       } catch {}
     }, 250);
   } catch {}
 }
 
-async function openSecrets(){
+async function openSecrets(requestedNames, opts){
   // Idempotent: if a secrets overlay is already present, do nothing.
   try{
     const existing = document.querySelector('[data-arcana-secrets-overlay="1"]');
     if (existing) return;
   } catch {}
+
+  // Backwards-compatible argument handling: openSecrets(), openSecrets(namesArray), openSecrets(opts).
+  const requested = Array.isArray(requestedNames) ? requestedNames.slice() : [];
+  let optsObj = opts;
+  if (!optsObj && requestedNames && typeof requestedNames === 'object' && !Array.isArray(requestedNames)){
+    optsObj = requestedNames;
+  }
+  const openOpts = (optsObj && typeof optsObj === 'object') ? optsObj : {};
 
   const overlay = document.createElement('div');
   try { overlay.dataset.arcanaSecretsOverlay = '1'; } catch {}
@@ -3537,6 +3843,10 @@ async function openSecrets(){
           if (r.status === 409) { appendLog('[secrets] 密钥箱未初始化'); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
           if (!r.ok) { appendLog('[secrets] 解锁失败: ' + (j.error || j.message || '未知错误')); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
           appendLog('[secrets] 已解锁');
+          if (openOpts && openOpts.autoCloseOnUnlock){
+            try { close(); } catch {}
+            return;
+          }
           await render();
         } catch (e) { appendLog('[secrets] 解锁失败: ' + e); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; }
       });

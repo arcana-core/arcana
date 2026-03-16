@@ -152,7 +152,7 @@ Sessions are stored **per agent** under the agent home.
   ```
 
 - Behavior:
-  - New sessions created via `/api/sessions` or `/api/chat2` set `agentId` and **do not** write `workspace`.
+  - New sessions created via `/api/sessions` or Gateway v2 chat (`/v2/turn-sync`) set `agentId` and **do not** write `workspace`.
   - Legacy sessions that still contain `workspace` continue to load; the field is ignored by new callers.
   - Sessions for the default `default` agent live in `$ARCANA_HOME/agents/default/sessions/`.
 
@@ -238,18 +238,18 @@ Sessions are stored **per agent** under the agent home.
 - Deletes one session JSON under `$ARCANA_HOME/agents/<agentId>/sessions/`.
 - If `agentId` is omitted, only sessions for the default agent are considered.
 
-## `/api/chat2` – Agent-Aware Chat
+## Gateway v2 Chat (`/v2/turn-sync`) – Agent-Aware Chat
 
-The concurrent chat endpoint is now **agent-centric**.
+The Gateway v2 chat endpoint is **agent-centric** and replaces legacy `/api/chat2`.
 
-- Request body:
+- Request body (synchronous chat):
 
   ```jsonc
   {
-    "message": "...",          // required
+    "text": "...",            // required user message
     "policy": "open" | "restricted",  // optional, defaults to "restricted"
-    "agentId": "default",         // optional, defaults to "default"
-    "sessionId": "..."         // optional; new session if omitted
+    "agentId": "default",           // optional, defaults to "default"
+    "sessionKey": "..."           // optional; stable key for this channel/session
   }
   ```
 

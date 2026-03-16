@@ -36,17 +36,24 @@ export class ToolDaemonClient{
     if (!this.token){ throw new Error("Tool daemon token missing. Start services or run a web tool once to initialize."); }
   }
 
-  _authHeaders(){
+  _authHeaders(ctx){
     const headers = { "authorization": "Bearer " + (this.token || "") };
     try {
-      const ctx = getContext?.() || null;
-      if (ctx && ctx.agentId) headers["x-arcana-agent-id"] = String(ctx.agentId);
-      if (ctx && ctx.sessionId) headers["x-arcana-session-id"] = String(ctx.sessionId);
+      const override = ctx && typeof ctx === "object" ? ctx : null;
+      let agentId = override && override.agentId ? String(override.agentId) : "";
+      let sessionId = override && override.sessionId ? String(override.sessionId) : "";
+      if (!agentId || !sessionId){
+        const cur = getContext?.() || null;
+        if (!agentId && cur && cur.agentId) agentId = String(cur.agentId);
+        if (!sessionId && cur && cur.sessionId) sessionId = String(cur.sessionId);
+      }
+      if (agentId) headers["x-arcana-agent-id"] = agentId;
+      if (sessionId) headers["x-arcana-session-id"] = sessionId;
     } catch {}
     return headers;
   }
 
-  async _post(path, body, opts){
+  async _post(path, body, opts, ctx){
     if (!this.baseUrl) this._load();
     const url = this.baseUrl + path;
     const payload = JSON.stringify(body || {});
@@ -60,7 +67,7 @@ export class ToolDaemonClient{
       }
       let res;
 try {
-  res = await fetch(url, { method: "POST", headers: { ...this._authHeaders(), "content-type":"application/json" }, body: payload, signal: ctrl.signal });
+  res = await fetch(url, { method: "POST", headers: { ...this._authHeaders(ctx), "content-type":"application/json" }, body: payload, signal: ctrl.signal });
 } catch (fetchErr) {
   const fetchMsg = String(fetchErr?.message || fetchErr || "");
   const isDown = /ECONNREFUSED|fetch failed|ECONNRESET|EPIPE|socket hang up|network/i.test(fetchMsg);
@@ -82,19 +89,28 @@ try {
     }
   }
 
-  async _get(path){
+  async _get(path, ctx){
     if (!this.baseUrl) this._load();
     const url = this.baseUrl + path;
-    const res = await fetch(url, { method: "GET", headers: this._authHeaders() });
+    const res = await fetch(url, { method: "GET", headers: this._authHeaders(ctx) });
     const text = await res.text();
     try { return JSON.parse(text); } catch { return { ok:false, error:"invalid_json", raw:text }; }
   }
 
-  async call(toolName, args, opts){
-    return this._post("/tool/" + toolName, args || {}, opts || {});
+  async call(toolName, args, optsOrCtx, ctx){
+    let callOpts = {};
+    let callCtx = null;
+    if (ctx && typeof ctx === "object"){
+      callCtx = ctx;
+      if (optsOrCtx && typeof optsOrCtx === "object") callOpts = optsOrCtx;
+    } else if (optsOrCtx && typeof optsOrCtx === "object"){
+      const looksLikeOpts = Object.prototype.hasOwnProperty.call(optsOrCtx, "timeoutMs");
+      if (looksLikeOpts) callOpts = optsOrCtx; else callCtx = optsOrCtx;
+    }
+    return this._post("/tool/" + toolName, args || {}, callOpts, callCtx);
   }
 
-  async getStatus(){ return this._get("/status"); }
+  async getStatus(ctx){ return this._get("/status", ctx && typeof ctx === "object" ? ctx : null); }
 
   async cancelActiveCall(){ try { if (this.activeAbort) { this.activeAbort.abort(); } } catch {} return true; }
 }

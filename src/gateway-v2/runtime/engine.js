@@ -21,6 +21,7 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
   }
 
   const runners = runnerRegistry instanceof Map ? runnerRegistry : new Map();
+  const inFlightByKey = new Map(); // key: agentId::sessionKey -> count
 
   async function resolveRunnerConfig(agentId, sessionKey){
     const aId = agentId || 'default';
@@ -166,10 +167,16 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
     };
   }
 
-  async function tick({ agentId, sessionKey, reason } = {}){
+  async function tick({ agentId, sessionKey, reason, skipIfRunning } = {}){
     const aId = agentId || 'default';
     const sKey = sessionKey || 'session';
     const laneKey = ['engine', aId, sKey];
+    const turnKey = aId + '::' + sKey;
+
+    const existing = inFlightByKey.get(turnKey) || 0;
+    if (skipIfRunning && existing > 0){
+      return { ok: true, skipped: true, reason: 'requests-in-flight', runnerId: null };
+    }
 
     const run = async () => {
       const cfg = await resolveRunnerConfig(aId, sKey);
@@ -214,6 +221,9 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
 
       let ok = false;
       let result;
+
+      const prevCount = inFlightByKey.get(turnKey) || 0;
+      inFlightByKey.set(turnKey, prevCount + 1);
 
       try {
         const ctx = {
@@ -318,6 +328,12 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
         ok = false;
         throw e;
       } finally {
+        try {
+          const cur = inFlightByKey.get(turnKey) || 0;
+          if (cur <= 1) inFlightByKey.delete(turnKey);
+          else inFlightByKey.set(turnKey, cur - 1);
+        } catch {}
+
         const endTsMs = nowMs();
         if (trace && typeof trace.emitSpan === 'function'){
           try {

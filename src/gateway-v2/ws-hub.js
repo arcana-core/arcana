@@ -1,6 +1,10 @@
 import { safeJsonParse } from './util.js';
 
-export function createWsHub(){
+export function createWsHub(options = {}){
+  const getInitialMessages = (options && typeof options.getInitialMessages === 'function')
+    ? options.getInitialMessages
+    : null;
+
   const clients = new Set();
   let pingInterval = null;
 
@@ -45,6 +49,24 @@ export function createWsHub(){
     if (!ws) return;
     const client = { ws, isAlive: true };
     clients.add(client);
+
+    try{
+      if (getInitialMessages){
+        const initial = getInitialMessages();
+        try {
+          if (Array.isArray(initial)) {
+            for (const msg of initial) {
+              if (!msg) continue;
+              const payload = JSON.stringify(msg);
+              try { ws.send(payload); } catch {}
+            }
+          } else if (initial) {
+            const payload = JSON.stringify(initial);
+            try { ws.send(payload); } catch {}
+          }
+        } catch {}
+      }
+    } catch {}
 
     try{
       if (typeof ws.on === 'function'){

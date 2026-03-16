@@ -7,6 +7,17 @@ import { arcanaHomePath } from '../arcana-home.js';
 import { getContext, runWithContext, emit } from '../event-bus.js';
 import { DEFAULT_CONTEXT_POLICY, compactSession } from '../context-manager.js';
 import { buildErrorStack } from '../util/error.js';
+import { mergeStreamingText } from '../streaming-text.js';
+
+const ASSISTANT_STREAM_MAX_CHARS = (()=>{
+  try {
+    const raw = process.env.ARCANA_ASSISTANT_STREAM_MAX_CHARS;
+    if (!raw) return 0;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.floor(n);
+  } catch { return 0; }
+})();
 
 function tailLines(text, max=100){
   const lines = String(text||'').split('\n');
@@ -82,7 +93,7 @@ function buildBoundedHistoryPrelude(sessionObj){
   }) || '';
 }
 
-async function ensureSessionId({ sessionId, sessionKey, title, agentId, workspaceRoot }){
+export async function ensureSessionId({ sessionId, sessionKey, title, agentId, workspaceRoot }){
   const t = String(title || '').trim();
   const id = String(sessionId || '').trim();
   const key = sessionKey != null ? String(sessionKey).trim() : '';
@@ -156,6 +167,24 @@ function extractUsageTotals(u){
   if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
   if (!Number.isFinite(out) || out < 0) out = 0;
   return { contextTokens: ctx, outputTokens: out, totalTokens: tot };
+}
+
+function isCompletionErrorReason(reason){
+  try {
+    if (!reason) return false;
+    const s = String(reason).trim().toLowerCase();
+    if (!s) return false;
+    if (s === 'error') return true;
+    if (s.includes('error')) return true;
+    if (s.includes('rate_limit') || s.includes('rate-limit')) return true;
+    if (s.includes('timeout')) return true;
+    if (s.includes('overloaded')) return true;
+    if (s.includes('content_filter') || s.includes('content-filter')) return true;
+    if (s.includes('blocked')) return true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 async function summarizeSessionChunk({ workspaceRoot, agentHomeRoot, existingSummary, olderMessages }){
@@ -264,7 +293,29 @@ async function compactSessionIfNeeded({ sessionId, agentId, workspaceRoot, agent
   }
 }
 
-export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logPath, agentId, timeoutMs }){
+const activeTurnsByKey = new Map();
+
+function buildTurnKey(agentId, sessionKey, sessionId){
+  try {
+    const a = (agentId == null ? '' : String(agentId)).trim() || 'default';
+    const sk = (sessionKey == null ? '' : String(sessionKey)).trim();
+    const sid = (sessionId == null ? '' : String(sessionId)).trim();
+    const key = sk || sid || 'default';
+    return a + '::' + key;
+  } catch {
+    return 'default::default';
+  }
+}
+
+export function requestTurnAbort({ agentId, sessionKey, sessionId } = {}){
+  const key = buildTurnKey(agentId, sessionKey, sessionId);
+  const fn = activeTurnsByKey.get(key);
+  if (!fn) return { ok: false, reason: 'no_active_turn' };
+  try { fn(); } catch {}
+  return { ok: true };
+}
+
+export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logPath, agentId, timeoutMs, execPolicy }){
   const ctx = getContext?.() || null;
   const rawTimeout = Number(timeoutMs);
   const effectiveTimeoutMs = (Number.isFinite(rawTimeout) && rawTimeout > 0) ? rawTimeout : 0;
@@ -297,10 +348,21 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
     const timing = await runWithContext(
       { sessionId: sid, agentId: effectiveAgentId, agentHomeRoot, workspaceRoot },
       async () => {
-        const { session, toolHost } = await createArcanaSession({ workspaceRoot, agentHomeRoot });
+        const { session, toolHost } = await createArcanaSession({ workspaceRoot, agentHomeRoot, execPolicy });
+        const turnKey = buildTurnKey(effectiveAgentId, sessionKey, sid);
+        const abortFn = () => {
+          try { toolHost && toolHost.cancelActiveCall && toolHost.cancelActiveCall(); } catch {}
+          try { if (session && typeof session.abort === 'function') { const p = session.abort(); if (p && typeof p.catch === 'function') p.catch(() => {}); } } catch {}
+        };
+        try { activeTurnsByKey.set(turnKey, abortFn); } catch {}
         let runTokens = 0;
+        let runContextTokens = 0;
+        let runOutputTokens = 0;
+        let hasEmittedAssistantText = false;
         let timeoutHandle = null;
         let timedOut = false;
+        let finishReason = '';
+        let stopReason = '';
         const unsub = session.subscribe((ev)=>{
           try {
             if (!ev) return;
@@ -308,15 +370,16 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
               const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
               const rawText = blocks.filter((c)=> c && c.type === 'text').map((c)=> c.text || '').join('');
               if (rawText){
-                textBuffer = String(rawText).slice(-20000);
+                textBuffer = mergeStreamingText(textBuffer, rawText, { maxLen: ASSISTANT_STREAM_MAX_CHARS });
               }
 
-              const extracted = extractMediaFromAssistantText(rawText);
+              const extracted = extractMediaFromAssistantText(textBuffer);
               const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
               const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
 
               if (cleanText){
                 try { emit({ type: 'assistant_text', text: cleanText, sessionId: sid }); } catch {}
+                hasEmittedAssistantText = true;
               }
               if (mediaRefs.length){
                 for (const raw of mediaRefs){
@@ -328,11 +391,55 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
               }
             }
             if (ev && ev.type === 'message_end' && ev.message && ev.message.role === 'assistant'){
+              const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
+              const rawText = blocks.filter((c)=> c && c.type === 'text').map((c)=> c.text || '').join('');
+              if (rawText){
+                textBuffer = mergeStreamingText(textBuffer, rawText, { maxLen: ASSISTANT_STREAM_MAX_CHARS });
+              }
+
+              const extracted = extractMediaFromAssistantText(textBuffer);
+              const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+              const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+
+              if (cleanText && !hasEmittedAssistantText){
+                try { emit({ type: 'assistant_text', text: cleanText, sessionId: sid }); } catch {}
+                hasEmittedAssistantText = true;
+              }
+              if (mediaRefs.length){
+                for (const raw of mediaRefs){
+                  const ref = normalizeMediaRef(raw);
+                  if (!ref || mediaRefsSeen.has(ref)) continue;
+                  mediaRefsSeen.add(ref);
+                  try { emit({ type: 'assistant_image', url: ref, mime: 'image/*', sessionId: sid }); } catch {}
+                }
+              }
+
               const u = ev.message && ev.message.usage;
               const totals = extractUsageTotals(u);
-              if (totals && typeof totals.totalTokens === 'number' && totals.totalTokens > 0){
-                runTokens += totals.totalTokens;
+              if (totals){
+                if (typeof totals.totalTokens === 'number' && totals.totalTokens > 0){
+                  runTokens += totals.totalTokens;
+                }
+                if (typeof totals.contextTokens === 'number' && totals.contextTokens > 0){
+                  runContextTokens += totals.contextTokens;
+                }
+                if (typeof totals.outputTokens === 'number' && totals.outputTokens > 0){
+                  runOutputTokens += totals.outputTokens;
+                }
               }
+              try {
+                const msg = ev.message;
+                if (msg){
+                  if (!finishReason){
+                    const fr = msg.finishReason || msg.finish_reason || msg.stopReason || msg.stop_reason || msg.endReason || '';
+                    if (fr) finishReason = String(fr);
+                  }
+                  if (!stopReason){
+                    const sr = msg.stopReason || msg.stop_reason || msg.finishReason || msg.finish_reason || '';
+                    if (sr) stopReason = String(sr);
+                  }
+                }
+              } catch {}
             }
             if (ev.type === 'tool_execution_start' || ev.type === 'tool_execution_update' || ev.type === 'tool_execution_end' || ev.type === 'thinking_start' || ev.type === 'thinking_delta' || ev.type === 'thinking_end'){
               const payload = (ev && typeof ev === 'object' && !ev.sessionId) ? { ...ev, sessionId: sid } : ev;
@@ -358,17 +465,23 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
             try { clearTimeout(timeoutHandle); } catch {}
           }
           try { unsub && unsub(); } catch {}
+          try { activeTurnsByKey.delete(buildTurnKey(effectiveAgentId, sessionKey, sid)); } catch {}
         }
         const finishedAtMs = Date.now();
-        return { finishedAtMs, runTokens, timedOut };
+        const completionErrorReason = isCompletionErrorReason(finishReason) ? finishReason : (isCompletionErrorReason(stopReason) ? stopReason : '');
+        return { finishedAtMs, runTokens, runContextTokens, runOutputTokens, timedOut, finishReason, stopReason, completionErrorReason };
       }
     );
 
     const finishedAtMs = timing && typeof timing.finishedAtMs === 'number' ? timing.finishedAtMs : Date.now();
-    const deltaTokens = timing && typeof timing.runTokens === 'number' ? timing.runTokens : 0;
+    const runTokens = timing && typeof timing.runTokens === 'number' ? timing.runTokens : 0;
+    const runContextTokens = timing && typeof timing.runContextTokens === 'number' ? timing.runContextTokens : 0;
+    const runOutputTokens = timing && typeof timing.runOutputTokens === 'number' ? timing.runOutputTokens : 0;
+    const deltaTokens = runTokens;
     const didTimeout = !!(timing && timing.timedOut);
+    const completionErrorReason = timing && typeof timing.completionErrorReason === 'string' ? timing.completionErrorReason : '';
 
-    if (!didTimeout) {
+    if (!didTimeout && !completionErrorReason) {
       appendMessage(sid, { role: 'assistant', text: textBuffer, agentId: effectiveAgentId });
     }
 
@@ -381,6 +494,39 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
       if (historyPrelude) log.write('History Prelude:\n' + historyPrelude + '\n\n');
       log.write('Assistant:\n' + textBuffer + '\n');
     } catch {}
+
+    let sessionTokensTotal = 0;
+    try {
+      const objAfter = loadSession(sid, { agentId: effectiveAgentId });
+      if (objAfter && typeof objAfter.sessionTokens === 'number' && objAfter.sessionTokens > 0){
+        sessionTokensTotal = objAfter.sessionTokens;
+      }
+    } catch {}
+
+    try {
+      if (runTokens > 0 || runContextTokens > 0 || runOutputTokens > 0 || sessionTokensTotal > 0){
+        emit({ type: 'llm_usage', sessionId: sid, agentId: effectiveAgentId, contextTokens: runContextTokens, outputTokens: runOutputTokens, totalTokens: runTokens, sessionTokens: sessionTokensTotal });
+      }
+    } catch {}
+
+    if (completionErrorReason){
+      const errMsg = 'completion_error: ' + String(completionErrorReason || '');
+      try {
+        emit({ type: 'error', sessionId: sid, agentId: effectiveAgentId, message: errMsg });
+      } catch {}
+      try {
+        emit({ type: 'turn_error', sessionId: sid, agentId: effectiveAgentId, error: errMsg, startedAtMs, finishedAtMs });
+      } catch {}
+      return {
+        ok: false,
+        sessionId: sid,
+        error: errMsg,
+        startedAtMs,
+        finishedAtMs,
+        outputTail: tailLines(textBuffer),
+        assistantText: textBuffer,
+      };
+    }
 
     return {
       ok: true,
@@ -424,4 +570,4 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
   }
 }
 
-export default { runArcanaTask };
+export default { runArcanaTask, requestTurnAbort };

@@ -34,6 +34,7 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
 - Web tools returning empty or inconsistent text
   - The tool-daemon browser reuses a profile per agent by default so web_render and web_extract calls share cookies and navigation history across tool calls.
   - To isolate profiles per session (for example in multi-tenant setups), set ARCANA_BROWSER_ISOLATE_BY_SESSION=1 before starting services or pass the header x-arcana-browser-isolate=1 to the tool-daemon.
+  - Newer Arcana versions forward per-call ctx headers (x-arcana-agent-id and x-arcana-session-id) from the gateway/session into the tool-daemon client so web_render and web_extract share the correct browser profile. Older versions that only relied on async-local context could send different headers per call and cause web_extract to see about:blank or open a blank popup window.
 
 - Unexpected automatic memory writes
   - Automatic Tier1 memory triggers are disabled by default.

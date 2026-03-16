@@ -14,6 +14,7 @@ import { runDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
 import { loadArcanaConfig, loadAgentConfig } from '../src/config.js';
 import { loadArcanaSkills } from '../src/skills.js';
+import { mergeStreamingText } from '../src/streaming-text.js';
 import {
   WELL_KNOWN_SECRETS,
   secrets,
@@ -38,6 +39,7 @@ import { DEFAULT_CONTEXT_POLICY, buildSessionPrelude, trimUserMessage, compactSe
 import { detectProblemMention, detectCorrectionMention, truncateText } from '../src/memory-triggers.js';
 import { loadOrCreateApiToken, isAuthorizedRequest, tokenHint, getApiTokenFilePath } from '../src/auth/api-token.js';
 import { buildErrorStack } from '../src/util/error.js';
+import { startGatewayV2 } from './gateway.mjs';
 const projectRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..'); // arcana/
 let workspaceRoot = null; // set on start
 let apiToken = '';
@@ -126,6 +128,16 @@ const TOOL_STREAM_MAX_BYTES = (()=>{
     if (!Number.isFinite(n) || n <= 0) return 2000000;
     return Math.floor(n);
   } catch { return 2000000; }
+})();
+
+const ASSISTANT_STREAM_MAX_CHARS = (()=>{
+  try {
+    const raw = process.env.ARCANA_ASSISTANT_STREAM_MAX_CHARS;
+    if (!raw) return 0;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.floor(n);
+  } catch { return 0; }
 })();
 
 const toolStreamBuffers = new Map(); // key -> { buf:string, timer:any, path:string }
@@ -591,7 +603,7 @@ function applyExecPolicyToSession(sess, policy) {
 }
 
 
-// Per-session (id+policy+cwd) sessions used by /api/chat2
+// Per-session (id+policy+cwd) sessions used by legacy chat HTTP APIs
 
 // Internal reflection sessions (per workspace)
 // Tier1 trigger dedupe (per workspace/session) — keep small TTL; best effort
@@ -1617,6 +1629,9 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
   const effectiveWorkspace = String(ws || workspaceRoot || '');
   try { initSessionUsageFromStore({ agentId: effectiveAgentId, sessionId }); } catch {}
   const toolArgsByCallId = new Map(); // toolCallId -> args snapshot for failure context
+  let lastAssistantText = "";
+  let assistantRawText = "";
+  let assistantActive = false;
   sess.subscribe((ev) => {
     try {
       const t = ev && ev.type ? String(ev.type) : '';
@@ -1779,7 +1794,6 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
 
       // LLM usage accounting (per assistant message_end)
       if (ev && t === 'message_end' && ev.message && ev.message.role === 'assistant') {
-      // Assistant streaming (text/images)
         try {
           const u = ev && ev.message && ev.message.usage;
           let ctx = 0, out = 0, tot = 0;
@@ -1798,15 +1812,84 @@ function ensureEventBridgeForId(sess, sessionId, agentId, agentHomeDir, ws) {
             try { broadcast({ type: 'llm_usage', sessionId, contextTokens: ctx, outputTokens: out, totalTokens: tot, sessionTokens: next }); } catch {}
           }
         } catch {}
+
+        // Assistant streaming (text/images) for non-streaming models or final snapshots
+        try {
+          const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
+          const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+          if (!assistantActive) {
+            assistantRawText = "";
+            assistantActive = true;
+          }
+          assistantRawText = mergeStreamingText(assistantRawText, rawText, { maxLen: ASSISTANT_STREAM_MAX_CHARS });
+          const extracted = extractMediaFromAssistantText(assistantRawText);
+          const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+          const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+
+          if (cleanText && cleanText !== lastAssistantText) {
+            lastAssistantText = cleanText;
+            broadcast({ type: 'assistant_text', text: cleanText, sessionId });
+          }
+
+          if (mediaRefs.length) {
+            const sidKey = String(sessionId || 'default');
+            let seen = mediaRefsByTurn.get(sidKey);
+            if (!seen) { seen = new Set(); mediaRefsByTurn.set(sidKey, seen); }
+            for (const raw of mediaRefs){
+              const ref = normalizeMediaRef(raw);
+              if (!ref || seen.has(ref)) continue;
+              seen.add(ref);
+              const lower = ref.toLowerCase();
+              if (lower.startsWith('http://') || lower.startsWith('https://')){
+                try { broadcast({ type: 'assistant_image', url: ref, mime: 'image/*', sessionId }); } catch {}
+                continue;
+              }
+              try {
+                const meta = runWithContext({ sessionId, agentId: effectiveAgentId, agentHomeRoot: effectiveAgentHome, workspaceRoot: effectiveWorkspace }, () => {
+                  const filePath = ensureReadAllowed(ref);
+                  const mime = mimeForImageExt(extname(filePath));
+                  if (!mime) return null;
+                  return { mime };
+                });
+                if (meta && meta.mime){
+                  const encodedPath = encodeURIComponent(ref);
+                  const sidParam = sessionId ? '&sessionId=' + encodeURIComponent(String(sessionId)) : '';
+                  const url = '/api/local-file?path=' + encodedPath + sidParam;
+                  try { broadcast({ type: 'assistant_image', url, mime: meta.mime, sessionId }); } catch {}
+                }
+              } catch {}
+            }
+          }
+
+          for (const c of blocks) {
+            if (!c || c.type !== 'image') continue;
+            const mime = c.mime || c.mimeType || c.MIMEType || 'image/png';
+            let url = c.image_url || c.url || '';
+            if (!url && c.data) url = 'data:' + mime + ';base64,' + c.data;
+            if (url) broadcast({ type: 'assistant_image', url, mime, sessionId });
+          }
+        } catch {}
+        assistantActive = false;
+        assistantRawText = "";
       }
       if (t === 'message_update' && ev.message && ev.message.role === 'assistant') {
         try {
           const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
           const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-          const extracted = extractMediaFromAssistantText(rawText);
+          if (!assistantActive) {
+            assistantRawText = "";
+            assistantActive = true;
+          }
+          assistantRawText = mergeStreamingText(assistantRawText, rawText, { maxLen: ASSISTANT_STREAM_MAX_CHARS });
+          const extracted = extractMediaFromAssistantText(assistantRawText);
           const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
           const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
-          if (cleanText) broadcast({ type: 'assistant_text', text: cleanText, sessionId });
+
+          if (cleanText && cleanText !== lastAssistantText) {
+            lastAssistantText = cleanText;
+            broadcast({ type: 'assistant_text', text: cleanText, sessionId });
+          }
+
           if (mediaRefs.length) {
             const sidKey = String(sessionId || 'default');
             let seen = mediaRefsByTurn.get(sidKey);
@@ -2029,375 +2112,6 @@ async function handleEvents(req, res) {
 }
 
 // Concurrent + persistent endpoint
-async function handleChat2(req, res) {
-  try {
-    const bufs = []; for await (const chunk of req) bufs.push(chunk);
-    const body = bufs.length ? JSON.parse(Buffer.concat(bufs).toString('utf8')) : {};
-    let message = trimUserMessage(String(body.message || '').trim(), DEFAULT_CONTEXT_POLICY);
-    const policy = String(body.policy || '').toLowerCase() === 'open' ? 'open' : 'restricted';
-    let agentId = String(body.agentId || '').trim();
-    let sessionId = String(body.sessionId || '').trim();
-    const sessionKey = String(body.sessionKey || '').trim();
-
-    if (!message) {
-      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'missing_message' }));
-      return;
-    }
-
-    if (!agentId) agentId = DEFAULT_AGENT_ID;
-
-    // Resolve agent meta (home + workspaceRoot) from ~/.arcana/agents/<agentId>/agent.json
-    const agent = findAgentMeta(agentId) || ensureDefaultAgentExists();
-    if (!agent || !agent.workspaceRoot) {
-      res.writeHead(400, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_not_found' }));
-      return;
-    }
-    const ws = agent.workspaceRoot;
-    const agentHomeDir = agent.agentHomeDir || agent.agentDir || arcanaHomePath('agents', agentId);
-
-    let initialSession = null;
-    if (!sessionId && sessionKey) {
-      const resolvedId = await resolveBackingSessionId({
-        agentId,
-        sessionId,
-        sessionKey,
-        title: 'Arcana Web',
-        workspaceRoot: ws,
-        createIfMissing: true,
-      });
-      sessionId = String(resolvedId || '').trim();
-    }
-    if (!sessionId) {
-      const created = ssCreate({ title: '新会话', agentId });
-      sessionId = created.id;
-      initialSession = created;
-    }
-
-    // Load session object and ensure it is bound to this agent
-    const obj0 = initialSession || ssLoad(sessionId, { agentId });
-    if (obj0) {
-      let changed = false;
-      const existingAgentRaw = obj0.agentId != null ? String(obj0.agentId) : '';
-      const existingAgent = existingAgentRaw.trim();
-      if (existingAgent && existingAgent !== agentId) {
-        res.writeHead(409, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'agent_mismatch' }));
-        return;
-      }
-      if (!existingAgent) {
-        obj0.agentId = agentId;
-        changed = true;
-      }
-      if (changed) { try { ssSave(obj0, { agentId }); } catch {} }
-    }
-
-    const sess = await ensureSessionFor(sessionId, policy, ws, agentId, agentHomeDir);
-    applyExecPolicyToSession(sess, policy);
-
-    // Local helpers for robust failure handling
-    const hardAbortSession = (s) => {
-      if (!s) return;
-      try { s.abortRetry?.(); } catch {}
-      try { s.clearQueue?.(); } catch {}
-      try { s.agent?.abort?.(); } catch {}
-      try { s._arcanaToolHostClient?.cancelActiveCall?.(); } catch {}
-      // Fallback: if the agent isn't exposed, try session-level abort (fire-and-forget)
-      try {
-        if (!s.agent?.abort && typeof s.abort === 'function') {
-          const p = s.abort();
-          if (p && typeof p.catch === 'function') p.catch(() => {});
-        }
-      } catch {}
-    };
-
-    const isPrematureStreamClose = (m) => {
-      try {
-        const t = String(m || '').toLowerCase();
-        return t.includes('sse') && t.includes('response.completed');
-      } catch { return false; }
-    };
-
-    const ctxBase = { sessionId, agentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws };
-
-    try {
-      if (sessionKey) {
-        await maybePersistKeyMapping({ agentId, sessionKey, sessionId });
-      }
-    } catch {}
-
-    // If user explicitly invoked a skill via a skill block (/skill:name), activate its tools
-    try {
-      const blk = parseSkillBlock(message);
-      if (blk && blk.name) activateToolsForSkill({ sess, sessionId, skillName: String(blk.name), policy });
-    } catch {}
-
-    // Tier1: user_issue detection -> direct daily memory append (deduped)
-    try {
-      if (MEMORY_TRIGGERS_ENABLED && detectProblemMention(message)) {
-        const key = String(sessionId || 'default') + '|' + hash(message);
-        if (!seenRecentlyTtl(dedupeUserIssue, key, DEDUPE_TRIGGER_TTL_MS)) {
-          const content = truncateText(message);
-          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_issue', content });
-        }
-      }
-      if (MEMORY_TRIGGERS_ENABLED && detectCorrectionMention(message)) {
-        const keyCorr = String(sessionId || 'default') + '|corr|' + hash(message);
-        if (!seenRecentlyTtl(dedupeUserCorrection, keyCorr, DEDUPE_TRIGGER_TTL_MS)) {
-          const content = truncateText(message);
-          appendToAgentDailyMemory({ agentHomeDir, heading: 'user_correction', content });
-        }
-      }
-    } catch {}
-
-    // Build context prelude from existing session state before the current user message
-    const historyObj = obj0 || ssLoad(sessionId, { agentId });
-    if (historyObj) {
-      let changed = false;
-      if (agentId && !historyObj.agentId) { historyObj.agentId = agentId; changed = true; }
-      if (changed) { try { ssSave(historyObj, { agentId }); } catch {} }
-    }
-    const prelude = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY);
-
-    // Persist user message after prelude so it is not duplicated in the prompt
-    ssAppend(sessionId, { role: 'user', text: message, agentId });
-    let payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
-    let out = '';
-    let lastAssistantText = '';
-    let persistedCount = 0;
-    const seenTexts = new Set();
-    const unsub = sess.subscribe((ev) => {
-      if (ev.type === 'message_update' && ev.message && ev.message.role === 'assistant') {
-        try {
-          const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-          const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-          if (text) out = text;
-        } catch {}
-      }
-      if (ev.type === 'message_end' && ev.message && ev.message.role === 'assistant') {
-        try {
-          const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-          const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
-          if (text) {
-            lastAssistantText = text;
-            if (!seenTexts.has(text)) {
-              ssAppend(sessionId, { role: 'assistant', text, agentId });
-              seenTexts.add(text);
-              persistedCount++;
-            }
-          }
-        } catch {}
-      }
-    });
-
-    // If session is already streaming, treat this request as a steering message
-    // so it interrupts the remaining plan after the current tool finishes.
-    if (sess && sess.isStreaming) {
-      try {
-        await runWithContext(ctxBase, () =>
-          sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true })
-        );
-        try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
-      } catch (e) {
-        let msg = '';
-        try { msg = String(e && (e.message || e)) || ''; } catch { msg = ''; }
-        if (msg && isContextOverflowErrorMessage(msg)) {
-          const steps = Array.isArray(DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps)
-            ? DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps
-            : [DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive || 40, 20, 10, 6];
-          const maxRetriesRaw = Number(DEFAULT_CONTEXT_POLICY.maxOverflowRetries);
-          const maxRetries = (Number.isFinite(maxRetriesRaw) && maxRetriesRaw > 0) ? Math.floor(maxRetriesRaw) : 1;
-
-          for (let i = 0; i < Math.min(maxRetries, steps.length); i++) {
-            const keepRecent = Number(steps[i]) || Number(DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive) || 40;
-            try {
-              await compactSession({
-                sessionId,
-                agentId,
-                workspaceRoot: ws,
-                agentHomeDir,
-                keepRecentMessages: keepRecent,
-                policy: DEFAULT_CONTEXT_POLICY,
-                broadcast,
-                reason: 'steer_overflow',
-              });
-            } catch {}
-
-            const updated = ssLoad(sessionId, { agentId });
-            let preludeAfter = '';
-            if (updated && Array.isArray(updated.messages) && updated.messages.length){
-              const msgsAfter = updated.messages;
-              const last = msgsAfter[msgsAfter.length - 1];
-              let historyAfter = updated;
-              if (last && last.role === 'user') {
-                historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
-              }
-              preludeAfter = buildSessionPrelude(historyAfter, DEFAULT_CONTEXT_POLICY);
-            }
-            const retryPayload = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
-            try {
-              await runWithContext(ctxBase, () =>
-                sess.prompt(retryPayload, { streamingBehavior: 'steer', expandPromptTemplates: true })
-              );
-              try { broadcast({ type: 'steer_enqueued', sessionId, text: message }); } catch {}
-              break;
-            } catch {
-              // best-effort: try again after a more aggressive compaction
-            }
-          }
-        }
-      }
-      try { unsub && unsub(); } catch {}
-      // For steer, we reply immediately; front-end will continue via SSE.
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: '' }));
-      return;
-    }
-
-    // Normal path: not streaming -> start a new agent turn
-    let promptError = null;
-    const steps = Array.isArray(DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps)
-      ? DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps
-      : [DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive || 40, 20, 10, 6];
-    const maxRetriesRaw = Number(DEFAULT_CONTEXT_POLICY.maxOverflowRetries);
-    const maxRetries = (Number.isFinite(maxRetriesRaw) && maxRetriesRaw > 0) ? Math.floor(maxRetriesRaw) : 1;
-    let compactionAttempts = 0;
-
-    const turnLockOptions = { agentId, workspaceRoot: ws };
-    let turnLockPath = null;
-    try {
-      try { turnLockPath = acquireSessionTurnLock(sessionId, turnLockOptions); } catch {}
-      for (let attempt = 0; attempt < 1 + maxRetries; attempt++) {
-        promptError = null;
-        try {
-          await runWithContext(ctxBase, () => sess.prompt(payloadMsg));
-        } catch (e) {
-          promptError = e;
-        }
-        if (!promptError) break;
-
-        let msg = '';
-        try {
-          msg = String(promptError && (promptError.message || promptError)) || 'agent_prompt_failed';
-        } catch {
-          msg = 'agent_prompt_failed';
-        }
-
-        if (isContextOverflowErrorMessage(msg) && compactionAttempts < maxRetries) {
-          const idx = Math.min(compactionAttempts, steps.length - 1);
-          const keepRecent = Number(steps[idx]) || Number(DEFAULT_CONTEXT_POLICY.keepRecentMessagesInteractive) || 40;
-          compactionAttempts++;
-          try {
-            await compactSession({
-              sessionId,
-              agentId,
-              workspaceRoot: ws,
-              agentHomeDir,
-              keepRecentMessages: keepRecent,
-              policy: DEFAULT_CONTEXT_POLICY,
-              broadcast,
-              reason: 'overflow_recovery',
-            });
-
-            const updated = ssLoad(sessionId, { agentId });
-            let preludeAfter = '';
-            if (updated && Array.isArray(updated.messages) && updated.messages.length){
-              const msgsAfter = updated.messages;
-              const last = msgsAfter[msgsAfter.length - 1];
-              let historyAfter = updated;
-              if (last && last.role === 'user') {
-                historyAfter = { ...updated, messages: msgsAfter.slice(0, -1) };
-              }
-              preludeAfter = buildSessionPrelude(historyAfter, DEFAULT_CONTEXT_POLICY);
-            }
-            payloadMsg = (preludeAfter ? preludeAfter + '\n\n' : '') + '[Current Question]\n' + message;
-            continue;
-          } catch {
-            // fall through to error handling below
-          }
-        }
-
-        // Non-overflow error or compaction failed -> stop retrying
-        break;
-      }
-    } finally {
-
-      try {
-        if (turnLockPath) releaseSessionTurnLock(turnLockPath, turnLockOptions);
-      } catch {}
-    }
-    try { unsub && unsub(); } catch {}
-
-    if (promptError) {
-      let msg = '';
-      try {
-        msg = String(promptError && (promptError.message || promptError)) || 'agent_prompt_failed';
-      } catch {
-        msg = 'agent_prompt_failed';
-      }
-
-      // Best-effort hard abort to avoid sess.isStreaming getting stuck on failures
-      try { hardAbortSession(sess); } catch {}
-
-      const partial = lastAssistantText || out;
-      if (isPrematureStreamClose(msg)) {
-        if (partial) {
-          try { console.warn('[arcana:chat2] SSE closed prematurely; returning partial text'); } catch {}
-          try { broadcast({ type: 'warning', sessionId, message: 'SSE stream closed before completion; returning partial text.' }); } catch {}
-          // Best-effort: persist partial assistant message to session store (deduped)
-          try {
-            const cur = ssLoad(sessionId, { agentId });
-            const msgs = (cur && Array.isArray(cur.messages)) ? cur.messages : [];
-            const last = msgs.length ? msgs[msgs.length - 1] : null;
-            if (!last || last.role !== 'assistant' || String(last.text || '') !== String(partial)) {
-              ssAppend(sessionId, { role: 'assistant', text: partial, agentId });
-              persistedCount++;
-            }
-          } catch {}
-          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: partial }));
-          return;
-        }
-      }
-
-      const stack = buildErrorStack(promptError, { maxDepth: 8, cap: 8000 });
-      try { console.error('[arcana:chat2] prompt failed with stack:\n' + stack); } catch {}
-      try { broadcast({ type: 'error', sessionId, message: msg, stack }); } catch {}
-      res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg, stack }));
-      return;
-    }
-
-    // Fallback persistence
-    if (lastAssistantText) {
-      try {
-        const cur = ssLoad(sessionId, { agentId });
-        const msgs = (cur && Array.isArray(cur.messages)) ? cur.messages : [];
-        const last = msgs.length ? msgs[msgs.length - 1] : null;
-        if (persistedCount === 0 || !last || last.role !== 'assistant' || String(last.text || '') !== String(lastAssistantText)) {
-          ssAppend(sessionId, { role: 'assistant', text: lastAssistantText, agentId });
-          persistedCount++;
-        }
-      } catch {}
-    } else if (out) {
-      try {
-        const cur = ssLoad(sessionId, { agentId });
-        const msgs = (cur && Array.isArray(cur.messages)) ? cur.messages : [];
-        const last = msgs.length ? msgs[msgs.length - 1] : null;
-        if (!last || last.role !== 'assistant' || String(last.text || '') !== String(out)) {
-          ssAppend(sessionId, { role: 'assistant', text: out, agentId });
-          persistedCount++;
-        }
-      } catch {}
-    }
-
-    const respText = lastAssistantText || out;
-    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }).end(JSON.stringify({ text: respText }));
-  } catch (e) {
-    let msg = '';
-    try { msg = String(e && (e.message || e)) || 'server_error'; } catch { msg = 'server_error'; }
-    const stack = buildErrorStack(e, { maxDepth: 8, cap: 8000 });
-    try { console.error('[arcana:chat2] unhandled error with stack:\n' + stack); } catch {}
-    try { broadcast({ type: 'error', sessionId, message: msg, stack }); } catch {}
-    res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'server_error', message: msg, stack }));
-  }
-}
-
 // POST /api/abort  — hard-stop current run and active tool (if any)
 async function handleAbort(req, res) {
   try {
@@ -2937,9 +2651,6 @@ function createRequestHandler() {
     if (req.method === 'POST' && url.pathname === '/api/secrets/reset') { await handleSecretsReset(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/secrets/migrate_env_vault') { await handleSecretsMigrateEnvVault(req, res); return; }
 
-    // Concurrent chat + persistence
-    if (req.method === 'POST' && url.pathname === '/api/chat2') { await handleChat2(req, res); return; }
-
     // Interrupt/steer APIs
     if (req.method === 'POST' && url.pathname === '/api/abort') { await handleAbort(req, res); return; }
     if (req.method === 'POST' && url.pathname === '/api/steer') { await handleSteer(req, res); return; }
@@ -2970,34 +2681,20 @@ function createRequestHandler() {
 }
 
 export async function startArcanaWebServer({ port, workspaceRoot: wsRoot } = {}) {
-  if (wsRoot) { process.env.ARCANA_WORKSPACE = String(wsRoot); try { resetWorkspaceRootCache(); } catch {} }
-  workspaceRoot = resolveWorkspaceRoot();
-  try { ensureArcanaHomeDir(); } catch {}
-  try { ensureDefaultAgentExists(); } catch {}
+  // Thin wrapper around Gateway v2 so existing desktop/CLI integrations
+  // continue to work on port 5678 while using the new control plane.
+  if (wsRoot) {
+    try { process.env.ARCANA_WORKSPACE = String(wsRoot); } catch {}
+    try { resetWorkspaceRootCache(); } catch {}
+  }
 
-  apiToken = loadOrCreateApiToken();
-  try {
-    const hint = tokenHint(apiToken);
-    let tokenPath = '';
-    try { tokenPath = getApiTokenFilePath(); } catch {}
-    if (tokenPath){
-      console.log('[arcana:web] API token ' + hint + ' (file: ' + tokenPath + ', localStorage key: arcana.apiToken.v1)');
-    } else {
-      console.log('[arcana:web] API token ' + hint + ' (localStorage key: arcana.apiToken.v1)');
-    }
-  } catch {}
-
-  const server = http.createServer(createRequestHandler());
   const desiredPort = typeof port === 'number' ? port : (process.env.PORT ? Number(process.env.PORT) : 5678);
-  const bindHost = process.env.ARCANA_BIND_HOST && String(process.env.ARCANA_BIND_HOST).trim()
-    ? String(process.env.ARCANA_BIND_HOST).trim()
-    : '127.0.0.1';
-  await new Promise((resolve) => { server.listen(desiredPort, bindHost, () => resolve()); });
-  const bound = server.address();
-  const actualPort = bound && typeof bound.port === 'number' ? bound.port : desiredPort;
-  const hostLabel = (bound && typeof bound.address === 'string' && bound.address) ? bound.address : bindHost;
-  console.log('[arcana:web] http://' + hostLabel + ':' + actualPort + '  (plugins: ' + (pluginFiles ? pluginFiles.length : 0) + ')');
-
+  const result = await startGatewayV2({ port: desiredPort });
+  const server = result && result.server ? result.server : null;
+  const actualPort = result && typeof result.port === 'number' ? result.port : desiredPort;
+  try {
+    console.log('[arcana:web] using gateway-v2 on http://127.0.0.1:' + actualPort);
+  } catch {}
   return { server, port: actualPort };
 }
 
