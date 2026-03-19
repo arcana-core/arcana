@@ -5,12 +5,20 @@ import { resolveWorkspaceRoot } from '../workspace-guard.js';
 import { createArcanaSession } from '../session.js';
 import { ensureSessionId } from '../cron/arcana-task.js';
 import { runWithContext, emit } from '../event-bus.js';
+import { loadArcanaConfig, loadAgentConfig } from '../config.js';
 import {
   loadSession as ssLoad,
   appendMessage as ssAppend,
   saveSession as ssSave,
+  buildHistoryPreludeText,
 } from '../sessions-store.js';
-import { DEFAULT_CONTEXT_POLICY, buildSessionPrelude, trimUserMessage } from '../context-manager.js';
+import {
+  DEFAULT_CONTEXT_POLICY,
+  buildSessionPrelude,
+  trimUserMessage,
+  estimateTokensFromText,
+  compactSessionByUserTurns,
+} from '../context-manager.js';
 import { buildErrorStack } from '../util/error.js';
 import { nowMs, ensureDir } from './util.js';
 import { persistToolMetaToDisk, persistToolResultToDisk, scheduleAppendToolStream } from '../tool-output-store.js';
@@ -771,7 +779,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   const usageHelper = sess.__arcana_chat_usage;
   if (usageHelper) usageHelper.reset();
 
-  const ctx = { sessionId, agentId, agentHomeRoot: agentHomeDir, workspaceRoot };
+  const ctx = { sessionId, sessionKey, agentId, agentHomeRoot: agentHomeDir, workspaceRoot };
 
   if (isSteer){
     try { toolHost && toolHost.cancelActiveCall && toolHost.cancelActiveCall(); } catch {}
@@ -1135,6 +1143,7 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
   }
 
   const ws = resolveWorkspaceRoot();
+  const agentHomeDir = arcanaHomePath('agents', agentId);
   const ensuredId = await ensureSessionId({ sessionId: rawSessionId, sessionKey, title: title || 'Arcana Web', agentId, workspaceRoot: ws });
   const sessionId = String(ensuredId || '').trim();
   if (!sessionId){
@@ -1159,6 +1168,117 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
       try { ssSave(historyObj, { agentId }); } catch {}
     }
   }
+
+  // Optional history compaction based on configured thresholds, before appending
+  try {
+    if (historyObj && Array.isArray(historyObj.messages) && historyObj.messages.length){
+      const globalCfg = loadArcanaConfig();
+      const agentCfg = loadAgentConfig(agentHomeDir);
+
+      function readCompressionKey(key){
+        let val;
+        try {
+          if (agentCfg && typeof agentCfg === 'object' && Object.prototype.hasOwnProperty.call(agentCfg, key)){
+            const raw = agentCfg[key];
+            if (raw != null){
+              if (typeof raw === 'string'){
+                if (raw.trim() !== '') val = raw;
+              } else {
+                val = raw;
+              }
+            }
+          }
+          if (val === undefined && globalCfg && typeof globalCfg === 'object' && Object.prototype.hasOwnProperty.call(globalCfg, key)){
+            const raw = globalCfg[key];
+            if (raw != null){
+              if (typeof raw === 'string'){
+                if (raw.trim() !== '') val = raw;
+              } else {
+                val = raw;
+              }
+            }
+          }
+        } catch {}
+        return val;
+      }
+
+      const enabledRaw = readCompressionKey('history_compression_enabled');
+      let historyCompressionEnabled = true;
+      if (typeof enabledRaw === 'boolean'){
+        historyCompressionEnabled = enabledRaw;
+      } else if (enabledRaw != null){
+        const s = String(enabledRaw).trim().toLowerCase();
+        if (s){
+          if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') historyCompressionEnabled = false;
+          else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') historyCompressionEnabled = true;
+        }
+      }
+
+      const thresholdDefault = 100000;
+      const thresholdRaw = readCompressionKey('history_compression_threshold_tokens');
+      let thresholdTokens = thresholdDefault;
+      const thresholdNum = Number(thresholdRaw);
+      if (Number.isFinite(thresholdNum) && thresholdNum > 0){
+        thresholdTokens = Math.floor(thresholdNum);
+      }
+
+      const keepDefault = 10;
+      const keepRaw = readCompressionKey('history_compression_keep_user_turns');
+      let keepUserTurns = keepDefault;
+      const keepNum = Number(keepRaw);
+      if (Number.isFinite(keepNum) && keepNum > 0){
+        keepUserTurns = Math.floor(keepNum);
+      }
+
+      if (historyCompressionEnabled && thresholdTokens > 0 && keepUserTurns > 0){
+        const historyText = buildHistoryPreludeText(historyObj) || '';
+        const summaryTextRaw = historyObj && typeof historyObj.summary === 'string' ? historyObj.summary : '';
+        const summaryText = String(summaryTextRaw || '').trim();
+        let combinedText = historyText;
+        if (summaryText){
+          combinedText = summaryText + '\n\n' + historyText;
+        }
+        const estimatedTokens = estimateTokensFromText(combinedText);
+
+        if (estimatedTokens > thresholdTokens){
+          let userTurns = 0;
+          try {
+            const msgs = Array.isArray(historyObj.messages) ? historyObj.messages : [];
+            for (const m of msgs){
+              if (m && m.role === 'user') userTurns += 1;
+            }
+          } catch {}
+
+          if (userTurns > 0){
+            let keepTurns = keepUserTurns;
+            if (userTurns < keepTurns){
+              keepTurns = Math.min(5, userTurns);
+            }
+
+            if (keepTurns > 0){
+              await compactSessionByUserTurns({
+                sessionId,
+                agentId,
+                workspaceRoot: ws,
+                agentHomeDir,
+                keepRecentUserTurns: keepTurns,
+                policy: DEFAULT_CONTEXT_POLICY,
+                broadcast(ev){
+                  try {
+                    if (!ev || typeof ev !== 'object') return;
+                    emit({ ...ev, sessionId, agentId, sessionKey });
+                  } catch {}
+                },
+                reason: 'threshold',
+              });
+
+              try { historyObj = ssLoad(sessionId, { agentId }); } catch {}
+            }
+          }
+        }
+      }
+    }
+  } catch {}
 
   const record = await ensureChatSession({ sessionId, agentId, policy });
   const session = record.session;

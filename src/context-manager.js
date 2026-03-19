@@ -202,6 +202,112 @@ export async function compactSession({
   return { compacted: true, keepRecentMessages: keep, summary: text };
 }
 
+export async function compactSessionByUserTurns({
+  sessionId,
+  agentId,
+  workspaceRoot,
+  agentHomeDir,
+  keepRecentUserTurns,
+  policy = DEFAULT_CONTEXT_POLICY,
+  broadcast,
+  reason,
+} = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return { compacted: false };
+
+  const keepNum = Number(keepRecentUserTurns);
+  const keepTurns = Number.isFinite(keepNum) && keepNum > 0 ? Math.floor(keepNum) : 0;
+  if (!keepTurns) return { compacted: false };
+
+  const obj = loadSession(sid, { agentId });
+  const msgs = obj && Array.isArray(obj.messages) ? obj.messages : [];
+  if (!obj || !msgs.length) return { compacted: false };
+
+  let idx = 0;
+  let userCount = 0;
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    const m = msgs[i];
+    if (m && m.role === 'user') {
+      userCount += 1;
+      if (userCount === keepTurns) {
+        idx = i;
+        break;
+      }
+    }
+  }
+  if (userCount < keepTurns) idx = 0;
+
+  const older = msgs.slice(0, idx);
+  const recent = msgs.slice(idx);
+
+  if (!older.length) return { compacted: false };
+
+  try {
+    if (typeof broadcast === 'function') {
+      broadcast({
+        type: 'history_compact_start',
+        sessionId: sid,
+        agentId,
+        keepRecentUserTurns: keepTurns,
+        reason: String(reason || ''),
+      });
+    }
+  } catch {}
+
+  const ctx = { sessionId: sid, agentId, workspaceRoot, agentHomeRoot: agentHomeDir };
+
+  let summary = '';
+  try {
+    summary = await runWithContext(ctx, async () => {
+      const existingSummary = obj && typeof obj.summary === 'string' ? obj.summary : '';
+      return summarizeOlderMessages({
+        workspaceRoot,
+        agentHomeDir,
+        olderMessages: older,
+        existingSummary,
+        policy,
+      });
+    });
+  } catch {
+    summary = '';
+  }
+
+  const text = String(summary || '').trim();
+  if (!text) {
+    try {
+      if (typeof broadcast === 'function') {
+        broadcast({
+          type: 'history_compact_end',
+          sessionId: sid,
+          agentId,
+          keepRecentUserTurns: keepTurns,
+          compacted: false,
+        });
+      }
+    } catch {}
+    return { compacted: false };
+  }
+
+  obj.summary = text;
+  obj.messages = recent;
+  obj.sessionTokens = 0;
+  try { saveSession(obj, { agentId }); } catch {}
+
+  try {
+    if (typeof broadcast === 'function') {
+      broadcast({
+        type: 'history_compact_end',
+        sessionId: sid,
+        agentId,
+        keepRecentUserTurns: keepTurns,
+        compacted: true,
+      });
+    }
+  } catch {}
+
+  return { compacted: true, keepRecentUserTurns: keepTurns, summary: text };
+}
+
 export async function ensurePreludeForPrompt({ sessionId, agentId, workspaceRoot, agentHomeDir, policy = DEFAULT_CONTEXT_POLICY } = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return '';
@@ -215,5 +321,6 @@ export default {
   trimUserMessage,
   buildSessionPrelude,
   compactSession,
+  compactSessionByUserTurns,
   ensurePreludeForPrompt,
 };

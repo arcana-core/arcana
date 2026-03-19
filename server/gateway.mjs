@@ -1,7 +1,22 @@
 import { pathToFileURL } from 'node:url';
-import { startGatewayV2 } from '../src/gateway-v2/index.js';
 
-export { startGatewayV2 };
+async function loadStartGatewayV2() {
+  const mod = await import('../src/gateway-v2/index.js');
+  const fn =
+    mod.startGatewayV2 ||
+    (mod.default && (mod.default.startGatewayV2 || mod.default));
+
+  if (typeof fn !== 'function') {
+    throw new Error('[arcana:gateway-v2] Unable to resolve startGatewayV2 export from ../src/gateway-v2/index.js');
+  }
+
+  return fn;
+}
+
+export async function startGatewayV2(options) {
+  const impl = await loadStartGatewayV2();
+  return impl(options);
+}
 
 const isDirectRun = (() => {
   try {
@@ -19,4 +34,3 @@ if (isDirectRun) {
     process.exit(1);
   });
 }
-

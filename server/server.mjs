@@ -2283,6 +2283,24 @@ function sanitizeConfig(cfg) {
   if (!cfg) return null;
   const out = { provider: cfg.provider || '', base_url: cfg.base_url || '', model: cfg.model || '', path: cfg.path || '' };
   out.has_key = !!cfg.key || !!cfg.api_key || !!cfg.apiKey;
+
+  // Non-secret history compression fields — expose if present
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_enabled')) {
+      out.history_compression_enabled = cfg.history_compression_enabled;
+    }
+  } catch {}
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_threshold_tokens')) {
+      out.history_compression_threshold_tokens = cfg.history_compression_threshold_tokens;
+    }
+  } catch {}
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_keep_user_turns')) {
+      out.history_compression_keep_user_turns = cfg.history_compression_keep_user_turns;
+    }
+  } catch {}
+
   delete out.key; delete out.api_key; delete out.apiKey;
   return out;
 }
@@ -2387,6 +2405,44 @@ async function handlePostAgentConfig(req, res) {
       const key = String(body.key || '').trim();
       const cfgObj = { provider, model: modelId, base_url: baseUrl };
       if (key) cfgObj.key = key;
+
+      // Optional history compression settings (non-secret)
+      try {
+        if (Object.prototype.hasOwnProperty.call(body, 'history_compression_enabled')) {
+          const enabledRaw = body.history_compression_enabled;
+          let enabledVal;
+          if (typeof enabledRaw === 'boolean') {
+            enabledVal = enabledRaw;
+          } else if (enabledRaw != null) {
+            const s = String(enabledRaw).trim().toLowerCase();
+            if (s) {
+              if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') enabledVal = false;
+              else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') enabledVal = true;
+            }
+          }
+          if (typeof enabledVal === 'boolean') cfgObj.history_compression_enabled = enabledVal;
+        }
+      } catch {}
+
+      try {
+        if (Object.prototype.hasOwnProperty.call(body, 'history_compression_threshold_tokens')) {
+          const raw = body.history_compression_threshold_tokens;
+          const num = Number(raw);
+          if (Number.isFinite(num) && num > 0) {
+            cfgObj.history_compression_threshold_tokens = Math.floor(num);
+          }
+        }
+      } catch {}
+
+      try {
+        if (Object.prototype.hasOwnProperty.call(body, 'history_compression_keep_user_turns')) {
+          const raw = body.history_compression_keep_user_turns;
+          const num = Number(raw);
+          if (Number.isFinite(num) && num > 0) {
+            cfgObj.history_compression_keep_user_turns = Math.floor(num);
+          }
+        }
+      } catch {}
       const baseDir = String(agentHomeDir || '').trim();
       if (baseDir) {
         try { mkdirSync(baseDir, { recursive: true }); } catch {}
@@ -2413,6 +2469,44 @@ async function handlePostConfig(req, res) {
     const key = String(body.key || '').trim();
     const cfgObj = { provider, model: modelId, base_url: baseUrl };
     if (key) cfgObj.key = key;
+
+    // Optional history compression settings (non-secret)
+    try {
+      if (Object.prototype.hasOwnProperty.call(body, 'history_compression_enabled')) {
+        const enabledRaw = body.history_compression_enabled;
+        let enabledVal;
+        if (typeof enabledRaw === 'boolean') {
+          enabledVal = enabledRaw;
+        } else if (enabledRaw != null) {
+          const s = String(enabledRaw).trim().toLowerCase();
+          if (s) {
+            if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') enabledVal = false;
+            else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') enabledVal = true;
+          }
+        }
+        if (typeof enabledVal === 'boolean') cfgObj.history_compression_enabled = enabledVal;
+      }
+    } catch {}
+
+    try {
+      if (Object.prototype.hasOwnProperty.call(body, 'history_compression_threshold_tokens')) {
+        const raw = body.history_compression_threshold_tokens;
+        const num = Number(raw);
+        if (Number.isFinite(num) && num > 0) {
+          cfgObj.history_compression_threshold_tokens = Math.floor(num);
+        }
+      }
+    } catch {}
+
+    try {
+      if (Object.prototype.hasOwnProperty.call(body, 'history_compression_keep_user_turns')) {
+        const raw = body.history_compression_keep_user_turns;
+        const num = Number(raw);
+        if (Number.isFinite(num) && num > 0) {
+          cfgObj.history_compression_keep_user_turns = Math.floor(num);
+        }
+      }
+    } catch {}
 
     const envCfg = String(process.env.ARCANA_CONFIG || '').trim();
     let path = '';

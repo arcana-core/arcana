@@ -45,8 +45,25 @@ function serviceIdFromFilename(file) {
   return b.slice(0, b.length - e.length);
 }
 
-async function scanServiceFiles(workspaceRoot) {
-  const servicesDir = join(workspaceRoot, "services");
+function isBundledServicesEnabled() {
+  try {
+    const raw = String(process.env.ARCANA_ENABLE_BUNDLED_SERVICES || "").trim().toLowerCase();
+    if (!raw) return false;
+    if (raw === "0" || raw === "false" || raw === "no") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getBundledRoot() {
+  if (!isBundledServicesEnabled()) return null;
+  const root = process.env.ARCANA_BUNDLED_ROOT;
+  if (!root) return null;
+  return root;
+}
+
+async function scanServicesDir(servicesDir) {
   try {
     const entries = await fsp.readdir(servicesDir, { withFileTypes: true });
     const files = [];
@@ -60,6 +77,37 @@ async function scanServiceFiles(workspaceRoot) {
     // directory missing is fine
     return [];
   }
+}
+
+async function scanServiceFiles(workspaceRoot) {
+  const servicesDir = join(workspaceRoot, "services");
+  return scanServicesDir(servicesDir);
+}
+
+async function scanBundledServiceFiles() {
+  const bundledRoot = getBundledRoot();
+  if (!bundledRoot) return [];
+  const servicesDir = join(bundledRoot, "services");
+  return scanServicesDir(servicesDir);
+}
+
+async function scanAllServiceFiles(workspaceRoot) {
+  const workspaceFiles = await scanServiceFiles(workspaceRoot);
+  const bundledFiles = await scanBundledServiceFiles();
+  if (!bundledFiles.length) return workspaceFiles;
+
+  const seen = new Set();
+  for (const file of workspaceFiles) {
+    seen.add(serviceIdFromFilename(file));
+  }
+
+  const all = workspaceFiles.slice();
+  for (const file of bundledFiles) {
+    const id = serviceIdFromFilename(file);
+    if (!seen.has(id)) all.push(file);
+  }
+
+  return all;
 }
 
 async function startOne(filePath, workspaceRoot) {
@@ -195,7 +243,7 @@ export async function startServicesOnce({ workspaceRoot } = {}) {
   state.started = true; // mark started early to avoid re-entrancy
   installHooksOnce();
 
-  const files = await scanServiceFiles(root);
+  const files = await scanAllServiceFiles(root);
   for (const file of files) {
     await startOne(file, root);
   }
@@ -214,7 +262,7 @@ export async function reloadServices({ workspaceRoot } = {}) {
 
   installHooksOnce();
 
-  const files = await scanServiceFiles(root);
+  const files = await scanAllServiceFiles(root);
   for (const file of files) {
     const id = serviceIdFromFilename(file);
     const existing = state.services.get(id);
@@ -245,6 +293,13 @@ export async function startService({ id, workspaceRoot } = {}) {
   if (state.services.has(id)) return getServicesStatus();
 
   const candidates = [join(root, "services", id + ".mjs"), join(root, "services", id + ".js")];
+  if (isBundledServicesEnabled()) {
+    const bundledRoot = getBundledRoot();
+    if (bundledRoot) {
+      candidates.push(join(bundledRoot, "services", id + ".mjs"));
+      candidates.push(join(bundledRoot, "services", id + ".js"));
+    }
+  }
   let found = null;
   for (const p of candidates) {
     try {

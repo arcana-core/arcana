@@ -1643,6 +1643,37 @@ try{
   }
 } catch {}
 
+const HISTORY_COMPRESSION_DEFAULT_ENABLED = true;
+const HISTORY_COMPRESSION_DEFAULT_THRESHOLD = 100000;
+const HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS = 10;
+
+function parseHistoryCompressionEnabled(raw, fallback){
+  let out = !!fallback;
+  try{
+    if (typeof raw === 'boolean'){
+      out = raw;
+    } else if (raw != null){
+      const s = String(raw).trim().toLowerCase();
+      if (s){
+        if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') out = false;
+        else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') out = true;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+function parseHistoryCompressionNumber(raw, fallback){
+  let out = fallback;
+  try{
+    const num = Number(raw);
+    if (Number.isFinite(num) && num > 0){
+      out = Math.floor(num);
+    }
+  } catch {}
+  return out;
+}
+
 async function loadConfigUI(){
   try{
     // Global default config
@@ -1659,6 +1690,25 @@ async function loadConfigUI(){
     if (qs('cfg-model-global')) qs('cfg-model-global').value = globalCfg.model || '';
     if (qs('cfg-base-url-global')) qs('cfg-base-url-global').value = globalCfg.base_url || '';
     if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? '已设置' : '未设置';
+
+    const globalEnabledRaw = (globalCfg && Object.prototype.hasOwnProperty.call(globalCfg, 'history_compression_enabled'))
+      ? globalCfg.history_compression_enabled
+      : HISTORY_COMPRESSION_DEFAULT_ENABLED;
+    const globalCompressEnabled = parseHistoryCompressionEnabled(globalEnabledRaw, HISTORY_COMPRESSION_DEFAULT_ENABLED);
+
+    const globalThresholdRaw = (globalCfg && Object.prototype.hasOwnProperty.call(globalCfg, 'history_compression_threshold_tokens'))
+      ? globalCfg.history_compression_threshold_tokens
+      : HISTORY_COMPRESSION_DEFAULT_THRESHOLD;
+    const globalCompressThreshold = parseHistoryCompressionNumber(globalThresholdRaw, HISTORY_COMPRESSION_DEFAULT_THRESHOLD);
+
+    const globalKeepRaw = (globalCfg && Object.prototype.hasOwnProperty.call(globalCfg, 'history_compression_keep_user_turns'))
+      ? globalCfg.history_compression_keep_user_turns
+      : HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS;
+    const globalCompressKeep = parseHistoryCompressionNumber(globalKeepRaw, HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS);
+
+    const gEnabledEl = qs('cfg-compress-enabled-global'); if (gEnabledEl) gEnabledEl.checked = !!globalCompressEnabled;
+    const gThreshEl = qs('cfg-compress-threshold-global'); if (gThreshEl) gThreshEl.value = String(globalCompressThreshold);
+    const gKeepEl = qs('cfg-compress-keep-user-turns-global'); if (gKeepEl) gKeepEl.value = String(globalCompressKeep);
     // Update default (global) model label cache
     try { __setCachedModelLabel(DEFAULT_AGENT_ID, globalCfg); } catch {}
 
@@ -1677,11 +1727,39 @@ async function loadConfigUI(){
       try { __setCachedModelLabel(aid, agentCfg); } catch {}
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = agentCfg.base_url || '';
       if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? '已设置' : '未设置';
+
+      let agentCompressEnabled = globalCompressEnabled;
+      try{
+        if (agentCfg && Object.prototype.hasOwnProperty.call(agentCfg, 'history_compression_enabled')){
+          agentCompressEnabled = parseHistoryCompressionEnabled(agentCfg.history_compression_enabled, globalCompressEnabled);
+        }
+      } catch {}
+
+      let agentCompressThreshold = globalCompressThreshold;
+      try{
+        if (agentCfg && Object.prototype.hasOwnProperty.call(agentCfg, 'history_compression_threshold_tokens')){
+          agentCompressThreshold = parseHistoryCompressionNumber(agentCfg.history_compression_threshold_tokens, globalCompressThreshold);
+        }
+      } catch {}
+
+      let agentCompressKeep = globalCompressKeep;
+      try{
+        if (agentCfg && Object.prototype.hasOwnProperty.call(agentCfg, 'history_compression_keep_user_turns')){
+          agentCompressKeep = parseHistoryCompressionNumber(agentCfg.history_compression_keep_user_turns, globalCompressKeep);
+        }
+      } catch {}
+
+      const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!agentCompressEnabled;
+      const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(agentCompressThreshold);
+      const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(agentCompressKeep);
     }catch(e){
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = '';
       if (qs('cfg-model-agent')) qs('cfg-model-agent').value = '';
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = '';
       if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = '未设置';
+      const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!globalCompressEnabled;
+      const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(globalCompressThreshold);
+      const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(globalCompressKeep);
       appendLog('[config] 读取 Agent 配置失败');
     }
     // Best-effort: refresh live info model label immediately
@@ -1696,6 +1774,22 @@ async function saveGlobalConfigUI(){
       model: (qs('cfg-model-global')||{}).value || '',
       base_url: (qs('cfg-base-url-global')||{}).value || '',
     };
+
+    const gEnabledEl = qs('cfg-compress-enabled-global');
+    const historyCompressionEnabled = (gEnabledEl && typeof gEnabledEl.checked !== 'undefined') ? !!gEnabledEl.checked : HISTORY_COMPRESSION_DEFAULT_ENABLED;
+
+    const gThreshEl = qs('cfg-compress-threshold-global');
+    const threshRaw = gThreshEl ? String(gThreshEl.value || '').trim() : '';
+    const historyCompressionThreshold = parseHistoryCompressionNumber(threshRaw || HISTORY_COMPRESSION_DEFAULT_THRESHOLD, HISTORY_COMPRESSION_DEFAULT_THRESHOLD);
+
+    const gKeepEl = qs('cfg-compress-keep-user-turns-global');
+    const keepRaw = gKeepEl ? String(gKeepEl.value || '').trim() : '';
+    const historyCompressionKeep = parseHistoryCompressionNumber(keepRaw || HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS, HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS);
+
+    payload.history_compression_enabled = historyCompressionEnabled;
+    payload.history_compression_threshold_tokens = historyCompressionThreshold;
+    payload.history_compression_keep_user_turns = historyCompressionKeep;
+
     const key = (qs('cfg-key-global')||{}).value || '';
     if (key) payload.key = key;
     const token = getStoredApiToken();
@@ -1719,6 +1813,34 @@ async function saveAgentConfigUI(){
       model: (qs('cfg-model-agent')||{}).value || '',
       base_url: (qs('cfg-base-url-agent')||{}).value || '',
     };
+
+    const aEnabledEl = qs('cfg-compress-enabled-agent');
+    if (aEnabledEl && typeof aEnabledEl.checked !== 'undefined'){
+      payload.history_compression_enabled = !!aEnabledEl.checked;
+    }
+
+    const aThreshEl = qs('cfg-compress-threshold-agent');
+    if (aThreshEl){
+      const threshRaw = String(aThreshEl.value || '').trim();
+      if (threshRaw){
+        const num = Number(threshRaw);
+        if (Number.isFinite(num) && num > 0){
+          payload.history_compression_threshold_tokens = Math.floor(num);
+        }
+      }
+    }
+
+    const aKeepEl = qs('cfg-compress-keep-user-turns-agent');
+    if (aKeepEl){
+      const keepRaw = String(aKeepEl.value || '').trim();
+      if (keepRaw){
+        const num = Number(keepRaw);
+        if (Number.isFinite(num) && num > 0){
+          payload.history_compression_keep_user_turns = Math.floor(num);
+        }
+      }
+    }
+
     const key = (qs('cfg-key-agent')||{}).value || '';
     if (key) payload.key = key;
     const token = getStoredApiToken();

@@ -9,20 +9,24 @@
     "chat": "node ./bin/arcana.js chat",
     "web:navigate": "node ./bin/arcana.js web navigate",
     "web:extract": "node ./bin/arcana.js web extract",
-    "web:serve": "node ./server/server.mjs",
+    "web:serve": "node ./bin/arcana.js gateway serve",
     "doctor": "node ./bin/arcana.js doctor",
     "support-bundle": "node ./bin/arcana.js support-bundle",
     "web:search": "node ./bin/arcana.js web search",
     "cron:once": "node ./bin/arcana.js cron once",
     "cron:serve": "node ./bin/arcana.js cron serve",
     "gateway": "node ./bin/arcana.js gateway serve",
-    "gateway:serve": "node ./bin/arcana.js gateway serve"
+    "gateway:serve": "node ./bin/arcana.js gateway serve",
+    "subtitle:stats": "node ./scripts/subtitle_phrase_stats.mjs"
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.54.0",
     "@mariozechner/pi-coding-agent": "^0.54.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@sinclair/typebox": "^0.32.35",
+    "mmd-parser": "^1.0.4",
     "playwright": "^1.58.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
   }
 }

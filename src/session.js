@@ -387,8 +387,41 @@ export async function createArcanaSession(opts={}){
 
             if (createdSession && typeof createdSession.reload === 'function') {
               try {
+                let prevActive = [];
+                try {
+                  if (typeof createdSession.getActiveToolNames === 'function') {
+                    const current = createdSession.getActiveToolNames() || [];
+                    if (Array.isArray(current)) prevActive = current;
+                  }
+                } catch {}
+
                 createdSession._customTools = wrappedCustomTools;
                 await createdSession.reload();
+
+                try {
+                  if (typeof createdSession.setActiveToolsByName === 'function') {
+                    const seen = new Set();
+                    const nextActive = [];
+                    const bashName = (bashProxy && bashProxy.name) || 'bash';
+
+                    for (const name of prevActive || []) {
+                      if (typeof name !== 'string') continue;
+                      const trimmed = name.trim();
+                      if (!trimmed) continue;
+                      if (execPolicy !== 'open' && trimmed === bashName) continue;
+                      if (seen.has(trimmed)) continue;
+                      seen.add(trimmed);
+                      nextActive.push(trimmed);
+                    }
+
+                    if (execPolicy === 'open' && !seen.has(bashName)) {
+                      seen.add(bashName);
+                      nextActive.push(bashName);
+                    }
+
+                    createdSession.setActiveToolsByName(nextActive);
+                  }
+                } catch {}
               } catch {}
             } else {
               const p = loader.reload();
@@ -525,10 +558,36 @@ export async function createArcanaSession(opts={}){
   // Apply initial execution policy to active tool names so chat2 sessions
   // honor the requested policy without an extra server-side toggle.
   try {
-    const desired = new Set(created.session?.getActiveToolNames?.() || []);
-    ['read','grep','find','ls'].forEach((t) => desired.add(t));
-    if (execPolicy === 'open') desired.add('bash');
-    else desired.delete('bash');
+    const baseNames = baseTools
+      .map((t) => t && t.name)
+      .filter((n) => typeof n === 'string' && n.length > 0);
+
+    const customNames = customTools
+      .map((t) => t && t.name)
+      .filter((n) => typeof n === 'string' && n.length > 0);
+
+    const skillToolNames = new Set(
+      (skillTools || [])
+        .map((t) => t && t.name)
+        .filter((n) => typeof n === 'string' && n.length > 0),
+    );
+
+    const desired = new Set();
+
+    // Always enable base tools (read/grep/find/ls)
+    for (const n of baseNames) desired.add(n);
+
+    // Enable all non-skill custom tools by default
+    for (const n of customNames) {
+      if (!n || skillToolNames.has(n)) continue;
+      desired.add(n);
+    }
+
+    // Apply bash enablement based on execution policy
+    const bashName = (bashProxy && bashProxy.name) || 'bash';
+    if (execPolicy === 'open') desired.add(bashName);
+    else desired.delete(bashName);
+
     created.session?.setActiveToolsByName?.(Array.from(desired));
   } catch {}
 

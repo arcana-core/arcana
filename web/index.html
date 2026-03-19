@@ -82,6 +82,17 @@
             <input id="cfg-key-global" type="password" placeholder="仅用于更新，不会回显" />
             <span id="cfg-key-set-global" style="font-size:12px;color:#666;">未设置</span>
           </div>
+          <div>历史压缩</div>
+          <div>
+            <label style="display:flex;align-items:center;gap:6px;">
+              <input id="cfg-compress-enabled-global" type="checkbox" />
+              启用（根据长度自动压缩历史）
+            </label>
+          </div>
+          <div>压缩阈值</div>
+          <input id="cfg-compress-threshold-global" type="number" min="0" placeholder="触发压缩的 token 数" />
+          <div>保留用户轮数</div>
+          <input id="cfg-compress-keep-user-turns-global" type="number" min="0" placeholder="至少保留的最近用户轮数" />
         </div>
 
         <div style="font-size:12px;color:#666;margin-bottom:4px;">当前 Agent 覆盖</div>
@@ -119,6 +130,17 @@
             <input id="cfg-key-agent" type="password" placeholder="仅用于更新，不会回显" />
             <span id="cfg-key-set-agent" style="font-size:12px;color:#666;">未设置</span>
           </div>
+          <div>历史压缩</div>
+          <div>
+            <label style="display:flex;align-items:center;gap:6px;">
+              <input id="cfg-compress-enabled-agent" type="checkbox" />
+              启用（为当前 Agent 历史压缩）
+            </label>
+          </div>
+          <div>压缩阈值</div>
+          <input id="cfg-compress-threshold-agent" type="number" min="0" placeholder="留空则继承全局" />
+          <div>保留用户轮数</div>
+          <input id="cfg-compress-keep-user-turns-agent" type="number" min="0" placeholder="留空则继承全局" />
         </div>
 
         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center;">
