@@ -251,36 +251,254 @@ export async function createArcanaSession(opts={}){
   // Legacy provider key; prefer secrets bindings
   const providerKey = (cfg && cfg.key) ? String(cfg.key).trim() : '';
 
-  let model;
-  const sel = resolveModelFromConfig(cfg) || resolveModelFromEnv();
-  if (sel) {
-    try {
-      const providerForLookup = String(sel.provider || '').trim().toLowerCase() === 'openai-compatible' ? 'openai' : sel.provider;
-      model = getModel(providerForLookup, sel.id);
-    } catch {}
-  }
-  if (!model) {
-    const provider = (cfg?.provider || inferProviderFromEnv() || '').toLowerCase();
-    if (provider) model = pickFallbackModel(provider);
-  }
-  const baseOverride = normalizeOpenAIBase(cfg?.base_url || process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || '');
-  if (baseOverride && model && model.provider === 'openai') model = { ...model, baseUrl: baseOverride };
+  // Inline provider/model definitions: cfg.models.providers
+  const inlineProvidersCfg = cfg && cfg.models && cfg.models.providers && typeof cfg.models.providers === 'object'
+    ? cfg.models.providers
+    : null;
 
-  const anthropicBaseOverride = normalizeAnthropicBase(cfg?.base_url || process.env.ANTHROPIC_BASE_URL || '');
-  if (anthropicBaseOverride && model && model.provider === 'anthropic') model = { ...model, baseUrl: anthropicBaseOverride };
+  function normalizeInlineProviderId(p){
+    return String(p || '').trim().toLowerCase();
+  }
+
+  function buildInlineProvidersIndex(raw){
+    if (!raw || typeof raw !== 'object') return null;
+    const index = new Map();
+    for (const [key, value] of Object.entries(raw)){
+      const norm = normalizeInlineProviderId(key);
+      if (!norm) continue;
+      if (!index.has(norm)){
+        const cfgObj = value && typeof value === 'object' ? value : {};
+        index.set(norm, { key, cfg: cfgObj });
+      }
+    }
+    return index;
+  }
+
+  const inlineProvidersIndex = buildInlineProvidersIndex(inlineProvidersCfg);
+
+  function getInlineProviderEntry(name){
+    if (!inlineProvidersIndex) return null;
+    const norm = normalizeInlineProviderId(name);
+    if (!norm) return null;
+    const entry = inlineProvidersIndex.get(norm);
+    return entry || null;
+  }
+
+  function buildProviderModelsMap(providerCfg){
+    if (!providerCfg || typeof providerCfg !== 'object') return null;
+    const src = providerCfg.models;
+    if (!src) return null;
+    if (Array.isArray(src)){
+      const map = {};
+      for (const item of src){
+        if (!item || typeof item !== 'object') continue;
+        const id = item.id != null ? String(item.id).trim() : '';
+        if (!id) continue;
+        map[id] = item;
+      }
+      return map;
+    }
+    if (typeof src === 'object') return src;
+    return null;
+  }
+
+  function mergeProviderAndModelTemplate(providerCfg, modelCfg){
+    const base = providerCfg && typeof providerCfg === 'object' ? providerCfg : {};
+    const model = modelCfg && typeof modelCfg === 'object' ? modelCfg : {};
+    const merged = { ...base, ...model };
+
+    const providerHeaders = (base && typeof base.headers === 'object') ? base.headers : null;
+    const modelHeaders = (model && typeof model.headers === 'object') ? model.headers : null;
+    if (providerHeaders || modelHeaders){
+      merged.headers = { ...(providerHeaders || {}), ...(modelHeaders || {}) };
+    }
+
+    // Do not leak nested models/defaultModel fields into individual model templates.
+    delete merged.models;
+    delete merged.defaultModel;
+    return merged;
+  }
+
+  function hasInlineBaseUrl(providerCfg, modelCfg){
+    const hasFrom = (obj)=>{
+      if (!obj || typeof obj !== 'object') return false;
+      if (Object.prototype.hasOwnProperty.call(obj, 'baseUrl')){
+        const v = obj.baseUrl;
+        if (v != null && String(v).trim()) return true;
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'baseURL')){
+        const v = obj.baseURL;
+        if (v != null && String(v).trim()) return true;
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'base_url')){
+        const v = obj.base_url;
+        if (v != null && String(v).trim()) return true;
+      }
+      return false;
+    };
+    return hasFrom(modelCfg) || hasFrom(providerCfg);
+  }
+
+  let inlineBaseUrlExplicit = false;
+
+  function buildModelFromInline(provider, id, template){
+    const prov = String(provider || '').trim();
+    const modelId = String(id || '').trim();
+    if (!prov || !modelId) return null;
+
+    const provNorm = prov.toLowerCase();
+    const providerForLookup = provNorm === 'openai-compatible' ? 'openai' : provNorm;
+
+    let baseTemplate = null;
+    try {
+      baseTemplate = getModel(providerForLookup, modelId);
+    } catch {}
+
+    const src = template && typeof template === 'object' ? template : {};
+
+    const api = String(src.api || (baseTemplate && baseTemplate.api) || 'openai-completions');
+
+    let baseUrl = src.baseUrl || src.baseURL || src.base_url || (baseTemplate && (baseTemplate.baseUrl || baseTemplate.baseURL || baseTemplate.base_url)) || '';
+    if (api === 'anthropic-messages') baseUrl = normalizeAnthropicBase(baseUrl);
+    else if (api === 'openai-completions' || api === 'openai-responses' || api === 'openai-codex-responses' || api === 'azure-openai-responses') baseUrl = normalizeOpenAIBase(baseUrl);
+    else {
+      let s = String(baseUrl || '').trim();
+      if (s) s = s.replace(/\/+$/g, '');
+      baseUrl = s;
+    }
+
+    const baseHeaders = (baseTemplate && baseTemplate.headers && typeof baseTemplate.headers === 'object') ? baseTemplate.headers : {};
+    const overrideHeaders = (src.headers && typeof src.headers === 'object') ? src.headers : {};
+
+    const result = {
+      id: modelId,
+      name: String(src.name || (baseTemplate && baseTemplate.name) || modelId),
+      provider: provNorm,
+      api,
+      baseUrl,
+      reasoning: src.reasoning != null ? !!src.reasoning : !!(baseTemplate && baseTemplate.reasoning),
+      input: Array.isArray(src.input) && src.input.length ? src.input : (baseTemplate && Array.isArray(baseTemplate.input) && baseTemplate.input.length ? baseTemplate.input : ['text']),
+      cost: src.cost && typeof src.cost === 'object' ? src.cost : (baseTemplate && baseTemplate.cost) || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: typeof src.contextWindow === 'number' ? src.contextWindow : (baseTemplate && typeof baseTemplate.contextWindow === 'number' ? baseTemplate.contextWindow : 200000),
+      maxTokens: typeof src.maxTokens === 'number' ? src.maxTokens : (baseTemplate && typeof baseTemplate.maxTokens === 'number' ? baseTemplate.maxTokens : 8192),
+      headers: { ...baseHeaders, ...overrideHeaders },
+    };
+
+    // Preserve any additional fields from the inline template (e.g., compat)
+    for (const [k, v] of Object.entries(src)){
+      if (Object.prototype.hasOwnProperty.call(result, k)) continue;
+      result[k] = v;
+    }
+
+    return result;
+  }
+
+  function resolveModel(){
+    inlineBaseUrlExplicit = false;
+    const sel = resolveModelFromConfig(cfg) || resolveModelFromEnv();
+    let model = null;
+    let selProvider = '';
+    let selId = '';
+    if (sel){
+      selProvider = String(sel.provider || '').trim();
+      selId = String(sel.id || '').trim();
+      const inlineEntry = selProvider ? getInlineProviderEntry(selProvider) : null;
+      if (inlineEntry){
+        const providerCfg = inlineEntry.cfg || {};
+        const providerKey = inlineEntry.key;
+        const modelsMap = buildProviderModelsMap(providerCfg);
+        if (modelsMap && Object.prototype.hasOwnProperty.call(modelsMap, selId)){
+          const modelCfg = modelsMap[selId] || {};
+          const template = mergeProviderAndModelTemplate(providerCfg, modelCfg);
+          inlineBaseUrlExplicit = hasInlineBaseUrl(providerCfg, modelCfg);
+          model = buildModelFromInline(providerKey, selId, template);
+        } else {
+          // Inline provider exists but model id is not explicitly listed: allow fallback construction
+          inlineBaseUrlExplicit = hasInlineBaseUrl(providerCfg, null);
+          model = buildModelFromInline(providerKey, selId, providerCfg || {});
+        }
+      }
+      if (!model){
+        try {
+          const norm = normalizeInlineProviderId(selProvider);
+          const providerForLookup = norm === 'openai-compatible' ? 'openai' : (norm || selProvider);
+          model = getModel(providerForLookup, selId);
+        } catch {}
+      }
+    }
+    if (!model){
+      const rawProvider = cfg?.provider || inferProviderFromEnv() || '';
+      const providerNorm = normalizeInlineProviderId(rawProvider);
+      if (inlineProvidersIndex && providerNorm){
+        const inlineEntry = inlineProvidersIndex.get(providerNorm);
+        if (inlineEntry){
+          const providerCfg = inlineEntry.cfg || {};
+          const providerKey = inlineEntry.key;
+          // If a default model id is specified on the provider entry, prefer it;
+          // otherwise try to build from the provider entry itself using the selected id (if any).
+          let defaultId = '';
+          try {
+            if (providerCfg && typeof providerCfg === 'object' && providerCfg.defaultModel){
+              defaultId = String(providerCfg.defaultModel || '').trim();
+            }
+          } catch {}
+          const id = defaultId || selId || '';
+          if (id){
+            const modelsMap = buildProviderModelsMap(providerCfg);
+            if (modelsMap && Object.prototype.hasOwnProperty.call(modelsMap, id)){
+              const modelCfg = modelsMap[id] || {};
+              const template = mergeProviderAndModelTemplate(providerCfg, modelCfg);
+              inlineBaseUrlExplicit = hasInlineBaseUrl(providerCfg, modelCfg);
+              model = buildModelFromInline(providerKey, id, template);
+            } else {
+              inlineBaseUrlExplicit = hasInlineBaseUrl(providerCfg, null);
+              model = buildModelFromInline(providerKey, id, providerCfg || {});
+            }
+          }
+        }
+      }
+      if (!model && providerNorm) model = pickFallbackModel(providerNorm);
+    }
+
+    // Legacy cfg.base_url / env overrides for OpenAI/Anthropic.
+    const baseOverrideRaw = cfg?.base_url || process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || '';
+    const baseOverrideOpenAI = normalizeOpenAIBase(baseOverrideRaw || '');
+    if (baseOverrideOpenAI && model && !inlineBaseUrlExplicit){
+      const providerNorm = String(model.provider || '').trim().toLowerCase();
+      if (providerNorm === 'openai' || providerNorm === 'openai-compatible'){
+        model = { ...model, baseUrl: baseOverrideOpenAI };
+      }
+    }
+
+    const anthropicBaseRaw = cfg?.base_url || process.env.ANTHROPIC_BASE_URL || '';
+    const anthropicBaseOverride = normalizeAnthropicBase(anthropicBaseRaw || '');
+    if (anthropicBaseOverride && model && !inlineBaseUrlExplicit){
+      const providerNorm = String(model.provider || '').trim().toLowerCase();
+      if (providerNorm === 'anthropic'){
+        model = { ...model, baseUrl: anthropicBaseOverride };
+      }
+    }
+
+    return model;
+  }
+
+  let model = resolveModel();
 
   // Inject Codex CLI identification headers for OpenAI provider.
   // The OpenAI API requires `originator: codex_cli_rs` header for certain models/endpoints,
   // otherwise it returns 400 "This API endpoint is only accessible via the official Codex CLI".
-  if (model && model.provider === 'openai' && providerName.toLowerCase() === 'openai') {
-    model = {
-      ...model,
-      headers: {
-        ...model.headers,
-        'originator': 'codex_cli_rs',
-        'User-Agent': 'codex/0.1.0',
-      }
-    };
+  if (model){
+    const modelProviderNorm = String(model.provider || '').trim().toLowerCase();
+    if (modelProviderNorm === 'openai' && providerName.toLowerCase() === 'openai') {
+      model = {
+        ...model,
+        headers: {
+          ...model.headers,
+          'originator': 'codex_cli_rs',
+          'User-Agent': 'codex/0.1.0',
+        }
+      };
+    }
   }
 
   // Create tool-daemon client and proxy tools. We always register a proxy 'bash'

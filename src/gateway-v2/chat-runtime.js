@@ -1604,12 +1604,47 @@ export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessio
   for (const rec of chatSessions.values()){
     if (!rec || rec.agentId !== agentId) continue;
     if (String(rec.sessionId || '') !== sessionId) continue;
-    try {
-      if (rec.session && rec.session.agent && typeof rec.session.agent.clearMessages === 'function'){
-        rec.session.agent.clearMessages();
-        cleared = true;
-      }
-    } catch {}
+
+    const sess = rec.session;
+    const agent = sess && sess.agent ? sess.agent : null;
+    let thisCleared = false;
+
+    if (sess && typeof sess.newSession === 'function'){
+      try {
+        const p = sess.newSession();
+        if (p && typeof p.then === 'function'){
+          await p;
+        }
+        thisCleared = true;
+      } catch {}
+    }
+
+    if (!thisCleared && agent){
+      try {
+        if (typeof agent.reset === 'function'){
+          const p = agent.reset();
+          if (p && typeof p.then === 'function'){
+            await p;
+          }
+          thisCleared = true;
+        } else if (typeof agent.clearMessages === 'function'){
+          agent.clearMessages();
+          thisCleared = true;
+        }
+      } catch {}
+    }
+
+    if (!thisCleared && sess && typeof sess.reset === 'function'){
+      try {
+        const p = sess.reset();
+        if (p && typeof p.then === 'function'){
+          await p;
+        }
+        thisCleared = true;
+      } catch {}
+    }
+
+    if (thisCleared) cleared = true;
   }
   return { ok: cleared };
 }

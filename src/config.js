@@ -72,17 +72,65 @@ export function applyProviderEnv(cfg) {
 }
 
 /**
- * Resolve a model from config like:
- *   { "model": "google:gemini-2.0-flash" }
- * Returns { provider, id } or null.
+ * Resolve a model from config.
+ *
+ * Supported shapes (OpenClaw-aligned):
+ *   - String provider+id:   "google:gemini-2.0-flash" or "google/gemini-2.0-flash"
+ *   - String id only:       "gemini-2.0-flash" with cfg.provider set separately
+ *   - Object:               { provider, id } or { provider, model }
  */
 export function resolveModelFromConfig(cfg){
-  const raw = cfg?.model?.trim();
-  if (!raw) return null;
-  const m = raw.split(":");
-  if (m.length === 2) return { provider: m[0].trim(), id: m[1].trim() };
-  // If only model id is given and provider provided separately
-  if (cfg?.provider) return { provider: String(cfg.provider).trim(), id: raw };
+  if (!cfg || cfg.model == null) return null;
+
+  const rawModel = cfg.model;
+
+  // Object form: { provider, id } or { provider, model }
+  if (rawModel && typeof rawModel === 'object' && !Array.isArray(rawModel)){
+    const obj = rawModel;
+    const provider = obj.provider != null ? obj.provider : cfg.provider;
+    const id = obj.id != null ? obj.id : (obj.model != null ? obj.model : undefined);
+    if (provider && id){
+      return {
+        provider: String(provider).trim(),
+        id: String(id).trim(),
+      };
+    }
+    if (!provider && id && cfg?.provider){
+      return {
+        provider: String(cfg.provider).trim(),
+        id: String(id).trim(),
+      };
+    }
+    return null;
+  }
+
+  // String form
+  if (typeof rawModel === 'string'){
+    const raw = rawModel.trim();
+    if (!raw) return null;
+
+    // "provider:id" (first ':' wins so ids may contain ':')
+    const colonIdx = raw.indexOf(':');
+    if (colonIdx > 0 && colonIdx < raw.length - 1){
+      const provider = raw.slice(0, colonIdx).trim();
+      const id = raw.slice(colonIdx + 1).trim();
+      if (provider && id) return { provider, id };
+    }
+
+    // "provider/id" (first '/' wins so ids may contain '/')
+    const slashIdx = raw.indexOf('/');
+    if (slashIdx > 0 && slashIdx < raw.length - 1){
+      const provider = raw.slice(0, slashIdx).trim();
+      const id = raw.slice(slashIdx + 1).trim();
+      if (provider && id) return { provider, id };
+    }
+
+    // If only model id is given and provider provided separately
+    if (cfg?.provider){
+      return { provider: String(cfg.provider).trim(), id: raw };
+    }
+  }
+
   return null;
 }
 
@@ -104,10 +152,23 @@ export function resolveModelFromEnv(){
   const raw = (process.env.ARCANA_MODEL||"").trim();
   if (!raw) return null;
   const p = inferProviderFromEnv();
-  if (raw.includes(":")){
-    const [prov,id] = raw.split(":");
-    return { provider: prov.trim(), id: id.trim() };
+
+  // "provider:id"
+  const colonIdx = raw.indexOf(":");
+  if (colonIdx > 0 && colonIdx < raw.length - 1){
+    const provider = raw.slice(0, colonIdx).trim();
+    const id = raw.slice(colonIdx + 1).trim();
+    if (provider && id) return { provider, id };
   }
+
+  // "provider/id"
+  const slashIdx = raw.indexOf("/");
+  if (slashIdx > 0 && slashIdx < raw.length - 1){
+    const provider = raw.slice(0, slashIdx).trim();
+    const id = raw.slice(slashIdx + 1).trim();
+    if (provider && id) return { provider, id };
+  }
+
   if (p) return { provider: p, id: raw };
   return null;
 }

@@ -69,7 +69,10 @@ export async function runDoctor({ cwd } = {}){
     const pLower = prov.toLowerCase();
     providerKnown = providerList.includes(pLower) || pLower === 'openai-compatible' || pLower === 'generic';
   }
-  const cfgDetails = cfgOk ? { path: redactPath(cfg.path), provider: cfg.provider||'', model: cfg.model||'', base_url: cfg.base_url||'' } : {};
+  const modelsProvidersCount = (cfg && cfg.models && cfg.models.providers && typeof cfg.models.providers === 'object')
+    ? Object.keys(cfg.models.providers).length
+    : 0;
+  const cfgDetails = cfgOk ? { path: redactPath(cfg.path), provider: cfg.provider||'', model: cfg.model||'', base_url: cfg.base_url||'', models_providers: modelsProvidersCount } : {};
   checks.push({
     id: 'config',
     title: 'Config',
