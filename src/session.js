@@ -53,17 +53,42 @@ function pickFallbackModel(provider){
 	return null;
 }
 
-function normalizeOpenAIBase(base){ return String(base||'').trim(); }
+function normalizeOpenAIBase(base){
+  let s = String(base || '').trim();
+  if (!s) return '';
+  // Normalize trailing slashes to avoid duplicating path segments.
+  s = s.replace(/\/+$/g, '');
+  const lower = s.toLowerCase();
+  const endpoints = ['/chat/completions', '/completions', '/responses'];
+  for (const ep of endpoints){
+    const epLen = ep.length;
+    const withV1 = '/v1' + ep;
+    if (lower.endsWith(withV1)){
+      // Keep trailing '/v1' and strip only the endpoint suffix.
+      return s.slice(0, s.length - epLen);
+    }
+    if (lower.endsWith(ep)){
+      return s.slice(0, s.length - epLen);
+    }
+  }
+  return s;
+}
 
 function normalizeAnthropicBase(base){
   let s = String(base || '').trim();
   if (!s) return '';
-  // Strip trailing slashes
+  // Strip trailing slashes first so suffix checks are reliable.
   s = s.replace(/\/+$/g, '');
-  // If the URL ends with '/v1', remove that segment so the
-  // Anthropic SDK can safely append '/v1/messages' without
-  // producing '/v1/v1/messages'.
-  if (s.toLowerCase().endsWith('/v1')) s = s.slice(0, -3);
+  const lower = s.toLowerCase();
+  if (lower.endsWith('/v1/messages')){
+    // Users often paste the full messages endpoint; drop it so the
+    // Anthropic SDK does not append '/v1/messages' twice.
+    s = s.slice(0, s.length - '/v1/messages'.length);
+  } else if (lower.endsWith('/messages')){
+    s = s.slice(0, s.length - '/messages'.length);
+  } else if (lower.endsWith('/v1')){
+    s = s.slice(0, s.length - '/v1'.length);
+  }
   return s;
 }
 
