@@ -8,7 +8,19 @@
     "dev": "electron .",
     "start": "electron .",
     "dist": "electron-builder -c electron-builder.config.cjs",
-    "dist:mac": "electron-builder --mac dmg -c electron-builder.config.cjs"
+    "dist:mac": "electron-builder --mac dmg -c electron-builder.config.cjs",
+    "dist:mac:signed": "ARCANA_CODESIGN=1 electron-builder --mac dmg -c electron-builder.config.cjs",
+    "dist:mac:unsigned": "ARCANA_CODESIGN=0 electron-builder --mac dmg -c electron-builder.config.cjs"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.54.0",
+    "@mariozechner/pi-coding-agent": "^0.54.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@sinclair/typebox": "^0.32.35",
+    "mmd-parser": "^1.0.4",
+    "playwright": "^1.58.2",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "electron": "^31.0.0",

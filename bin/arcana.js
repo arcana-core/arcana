@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
+import { promises as fsp } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
 import { createArcanaSession } from '../src/session.js';
 import { runDoctor, printDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
@@ -13,7 +16,6 @@ import { requestHeartbeatNow } from '../src/heartbeat/wake.js';
 import { enqueueSystemEvent } from '../src/system-events/store.js';
 import { loadAgentsSnapshot } from '../src/agents-snapshot.js';
 import { loadHeartbeatConfigForAgent } from '../src/heartbeat/config.js';
-import { startLivestreamShowrunner } from '../src/livestream/showrunner.js';
 import { startGatewayV2 } from '../server/gateway.mjs';
 
 const HELP = `
@@ -40,7 +42,9 @@ Usage:
   arcana heartbeat request --agent <id> [--session <sessionKey>] [--reason r]
   arcana heartbeat enqueue --agent <id> --session <sessionKey> --text <text> [--context c] [--dedupe k] [--wake]
   arcana heartbeat status               # show heartbeat config per agent
-  arcana livestream serve --room <roomId> [--agent <agentId>] [--tick-ms <n>] [--session <sid>] [--tts-provider <p>] [--tts-play 0|1] [--subtitle 0|1]  # run livestream showrunner loop
+  arcana livestream enable --room <roomId> [--agent <agentId>] [--tick-ms <n>] [--tts-provider <p>] [--tts-play 0|1] [--subtitle 0|1]
+  arcana livestream disable [--agent <agentId>] [--room <roomId>]
+  arcana livestream status [--agent <agentId>]
   arcana gateway serve [--port <n>]     # run gateway v2 HTTP+WS server
 
 Env:
@@ -48,6 +52,57 @@ Env:
 `;
 
 function error(msg){ console.error('[arcana]', msg); process.exit(1); }
+
+function resolveArcanaHome(){
+  try {
+    const env = String(process.env.ARCANA_HOME || '').trim();
+    if (env) return env;
+  } catch {}
+  try {
+    return join(homedir(), '.arcana');
+  } catch {
+    return '.arcana';
+  }
+}
+
+function resolveAgentId(rawFromCli){
+  const cli = String(rawFromCli || '').trim();
+  if (cli) return cli;
+  try {
+    const env = String(process.env.ARCANA_AGENT_ID || '').trim();
+    if (env) return env;
+  } catch {}
+  return 'default';
+}
+
+function resolveLivestreamConfigPath(agentIdFromCli){
+  const arcanaHome = resolveArcanaHome();
+  const agentId = resolveAgentId(agentIdFromCli);
+  return { path: join(arcanaHome, 'agents', agentId, 'livestream', 'config.json'), agentId, arcanaHome };
+}
+
+async function readJsonFile(path){
+  try {
+    const text = await fsp.readFile(path, 'utf8');
+    if (!text) return null;
+    return JSON.parse(text);
+  } catch (err){
+    if (err && err.code === 'ENOENT') return null;
+    try {
+      console.error('[arcana] failed to read JSON', path + ':', err && (err.message || String(err)));
+    } catch {}
+    return null;
+  }
+}
+
+async function writeJsonFile(path, data){
+  const dir = dirname(path);
+  try {
+    await fsp.mkdir(dir, { recursive: true });
+  } catch {}
+  const text = JSON.stringify(data, null, 2);
+  await fsp.writeFile(path, text, 'utf8');
+}
 
 async function chat(){
   const { session, model, toolNames, pluginFiles, pluginErrors } = await createArcanaSession({ cwd: process.cwd() });
@@ -124,26 +179,27 @@ async function livestreamCLI({ args }){
   const [, , sub, ...rest] = args;
   const s = String(sub || '').toLowerCase();
 
-  if (s === 'serve'){
+  if (s === 'enable'){
     const roomIdx = rest.indexOf('--room');
     const agentIdx = rest.indexOf('--agent');
     const tickIdx = rest.indexOf('--tick-ms');
-    const sessionIdx = rest.indexOf('--session');
     const providerIdx = rest.indexOf('--tts-provider');
     const playIdx = rest.indexOf('--tts-play');
     const subtitleIdx = rest.indexOf('--subtitle');
 
     const roomId = roomIdx >= 0 ? rest[roomIdx + 1] : undefined;
-    const agentId = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+    if (!roomId){
+      return error('arcana livestream enable --room <roomId> [--agent <agentId>] [--tick-ms <n>] [--tts-provider <p>] [--tts-play 0|1] [--subtitle 0|1]');
+    }
+
+    const agentFromCli = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
     const tickRaw = tickIdx >= 0 ? rest[tickIdx + 1] : undefined;
-    const sessionId = sessionIdx >= 0 ? rest[sessionIdx + 1] : undefined;
     const ttsProvider = providerIdx >= 0 ? rest[providerIdx + 1] : undefined;
     const ttsPlayRaw = playIdx >= 0 ? rest[playIdx + 1] : undefined;
     const subtitleRaw = subtitleIdx >= 0 ? rest[subtitleIdx + 1] : undefined;
 
-    if (!roomId){
-      return error('arcana livestream serve --room <roomId> [--agent <agentId>] [--tick-ms <n>] [--session <sid>] [--tts-provider <p>] [--tts-play 0|1] [--subtitle 0|1]');
-    }
+    const { path: cfgPath, agentId } = resolveLivestreamConfigPath(agentFromCli);
+    const roomStr = String(roomId).trim();
 
     let tickMs;
     if (tickRaw != null && tickRaw !== undefined){
@@ -165,16 +221,96 @@ async function livestreamCLI({ args }){
       else if (v === '0' || v === 'false' || v === 'no') subtitle = false;
     }
 
-    console.log('[arcana] livestream: serve loop (Ctrl+C to stop)');
-    await startLivestreamShowrunner({
-      roomId,
-      agentId,
-      tickMs,
-      sessionId,
-      ttsProvider,
-      ttsPlay,
-      subtitle,
-    });
+    const existing = await readJsonFile(cfgPath);
+    const prevRooms = Array.isArray(existing && existing.rooms) ? existing.rooms : [];
+    const rooms = [];
+    let updated = false;
+    for (const r of prevRooms){
+      if (!r) continue;
+      const id = r.roomId != null ? String(r.roomId).trim() : '';
+      if (!id) continue;
+      if (id === roomStr){
+        const next = { ...r, roomId: roomStr };
+        if (tickMs != null) next.tickMs = tickMs;
+        if (ttsProvider != null && ttsProvider !== undefined) next.ttsProvider = ttsProvider;
+        if (ttsPlay !== undefined) next.ttsPlay = ttsPlay;
+        if (subtitle !== undefined) next.subtitle = subtitle;
+        rooms.push(next);
+        updated = true;
+      } else {
+        rooms.push(r);
+      }
+    }
+
+    if (!updated){
+      const newRoom = { roomId: roomStr };
+      if (tickMs != null) newRoom.tickMs = tickMs;
+      if (ttsProvider != null && ttsProvider !== undefined) newRoom.ttsProvider = ttsProvider;
+      if (ttsPlay !== undefined) newRoom.ttsPlay = ttsPlay;
+      if (subtitle !== undefined) newRoom.subtitle = subtitle;
+      rooms.push(newRoom);
+    }
+
+    const nextCfg = { enabled: true, rooms };
+    await writeJsonFile(cfgPath, nextCfg);
+    console.log('[arcana] livestream: enabled for agent=' + agentId + ' room=' + roomStr);
+    console.log(JSON.stringify(nextCfg, null, 2));
+    return;
+  }
+
+  if (s === 'disable'){
+    const roomIdx = rest.indexOf('--room');
+    const agentIdx = rest.indexOf('--agent');
+    const roomId = roomIdx >= 0 ? rest[roomIdx + 1] : undefined;
+    const agentFromCli = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+
+    const { path: cfgPath, agentId } = resolveLivestreamConfigPath(agentFromCli);
+    const existing = await readJsonFile(cfgPath);
+    const prevRooms = Array.isArray(existing && existing.rooms) ? existing.rooms : [];
+
+    let rooms;
+    if (roomId){
+      const roomStr = String(roomId).trim();
+      rooms = [];
+      for (const r of prevRooms){
+        if (!r) continue;
+        const id = r.roomId != null ? String(r.roomId).trim() : '';
+        if (!id || id === roomStr) continue;
+        rooms.push(r);
+      }
+    } else {
+      rooms = [];
+    }
+
+    const enabled = rooms.length > 0 ? !!(existing && existing.enabled) : false;
+    const nextCfg = { enabled, rooms };
+    await writeJsonFile(cfgPath, nextCfg);
+    if (!rooms.length){
+      console.log('[arcana] livestream: disabled for agent=' + agentId + ' (no rooms)');
+    } else if (roomId){
+      console.log('[arcana] livestream: disabled room=' + String(roomId) + ' for agent=' + agentId);
+    } else {
+      console.log('[arcana] livestream: disabled for agent=' + agentId);
+    }
+    console.log(JSON.stringify(nextCfg, null, 2));
+    return;
+  }
+
+  if (s === 'status'){
+    const agentIdx = rest.indexOf('--agent');
+    const agentFromCli = agentIdx >= 0 ? rest[agentIdx + 1] : undefined;
+    const { path: cfgPath, agentId } = resolveLivestreamConfigPath(agentFromCli);
+    const existing = await readJsonFile(cfgPath);
+
+    if (!existing){
+      console.log('disabled');
+    } else {
+      console.log(JSON.stringify(existing, null, 2));
+    }
+
+    const logDir = join(process.cwd(), '.arcana', 'services', 'livestream_showrunner');
+    console.log('[arcana] livestream: agent=' + agentId + ' config=' + cfgPath);
+    console.log('[arcana] livestream: check service logs under ' + logDir);
     return;
   }
 

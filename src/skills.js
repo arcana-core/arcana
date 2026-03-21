@@ -180,7 +180,30 @@ export function loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, r
 
 export function buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd } = {}) {
   try {
-    const skills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd });
+    const allSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot, cwd });
+    let skills = allSkills;
+    try {
+      const disabledArr = cfg && cfg.skills && Array.isArray(cfg.skills.disabled) ? cfg.skills.disabled : [];
+      if (disabledArr && disabledArr.length){
+        const disabled = new Set();
+        for (const raw of disabledArr){
+          if (typeof raw !== 'string') continue;
+          const name = raw.trim();
+          if (name) disabled.add(name);
+        }
+        if (disabled.size){
+          skills = allSkills.filter((s)=>{
+            try {
+              const n = String(s && s.name || '').trim();
+              if (!n) return false;
+              return !disabled.has(n);
+            } catch {
+              return true;
+            }
+          });
+        }
+      }
+    } catch {}
     const prompt = formatSkillsForPrompt(skills);
     return prompt && prompt.trim().length > 0 ? prompt : '';
   } catch {

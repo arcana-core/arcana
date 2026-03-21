@@ -22,6 +22,8 @@ export const WELL_KNOWN_SECRETS = [
   // Service secrets commonly used by skills
   { name: 'services/feishu/app_id', service: 'feishu', kind: 'app_id' },
   { name: 'services/feishu/app_secret', service: 'feishu', kind: 'app_secret' },
+  { name: 'services/feishu/encrypt_key', service: 'feishu', kind: 'encrypt_key' },
+  { name: 'services/feishu/verification_token', service: 'feishu', kind: 'verification_token' },
   { name: 'services/wechat/app_id', service: 'wechat', kind: 'app_id' },
   { name: 'services/wechat/app_secret', service: 'wechat', kind: 'app_secret' },
   { name: 'services/elevenlabs/api_key', service: 'elevenlabs', kind: 'api_key' },

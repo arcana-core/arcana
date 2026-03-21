@@ -24,8 +24,10 @@ import { emit, getContext } from './event-bus.js';
 import { ensureReadAllowed } from './workspace-guard.js';
 import { resolveAgentHomeRoot } from './agent-guard.js';
 import { buildAgentBootstrapContext } from './agent-bootstrap-context.js';
-import { globSync } from 'glob';
+import * as globPkg from 'glob';
 import { createSecretsContext } from './secrets/index.js';
+
+const globSync = (...args) => (globPkg.globSync ?? globPkg.sync)(...args);
 
 function arcanaPkgRoot(){
   const here = fileURLToPath(new URL('.', import.meta.url)); // arcana/src/
@@ -193,6 +195,33 @@ export async function createArcanaSession(opts={}){
     };
   }
 
+  function filterDisabledSkillsForConfig(allSkills, cfg){
+    try {
+      const skills = Array.isArray(allSkills) ? allSkills : [];
+      const disabledArr = cfg && cfg.skills && Array.isArray(cfg.skills.disabled) ? cfg.skills.disabled : [];
+      if (!disabledArr || !disabledArr.length) return skills;
+      const disabled = new Set();
+      for (const raw of disabledArr){
+        if (typeof raw !== 'string') continue;
+        const name = raw.trim();
+        if (!name) continue;
+        disabled.add(name);
+      }
+      if (!disabled.size) return skills;
+      return skills.filter((s)=>{
+        try {
+          const n = String(s && s.name || '').trim();
+          if (!n) return false;
+          return !disabled.has(n);
+        } catch {
+          return true;
+        }
+      });
+    } catch {
+      return Array.isArray(allSkills) ? allSkills : [];
+    }
+  }
+
   const providerName = (cfg && cfg.provider) ? String(cfg.provider).trim() : '';
   // Legacy provider key; prefer secrets bindings
   const providerKey = (cfg && cfg.key) ? String(cfg.key).trim() : '';
@@ -283,8 +312,9 @@ export async function createArcanaSession(opts={}){
     }
   } catch {}
 
-  // Skill-scoped tools (preload definitions; activation controlled by skill gate)
+  // Skill-scoped tools (preload definitions; activation controlled by per-agent toggles)
   let arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+  arcanaSkills = filterDisabledSkillsForConfig(arcanaSkills, cfg);
   let skillTools = []; let skillToolMap = new Map();
   try {
     const res = await loadSkillTools(arcanaSkills);
@@ -367,7 +397,7 @@ export async function createArcanaSession(opts={}){
   });
   await loader.reload();
   let createdSession = null;
-  // Start a lightweight watcher that refreshes the skills prompt when SKILL.md files change
+  // Start a lightweight watcher that refreshes the skills prompt when skills change
   try {
     ensureArcanaSkillsWatcher({
       workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot,
@@ -376,6 +406,7 @@ export async function createArcanaSession(opts={}){
           try {
             skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
             arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+            arcanaSkills = filterDisabledSkillsForConfig(arcanaSkills, cfg);
             try {
               const res = await loadSkillTools(arcanaSkills);
               skillTools = res.tools || [];
@@ -399,28 +430,28 @@ export async function createArcanaSession(opts={}){
                 await createdSession.reload();
 
                 try {
-                  if (typeof createdSession.setActiveToolsByName === 'function') {
-                    const seen = new Set();
-                    const nextActive = [];
-                    const bashName = (bashProxy && bashProxy.name) || 'bash';
+                    if (typeof createdSession.setActiveToolsByName === 'function') {
+                      const seen = new Set();
+                      const nextActive = [];
+                      const bashName = (bashProxy && bashProxy.name) || 'bash';
 
-                    for (const name of prevActive || []) {
-                      if (typeof name !== 'string') continue;
-                      const trimmed = name.trim();
-                      if (!trimmed) continue;
-                      if (execPolicy !== 'open' && trimmed === bashName) continue;
-                      if (seen.has(trimmed)) continue;
-                      seen.add(trimmed);
-                      nextActive.push(trimmed);
+                      for (const name of prevActive || []) {
+                        if (typeof name !== 'string') continue;
+                        const trimmed = name.trim();
+                        if (!trimmed) continue;
+                        if (execPolicy !== 'open' && trimmed === bashName) continue;
+                        if (seen.has(trimmed)) continue;
+                        seen.add(trimmed);
+                        nextActive.push(trimmed);
+                      }
+
+                      if (execPolicy === 'open' && !seen.has(bashName)) {
+                        seen.add(bashName);
+                        nextActive.push(bashName);
+                      }
+
+                      createdSession.setActiveToolsByName(nextActive);
                     }
-
-                    if (execPolicy === 'open' && !seen.has(bashName)) {
-                      seen.add(bashName);
-                      nextActive.push(bashName);
-                    }
-
-                    createdSession.setActiveToolsByName(nextActive);
-                  }
                 } catch {}
               } catch {}
             } else {
@@ -447,7 +478,7 @@ export async function createArcanaSession(opts={}){
   const execPolicy = rawPolicy === 'open' ? 'open' : 'restricted';
 
   // Workspace-guarded built-in tools. All operations call ensureReadAllowed(path).
-  const readTool = createReadTool(workspaceRoot, {
+  const baseReadTool = createReadTool(workspaceRoot, {
     operations: {
       access: async (p) => { await fsp.access(ensureReadAllowed(p)); },
       readFile: async (p) => fsp.readFile(ensureReadAllowed(p)),
@@ -462,6 +493,8 @@ export async function createArcanaSession(opts={}){
       }
     }
   });
+
+  const readTool = baseReadTool;
 
   const grepTool = createGrepTool(workspaceRoot, {
     operations: {
@@ -513,6 +546,38 @@ export async function createArcanaSession(opts={}){
   });
 
   createdSession = created && created.session ? created.session : null;
+
+  // Optionally capture the last LLM request context and provider payload
+  // for gateway-v2 failure logs. This wraps the underlying pi-agent-core
+  // Agent.streamFn only when ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST or
+  // ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL is enabled.
+  try {
+    const env = (typeof process !== 'undefined' && process && process.env) ? process.env : null;
+    const logReqEnv = env && (env.ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST || env.ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL);
+    if (logReqEnv && createdSession && createdSession.agent && createdSession.agent.streamFn){
+      const agent = createdSession.agent;
+      const originalStreamFn = agent.streamFn;
+      if (originalStreamFn && !agent.__arcanaStreamFnWrappedForRequestLogging){
+        agent.__arcanaStreamFnWrappedForRequestLogging = true;
+        agent.streamFn = function(modelArg, llmContextArg, optionsArg){
+          try {
+            try { createdSession.__arcana_last_llm_context = llmContextArg || null; } catch {}
+            const opts = (optionsArg && typeof optionsArg === 'object') ? { ...optionsArg } : {};
+            const prevOnPayload = typeof opts.onPayload === 'function' ? opts.onPayload : null;
+            opts.onPayload = function(payload){
+              try { createdSession.__arcana_last_provider_payload = payload || null; } catch {}
+              if (prevOnPayload){
+                try { prevOnPayload(payload); } catch {}
+              }
+            };
+            return originalStreamFn.call(agent, modelArg, llmContextArg, opts);
+          } catch {
+            return originalStreamFn.call(agent, modelArg, llmContextArg, optionsArg);
+          }
+        };
+      }
+    }
+  } catch {}
 
   // Attach the tool-daemon client to the session so server-side abort can cancel active tool calls.
   try {
@@ -566,20 +631,14 @@ export async function createArcanaSession(opts={}){
       .map((t) => t && t.name)
       .filter((n) => typeof n === 'string' && n.length > 0);
 
-    const skillToolNames = new Set(
-      (skillTools || [])
-        .map((t) => t && t.name)
-        .filter((n) => typeof n === 'string' && n.length > 0),
-    );
-
     const desired = new Set();
 
     // Always enable base tools (read/grep/find/ls)
     for (const n of baseNames) desired.add(n);
 
-    // Enable all non-skill custom tools by default
+    // Enable all custom tools (including skill tools) by default
     for (const n of customNames) {
-      if (!n || skillToolNames.has(n)) continue;
+      if (!n) continue;
       desired.add(n);
     }
 

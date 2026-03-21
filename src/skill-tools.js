@@ -1,12 +1,11 @@
-// Load skill-scoped tools from arcana/skills/<skill>/tools/** based on SKILL.md frontmatter
-// - Reads the tools list from frontmatter (arcana.tools)
+// Load skill-scoped tools from arcana/skills/<skill>/tools/**
+// - Scans each skill's tools directory
 // - Resolves entry files per tool: index.js or tool.js under tools/<tool>/
 // - Imports modules and collects ToolDefinition objects (default export should be a factory returning a tool)
 
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { existsSync, statSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
 
 function expandHomePath(p){
   try{
@@ -20,23 +19,35 @@ function expandHomePath(p){
   } catch { return p }
 }
 
-function readToolsFromSkillFile(skillFile){
-  try{
-    const raw = readFileSync(skillFile, 'utf-8');
-    const { frontmatter } = parseFrontmatter(raw);
-    const arc = frontmatter && frontmatter.arcana;
-    const arr = Array.isArray(arc && arc.tools) ? arc.tools : [];
-    const out = [];
-    for (const t of arr){ if (t && t.name) out.push({ name: String(t.name), label: t.label, description: t.description }); }
-    return out;
-  } catch { return [] }
-}
-
 function resolveEntry(skillDir, toolName){
   const base = join(skillDir, 'tools', toolName);
   const cand = [ join(base, 'index.js'), join(base, 'tool.js') ];
   for (const p of cand){ try { if (existsSync(p) && statSync(p).isFile()) return p; } catch {} }
   return '';
+}
+
+function listToolNamesForSkill(skillDir){
+  try {
+    if (!skillDir) return [];
+    const toolsDir = join(skillDir, 'tools');
+    if (!existsSync(toolsDir) || !statSync(toolsDir).isDirectory()) return [];
+    const entries = readdirSync(toolsDir, { withFileTypes: true });
+    const out = [];
+    for (const ent of entries){
+      try {
+        if (!ent || typeof ent.name !== 'string') continue;
+        const name = ent.name;
+        // Only consider subdirectories under tools/ as tool names.
+        const isDir = ent.isDirectory ? ent.isDirectory() : statSync(join(toolsDir, name)).isDirectory();
+        if (!isDir) continue;
+        if (!name || name === '.' || name === '..') continue;
+        out.push(name);
+      } catch {}
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 export async function loadSkillTools(skills){
@@ -47,10 +58,10 @@ export async function loadSkillTools(skills){
     try {
       const skillFile = expandHomePath(s.filePath || s.file_path || '');
       const skillDir = dirname(skillFile || '');
-      const fromFm = Array.isArray(s.tools) && s.tools.length ? s.tools : readToolsFromSkillFile(skillFile);
       const toolNames = [];
-      for (const t of fromFm){
-        const name = String(t.name||'').trim(); if (!name) continue;
+      const names = listToolNamesForSkill(skillDir);
+      for (const rawName of names){
+        const name = String(rawName || '').trim(); if (!name) continue;
         const entry = resolveEntry(skillDir, name);
         if (!entry) { errors.push({ skill: s.name, tool: name, error: 'entry_not_found' }); continue; }
         try {

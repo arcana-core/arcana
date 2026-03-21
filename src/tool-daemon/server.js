@@ -139,12 +139,15 @@ export async function startToolDaemon({ workspaceRoot, port }){
                 if (action === "snapshot"){
                   const screenshotPath = (args && typeof args.screenshotPath === "string" && args.screenshotPath) ? String(args.screenshotPath) : undefined;
                   const fullPage = (args && typeof args.fullPage === "boolean") ? args.fullPage : undefined;
+                  const screenshotType = (args && typeof args.screenshotType === "string" && args.screenshotType) ? String(args.screenshotType) : undefined;
+                  const screenshotQuality = (args && typeof args.screenshotQuality === "number") ? args.screenshotQuality : undefined;
                   let screenshotRes = null;
-                  if (screenshotPath || typeof fullPage === "boolean"){
-                    screenshotRes = await bm.screenshot({ headers: req.headers, proxy: args.proxy, path: screenshotPath, fullPage, profileKey: args.profileKey, browserProfile: args.browserProfile, profile: args.profile, driver: args.driver, mcp: args.mcp });
-                  } else {
-                    screenshotRes = await bm.screenshot({ headers: req.headers, proxy: args.proxy, profileKey: args.profileKey, browserProfile: args.browserProfile, profile: args.profile, driver: args.driver, mcp: args.mcp });
-                  }
+                  const screenshotArgs = { headers: req.headers, proxy: args.proxy, profileKey: args.profileKey, browserProfile: args.browserProfile, profile: args.profile, driver: args.driver, mcp: args.mcp };
+                  if (screenshotPath) screenshotArgs.path = screenshotPath;
+                  if (typeof fullPage === "boolean") screenshotArgs.fullPage = fullPage;
+                  if (typeof screenshotType === "string" && screenshotType) screenshotArgs.type = screenshotType;
+                  if (typeof screenshotQuality === "number") screenshotArgs.quality = screenshotQuality;
+                  screenshotRes = await bm.screenshot(screenshotArgs);
                   const r = await bm.extract({ headers: req.headers, proxy: args.proxy, maxChars: Number(args.maxChars||20000), autoScroll: Boolean(args.autoScroll), profileKey: args.profileKey, browserProfile: args.browserProfile, profile: args.profile, driver: args.driver, mcp: args.mcp });
                   const details = { url: r.url, title: r.title, tookMs: r.tookMs };
                   if (screenshotRes && typeof screenshotRes.path === "string") details.screenshotPath = screenshotRes.path;

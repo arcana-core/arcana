@@ -8,13 +8,13 @@ files:
   - filter:
       - src/**/*
       - package.json
+      - '!node_modules/**'
 mac:
   target: dmg
   hardenedRuntime: true
   gatekeeperAssess: false
   entitlements: entitlements.mac.plist
   entitlementsInherit: entitlements.mac.inherit.plist
-afterSign: scripts/notarize.cjs
 extraResources:
   - from: ../../server
     to: server
@@ -22,6 +22,9 @@ extraResources:
     to: src
   - from: ../../web
     to: web
+    filter:
+      - '**/*'
+      - '!models/**'
   - from: ../../skills/secrets
     to: skills/secrets
   - from: ../../skills/create_skill
@@ -44,8 +47,27 @@ extraResources:
     to: plugins
   - from: ../../tools
     to: tools
-  - from: ../../node_modules
+  - from: node_modules
     to: node_modules
+    filter:
+      - '**/*'
+      - '!**/*.map'
+      - '!**/*.d.ts'
+      - '!**/test/**'
+      - '!**/tests/**'
+      - '!**/docs/**'
+      - '!**/examples/**'
+      - '!**/*.md'
+      - '!electron/**'
+      - '!electron-builder/**'
+      - '!@electron/notarize/**'
+      - '!**/.bin/**'
+      - '!koffi/build/koffi/linux_*/**'
+      - '!koffi/build/koffi/musl_*/**'
+      - '!koffi/build/koffi/win32_*/**'
+      - '!koffi/build/koffi/freebsd_*/**'
+      - '!koffi/build/koffi/openbsd_*/**'
   - from: resources/src/package.json
     to: src/package.json
+afterSign: scripts/notarize.cjs
 electronVersion: 31.7.7

@@ -1,5 +1,6 @@
-import { dirname, join } from 'node:path';
-import { promises as fsp } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
+import { promises as fsp, readFileSync } from 'node:fs';
+import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
 import { arcanaHomePath } from '../arcana-home.js';
 import { resolveWorkspaceRoot } from '../workspace-guard.js';
 import { createArcanaSession } from '../session.js';
@@ -31,6 +32,7 @@ const DEFAULT_AGENT_ID = 'default';
 
 const MAX_LOG_JSON_CHARS = 8000;
 const MAX_PROMPT_LOG_CHARS = 8000;
+const MAX_PROMPT_LOG_CHARS_FULL = 2 * 1024 * 1024;
 const MAX_DIAGNOSTIC_ITEMS = 16;
 const MAX_DIAGNOSTIC_STRING_CHARS = 512;
 
@@ -85,17 +87,32 @@ function safeJsonForLog(value, maxLen){
 function asciiSafeBody(text){
   try {
     const s = String(text || '');
+    const forceAscii = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_ASCII_ONLY');
     let out = '';
     for (let i = 0; i < s.length; i += 1){
-      const code = s.charCodeAt(i);
+      const ch = s[i];
+      const code = ch.charCodeAt(0);
       if (code === 0x0a || code === 0x0d || code === 0x09){
-        out += s[i];
+        out += ch;
         continue;
       }
-      if (code >= 0x20 && code <= 0x7e){
-        out += s[i];
-      } else {
+      if (forceAscii){
+        // Legacy behavior: keep only ASCII printable characters and common whitespace.
+        if (code >= 0x20 && code <= 0x7e){
+          out += ch;
+        } else {
+          out += '?';
+        }
+        continue;
+      }
+
+      // UTF-8-friendly behavior: preserve all Unicode characters except control
+      // characters (other than newline, carriage return and tab) which are
+      // replaced with '?' to avoid corrupting log consumers.
+      if ((code >= 0x00 && code < 0x20) || code === 0x7f){
         out += '?';
+      } else {
+        out += ch;
       }
     }
     return out;
@@ -131,7 +148,16 @@ function buildChatLogPath(agentId, sessionKey, sessionId){
   }
 }
 
-async function writeChatLog({ logPath, headerLines, promptText, includePrompt, errorStack, stats, diagnostics }){
+// Chat logs are written as UTF-8 text. By default, all Unicode characters
+// are preserved in the log body and only control characters (except \n, \r,
+// and \t) are replaced with '?'. To force the legacy ASCII-only behavior
+// where all non-ASCII characters are replaced with '?', set the environment
+// variable ARCANA_GATEWAY_V2_CHAT_LOG_ASCII_ONLY=1.
+//
+// Minimal self-check examples:
+// - Default mode: "\u4f60\u597d\n" stays "\u4f60\u597d\n" in logs.
+// - ASCII-only mode (env=1): "\u4f60\u597d\n" becomes "??\n".
+async function writeChatLog({ logPath, headerLines, promptText, includePrompt, errorStack, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars }){
   if (!logPath) return null;
   try {
     const dir = dirname(logPath);
@@ -176,8 +202,18 @@ async function writeChatLog({ logPath, headerLines, promptText, includePrompt, e
     if (includePrompt && promptText){
       lines.push('');
       lines.push('prompt:');
-      const promptSafe = truncateStringForLog(promptText, MAX_PROMPT_LOG_CHARS);
+      const promptSafe = truncateStringForLog(promptText, promptMaxChars || MAX_PROMPT_LOG_CHARS);
       lines.push(String(promptSafe || ''));
+    }
+  } catch {}
+
+  try {
+    if (includeModelRequest && modelRequest){
+      lines.push('');
+      lines.push('model_request:');
+      const maxLen = modelRequestMaxChars || MAX_PROMPT_LOG_CHARS;
+      const reqSafe = safeJsonForLog(modelRequest, maxLen);
+      lines.push(String(reqSafe || ''));
     }
   } catch {}
 
@@ -251,6 +287,7 @@ async function ensureChatSession({ sessionId, agentId, policy }){
     agentHomeDir,
     workspaceRoot: ws,
     sessionId: sid || 'default',
+    skillToolMap: created.skillToolMap || new Map(),
   };
 
   attachChatEventBridge(record, sid || 'default');
@@ -320,6 +357,88 @@ function extractUsageFromToolEvent(ev){
     return null;
   }
 }
+function extractUsageTotals(u){
+  let ctx = 0;
+  let out = 0;
+  let tot = 0;
+  try {
+    if (u && typeof u === 'object'){
+      const input = Number(u.inputTokens ?? u.prompt_tokens ?? u.promptTokens ?? u.input_tokens ?? u.input ?? u.prompt ?? 0) || 0;
+      const output = Number(u.outputTokens ?? u.completion_tokens ?? u.completionTokens ?? u.output_tokens ?? u.output ?? 0) || 0;
+      const cacheRead = Number(u.cacheRead ?? u.cache_read_input_tokens ?? u.cacheReadTokens ?? 0) || 0;
+      const cacheWrite = Number(u.cacheWrite ?? u.cache_creation_input_tokens ?? u.cacheWriteTokens ?? 0) || 0;
+      // Treat context tokens as everything that contributes to the request context
+      ctx = input + cacheRead + cacheWrite;
+      out = output;
+      tot = Number(u.totalTokens ?? u.total_tokens ?? u.total ?? 0) || 0;
+      if (!tot) tot = ctx + out;
+    }
+  } catch {}
+  if (!Number.isFinite(tot) || tot < 0) tot = 0;
+  if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
+  if (!Number.isFinite(out) || out < 0) out = 0;
+  return { contextTokens: ctx, outputTokens: out, totalTokens: tot };
+}
+
+function extractUsageFromAssistantMessage(msg, extractUsageTotalsFn){
+  try {
+    if (!msg || typeof msg !== 'object') return null;
+    const candidates = [];
+    const push = (raw) => {
+      if (raw && typeof raw === 'object') candidates.push(raw);
+    };
+    push(msg.usage);
+    if (msg.response && typeof msg.response === 'object'){
+      push(msg.response.usage);
+    }
+    if (msg.result && typeof msg.result === 'object'){
+      push(msg.result.usage);
+    }
+    if (msg.meta && typeof msg.meta === 'object'){
+      push(msg.meta.usage);
+      if (msg.meta.response && typeof msg.meta.response === 'object'){
+        push(msg.meta.response.usage);
+      }
+      if (msg.meta.raw && typeof msg.meta.raw === 'object'){
+        push(msg.meta.raw.usage);
+      }
+    }
+    if (msg.raw && typeof msg.raw === 'object'){
+      push(msg.raw.usage);
+      if (msg.raw.response && typeof msg.raw.response === 'object'){
+        push(msg.raw.response.usage);
+      }
+    }
+    if (msg.providerResponse && typeof msg.providerResponse === 'object'){
+      push(msg.providerResponse.usage);
+    }
+    if (!candidates.length) return null;
+    const fn = typeof extractUsageTotalsFn === 'function' ? extractUsageTotalsFn : extractUsageTotals;
+    let best = null;
+    let bestTotals = null;
+    let bestScore = -1;
+    for (const raw of candidates){
+      let totals;
+      try { totals = fn(raw); } catch { totals = null; }
+      if (!totals || typeof totals !== 'object') continue;
+      const ctx = Number(totals.contextTokens || 0) || 0;
+      const out = Number(totals.outputTokens || 0) || 0;
+      let score = Number(totals.totalTokens || 0) || 0;
+      if (!score) score = ctx + out;
+      if (!Number.isFinite(score) || score <= 0) continue;
+      if (score > bestScore){
+        bestScore = score;
+        best = raw;
+        bestTotals = totals;
+      }
+    }
+    if (!bestTotals) return null;
+    return { usage: best, totals: bestTotals };
+  } catch {
+    return null;
+  }
+}
+
 
 function buildModelDiagnostics(model){
   try {
@@ -426,9 +545,11 @@ function extractAssistantMessageMeta(msg){
       }
     }
     try {
-      const u = msg.usage;
-      const norm = normalizeUsageObject(u);
-      if (norm) meta.usage = norm;
+      const usageInfo = extractUsageFromAssistantMessage(msg, extractUsageTotals);
+      if (usageInfo && usageInfo.usage){
+        const norm = normalizeUsageObject(usageInfo.usage);
+        if (norm) meta.usage = norm;
+      }
     } catch {}
     try {
       const err = msg.error;
@@ -551,29 +672,10 @@ function attachChatEventBridge(record, sessionId){
   let runContextTokens = 0;
   let runOutputTokens = 0;
   let runTotalTokens = 0;
+  // Last single LLM call values (for per-card display)
+  let lastCallContextTokens = 0;
+  let lastCallTotalTokens = 0;
 
-  function extractUsageTotals(u){
-    let ctx = 0;
-    let out = 0;
-    let tot = 0;
-    try {
-      if (u && typeof u === 'object'){
-        const input = Number(u.inputTokens ?? u.prompt_tokens ?? u.promptTokens ?? u.input_tokens ?? u.input ?? u.prompt ?? 0) || 0;
-        const output = Number(u.outputTokens ?? u.completion_tokens ?? u.completionTokens ?? u.output_tokens ?? u.output ?? 0) || 0;
-        const cacheRead = Number(u.cacheRead ?? u.cache_read_input_tokens ?? u.cacheReadTokens ?? 0) || 0;
-        const cacheWrite = Number(u.cacheWrite ?? u.cache_creation_input_tokens ?? u.cacheWriteTokens ?? 0) || 0;
-        // Treat context tokens as everything that contributes to the request context
-        ctx = input + cacheRead + cacheWrite;
-        out = output;
-        tot = Number(u.totalTokens ?? u.total_tokens ?? u.total ?? 0) || 0;
-        if (!tot) tot = ctx + out;
-      }
-    } catch {}
-    if (!Number.isFinite(tot) || tot < 0) tot = 0;
-    if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
-    if (!Number.isFinite(out) || out < 0) out = 0;
-    return { contextTokens: ctx, outputTokens: out, totalTokens: tot };
-  }
 
   function normalizeMediaRef(raw){
     if (!raw) return '';
@@ -653,6 +755,83 @@ function attachChatEventBridge(record, sessionId){
       if (t === 'tool_execution_start'){
         try { persistToolMetaToDisk({ agentId, sessionId, toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
         try { emit(base); } catch {}
+
+        // Best-effort auto-activation of skill-scoped tools when reading a SKILL.md
+        try {
+          const toolName = ev && ev.toolName;
+          const args = ev && ev.args;
+          const rawPath = args && typeof args.path === 'string' ? args.path : '';
+          if (toolName === 'read' && rawPath && /\bSKILL\.md$/i.test(String(rawPath))){
+            let absPath = '';
+            try {
+              const p = String(rawPath);
+              absPath = isAbsolute(p) ? p : join(workspaceRoot || process.cwd(), p);
+            } catch {}
+
+            if (absPath){
+              try {
+                const text = readFileSync(absPath, 'utf-8');
+                let frontmatter = null;
+                try {
+                  const parsed = parseFrontmatter(text) || {};
+                  frontmatter = parsed && parsed.frontmatter ? parsed.frontmatter : null;
+                } catch {}
+
+                const skillName = frontmatter && frontmatter.name ? String(frontmatter.name) : '';
+                let toolNames = [];
+
+                try {
+                  if (skillName && record && record.skillToolMap instanceof Map){
+                    const fromMap = record.skillToolMap.get(skillName) || [];
+                    if (Array.isArray(fromMap) && fromMap.length){
+                      toolNames = fromMap.filter((n)=> typeof n === 'string' && n.trim());
+                    }
+                  }
+                } catch {}
+
+                if (!toolNames || !toolNames.length){
+                  try {
+                    const arc = frontmatter && frontmatter.arcana;
+                    const arr = Array.isArray(arc && arc.tools) ? arc.tools : [];
+                    const names = [];
+                    for (const tDef of arr){
+                      if (!tDef || !tDef.name) continue;
+                      const n = String(tDef.name || '').trim();
+                      if (n) names.push(n);
+                    }
+                    toolNames = names;
+                  } catch {}
+                }
+
+                if (toolNames && toolNames.length && sess && typeof sess.setActiveToolsByName === 'function'){
+                  const desired = new Set();
+                  try {
+                    const current = typeof sess.getActiveToolNames === 'function' ? (sess.getActiveToolNames() || []) : [];
+                    if (Array.isArray(current)){
+                      for (const n of current){
+                        if (typeof n !== 'string') continue;
+                        const trimmed = n.trim();
+                        if (!trimmed) continue;
+                        desired.add(trimmed);
+                      }
+                    }
+                  } catch {}
+
+                  for (const n of toolNames){
+                    if (typeof n !== 'string') continue;
+                    const trimmed = n.trim();
+                    if (!trimmed) continue;
+                    desired.add(trimmed);
+                  }
+
+                  const list = Array.from(desired);
+                  try { sess.setActiveToolsByName(list); } catch {}
+                  try { emit({ type: 'tools_active', tools: list, sessionId, agentId }); } catch {}
+                }
+              } catch {}
+            }
+          }
+        } catch {}
         return;
       }
 
@@ -741,8 +920,8 @@ function attachChatEventBridge(record, sessionId){
           }
         } catch {}
 
-        const u = ev.message && ev.message.usage;
-        const totals = extractUsageTotals(u);
+        const usageInfo = extractUsageFromAssistantMessage(ev.message, extractUsageTotals);
+        const totals = usageInfo && usageInfo.totals;
         if (totals){
           if (typeof totals.contextTokens === 'number' && totals.contextTokens > 0){
             runContextTokens += totals.contextTokens;
@@ -753,7 +932,21 @@ function attachChatEventBridge(record, sessionId){
           if (typeof totals.totalTokens === 'number' && totals.totalTokens > 0){
             runTotalTokens += totals.totalTokens;
           }
+          // Track last single LLM call values for per-card display
+          lastCallContextTokens = (typeof totals.contextTokens === 'number' && totals.contextTokens > 0) ? totals.contextTokens : 0;
+          lastCallTotalTokens = (typeof totals.totalTokens === 'number' && totals.totalTokens > 0) ? totals.totalTokens : 0;
+          // Emit per-call usage so frontend can update the current LLM card
+          try {
+            emit({
+              type: 'llm_call_usage',
+              sessionId,
+              agentId,
+              contextTokens: lastCallContextTokens,
+              totalTokens: lastCallTotalTokens,
+            });
+          } catch {}
         }
+
 
         assistantRawText = '';
       }
@@ -762,8 +955,8 @@ function attachChatEventBridge(record, sessionId){
 
   // Attach a helper so callers can drain usage per completed turn
   sess.__arcana_chat_usage = {
-    reset(){ runContextTokens = 0; runOutputTokens = 0; runTotalTokens = 0; },
-    snapshot(){ return { contextTokens: runContextTokens, outputTokens: runOutputTokens, totalTokens: runTotalTokens }; },
+    reset(){ runContextTokens = 0; runOutputTokens = 0; runTotalTokens = 0; lastCallContextTokens = 0; lastCallTotalTokens = 0; },
+    snapshot(){ return { contextTokens: runContextTokens, outputTokens: runOutputTokens, totalTokens: runTotalTokens, lastCallContextTokens, lastCallTotalTokens }; },
   };
 }
 
@@ -775,7 +968,19 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   const workspaceRoot = record.workspaceRoot;
   const model = record.model || null;
 
-  const payloadMsg = (prelude ? prelude + '\n\n' : '') + '[Current Question]\n' + message;
+  // Only inject prelude when pi-agent-core has no internal context.
+  // Once the agent has processed at least one turn, it keeps its own
+  // tool-call history — injecting the prelude again would double-count.
+  let usePrelude = '';
+  try {
+    const agentMessages = sess.agent && sess.agent.state && sess.agent.state.messages;
+    if (!agentMessages || agentMessages.length === 0) {
+      usePrelude = prelude || '';
+    }
+  } catch {
+    usePrelude = prelude || '';
+  }
+  const payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
   const usageHelper = sess.__arcana_chat_usage;
   if (usageHelper) usageHelper.reset();
 
@@ -792,8 +997,9 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   const _retryMaxRaw = Number(process.env.ARCANA_COMPLETION_MAX_RETRIES);
   const _retryMax = (Number.isFinite(_retryMaxRaw) && _retryMaxRaw >= 0) ? _retryMaxRaw : 2;
   const maxAttempts = _retryMax + 1; // default 3 total attempts
+  const defaultRetryDelayMs = 5000;
   const _retryDelayRaw = Number(process.env.ARCANA_COMPLETION_RETRY_DELAY_MS);
-  const retryDelayMs = (Number.isFinite(_retryDelayRaw) && _retryDelayRaw >= 0) ? _retryDelayRaw : 3000;
+  const retryDelayMs = (Number.isFinite(_retryDelayRaw) && _retryDelayRaw >= 0) ? Math.max(_retryDelayRaw, defaultRetryDelayMs) : defaultRetryDelayMs;
 
   let lastAssistantText = '';
   let out = '';
@@ -884,7 +1090,6 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         }
       } catch {}
     });
-
     try {
       await runWithContext(ctx, () => sess.prompt(payloadMsg));
     } catch (e) {
@@ -925,22 +1130,50 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       }
     }
   } catch {}
+  let usageModelLabel = '';
+  try {
+    const srcModel = (record && record.model) || model;
+    const modelInfo = srcModel ? buildModelDiagnostics(srcModel) : null;
+    if (modelInfo && modelInfo.label){
+      usageModelLabel = String(modelInfo.label);
+    }
+  } catch {}
   if (usage && (usage.totalTokens > 0 || usage.contextTokens > 0 || usage.outputTokens > 0 || sessionTokensTotal > 0)){
     try {
-      emit({
+      const ev = {
         type: 'llm_usage',
         sessionId,
+        sessionKey,
         agentId,
         contextTokens: usage.contextTokens,
         outputTokens: usage.outputTokens,
         totalTokens: usage.totalTokens,
+        lastCallContextTokens: usage.lastCallContextTokens || 0,
+        lastCallTotalTokens: usage.lastCallTotalTokens || 0,
         sessionTokens: sessionTokensTotal,
-      });
+        tsMs: nowMs(),
+      };
+      if (usageModelLabel) ev.model = usageModelLabel;
+      emit(ev);
     } catch {}
   }
 
+
   const completionErrorReason = isCompletionErrorReason(finishReason) ? finishReason : (isCompletionErrorReason(stopReason) ? stopReason : '');
   const diagnostics = buildDiagnosticsPayload({ record: { ...record, model }, finishReason, stopReason, completionErrorReason, assistantMessageMeta, diagnosticEvents });
+
+  // Optional model_request logging
+  let modelRequest = null;
+  try {
+    if (record && record.session && (truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST') || truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL'))){
+      const sess = record.session;
+      const ctx = sess.__arcana_last_llm_context || null;
+      const payload = sess.__arcana_last_provider_payload || null;
+      if (ctx || payload){
+        modelRequest = { context: ctx || null, providerPayload: payload || null };
+      }
+    }
+  } catch {}
 
   if (promptError){
     let msg = '';
@@ -988,9 +1221,16 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         usageOutputTokens: usage.outputTokens,
         usageTotalTokens: usage.totalTokens,
       };
-      const includePrompt = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
+      const promptEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
+      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL');
+      const includePrompt = promptEnv || promptFullEnv;
       const promptText = payloadMsg;
-      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: stack, stats, diagnostics });
+      const promptMaxChars = promptFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      const reqEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST');
+      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL');
+      const includeModelRequest = !!(modelRequest && (reqEnv || reqFullEnv));
+      const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: stack, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
       logPath = lp;
     } catch {}
     try {
@@ -1079,9 +1319,16 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         usageOutputTokens: usage.outputTokens,
         usageTotalTokens: usage.totalTokens,
       };
-      const includePrompt = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
+      const promptEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
+      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL');
+      const includePrompt = promptEnv || promptFullEnv;
       const promptText = payloadMsg;
-      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics });
+      const promptMaxChars = promptFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      const reqEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST');
+      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL');
+      const includeModelRequest = !!(modelRequest && (reqEnv || reqFullEnv));
+      const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
       logPath = lp;
     } catch {}
     try {
@@ -1116,9 +1363,16 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         usageOutputTokens: usage.outputTokens,
         usageTotalTokens: usage.totalTokens,
       };
-      const includePrompt = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
+      const promptEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
+      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL');
+      const includePrompt = promptEnv || promptFullEnv;
       const promptText = payloadMsg;
-      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics });
+      const promptMaxChars = promptFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      const reqEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST');
+      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL');
+      const includeModelRequest = !!(modelRequest && (reqEnv || reqFullEnv));
+      const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
       logPath = lp;
       warning = 'empty_completion';
       try {
@@ -1335,4 +1589,29 @@ export async function abortChat({ agentId: rawAgentId, sessionKey, sessionId: ra
   return { ok: false, reason: 'no_active_session' };
 }
 
-export default { runChatMessage, abortChat };
+export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId }){
+  const agentId = normalizeAgentId(rawAgentId || DEFAULT_AGENT_ID);
+  let sessionId = String(rawSessionId || '').trim();
+  if (!sessionId && sessionKey){
+    try {
+      const resolvedId = await getSessionIdForKey({ agentId, sessionKey });
+      if (resolvedId) sessionId = String(resolvedId || '').trim();
+    } catch {}
+  }
+  if (!sessionId) return { ok: false, reason: 'missing_sessionId' };
+
+  let cleared = false;
+  for (const rec of chatSessions.values()){
+    if (!rec || rec.agentId !== agentId) continue;
+    if (String(rec.sessionId || '') !== sessionId) continue;
+    try {
+      if (rec.session && rec.session.agent && typeof rec.session.agent.clearMessages === 'function'){
+        rec.session.agent.clearMessages();
+        cleared = true;
+      }
+    } catch {}
+  }
+  return { ok: cleared };
+}
+
+export default { runChatMessage, abortChat, clearChatContext };

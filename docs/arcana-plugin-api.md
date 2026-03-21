@@ -124,8 +124,8 @@ context. Today, channel bridges call Gateway v2 (`/v2/turn-sync`) and read from
 
 Sink plugins consume events and traces and forward them to external systems
 (log aggregation, metrics backends, monitoring services). Today, this behavior
-is implicit: code in `server/server.mjs` broadcasts events over SSE, and tools
-like the support bundle read plugin information.
+is implicit: the core Gateway v2 runtime broadcasts events over `/v2/stream`,
+and tools like the support bundle read plugin information.
 
 In v2, a SinkPlugin receives a filtered event/trace stream and may export data
 elsewhere.
@@ -227,9 +227,9 @@ Requirements (Proposed):
   - Channel ingress may create a new trace and root span per user-visible
     turn, then link subsequent tool spans under it.
   - Tool execution spans can be derived from existing `tool_execution_*`
-    events in `server/server.mjs`.
+    events emitted on the Gateway event bus.
 
-The existing SSE stream from `/api/events` already carries many event types
+The existing Gateway v2 WebSocket stream from `/v2/stream` already carries many event types
 that correspond to these concepts (see `docs/arcana-gateway-protocol.md`). The
 v2 Plugin API standardizes how plugins participate in that stream.
 

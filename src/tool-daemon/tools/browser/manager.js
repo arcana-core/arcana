@@ -225,16 +225,65 @@ export class BrowserManager {
     return { ok:true, url: entry.page.url?.() };
   }
 
-  async screenshot({ headers, path: relPath, fullPage, proxy, profileKey, browserProfile, profile, driver, mcp }={}){
+  async screenshot({ headers, path: relPath, fullPage, type, quality, proxy, profileKey, browserProfile, profile, driver, mcp }={}){
     const key = this._resolveProfileKey({ headers, proxy, profileKey, browserProfile, profile });
     const drv = this._normalizeDriver(driver, key);
 
+    let typeExplicit = false;
+    let normalizedType = "jpeg";
+    if (typeof type === "string" && type) {
+      const t = String(type).trim().toLowerCase();
+      if (t === "png" || t === "jpeg"){
+        normalizedType = t;
+        typeExplicit = true;
+      }
+    }
+
+    let qualityExplicit = false;
+    let normalizedQuality = 80;
+    if (typeof quality === "number" && Number.isFinite(quality)){
+      let q = Math.round(quality);
+      if (q < 1) q = 1;
+      if (q > 100) q = 100;
+      normalizedQuality = q;
+      qualityExplicit = true;
+    }
+
+    let effectiveRelPath = null;
+    if (relPath && String(relPath).trim()){
+      effectiveRelPath = String(relPath).trim();
+      const ext = path.extname(effectiveRelPath).toLowerCase();
+      const isPngExt = ext === ".png";
+      const isJpegExt = ext === ".jpg" || ext === ".jpeg";
+      if (!typeExplicit){
+        if (isPngExt){
+          normalizedType = "png";
+        } else if (isJpegExt){
+          normalizedType = "jpeg";
+        }
+      } else if (isPngExt && normalizedType === "jpeg"){
+        console.error("[web_render] Warning: type=jpeg but screenshot path has .png extension; keeping type jpeg and writing as-is.");
+      } else if (isJpegExt && normalizedType === "png"){
+        console.error("[web_render] Warning: type=png but screenshot path has .jpg/.jpeg extension; keeping type png and writing as-is.");
+      }
+    } else {
+      if (normalizedType === "png"){
+        effectiveRelPath = "artifacts/web_render/latest.png";
+      } else {
+        effectiveRelPath = "artifacts/web_render/latest.jpg";
+        normalizedType = "jpeg";
+      }
+    }
+
+    if (normalizedType !== "jpeg" && qualityExplicit){
+      console.error("[web_render] Warning: quality is only used for jpeg screenshots and will be ignored for type png.");
+    }
+
+    const absPath = path.isAbsolute(effectiveRelPath) ? effectiveRelPath : path.join(this.workspaceRoot, effectiveRelPath);
+    try { await fs.promises.mkdir(path.dirname(absPath), { recursive: true }); } catch {}
+
     if (drv === "mcp"){
       const cfg = this._normalizeMcpConfig(key, mcp);
-      const effectiveRelPath = (relPath && String(relPath).trim()) ? String(relPath).trim() : "artifacts/web_render/latest.png";
-      const absPath = path.isAbsolute(effectiveRelPath) ? effectiveRelPath : path.join(this.workspaceRoot, effectiveRelPath);
-      try { await fs.promises.mkdir(path.dirname(absPath), { recursive: true }); } catch {}
-
       const args = { filePath: absPath };
       if (typeof fullPage === "boolean") args.fullPage = fullPage;
       const r = await this.mcp.call(key, "take_screenshot", args, cfg);
@@ -251,12 +300,10 @@ export class BrowserManager {
     }
 
     const entry = await this.profiles.getOrStartProfile(key, { proxy });
-    const effectiveRelPath = (relPath && String(relPath).trim()) ? String(relPath).trim() : "artifacts/web_render/latest.png";
-    const absPath = path.isAbsolute(effectiveRelPath) ? effectiveRelPath : path.join(this.workspaceRoot, effectiveRelPath);
-    try { await fs.promises.mkdir(path.dirname(absPath), { recursive: true }); } catch {}
 
     try {
-      const opts = { path: absPath };
+      const opts = { path: absPath, type: normalizedType };
+      if (normalizedType === "jpeg" && typeof normalizedQuality === "number") opts.quality = normalizedQuality;
       if (typeof fullPage === "boolean") opts.fullPage = fullPage;
       await entry.page.screenshot(opts);
       return { ok:true, path: effectiveRelPath, fullPage: Boolean(opts.fullPage) };

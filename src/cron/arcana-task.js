@@ -346,7 +346,7 @@ export async function runArcanaTask({ prompt, sessionId, sessionKey, title, logP
     const finalPrompt = historyPrelude ? (historyPrelude + '\n\n' + currentQuestion) : currentQuestion;
 
     const timing = await runWithContext(
-      { sessionId: sid, agentId: effectiveAgentId, agentHomeRoot, workspaceRoot },
+      { sessionId: sid, sessionKey, agentId: effectiveAgentId, agentHomeRoot, workspaceRoot },
       async () => {
         const { session, toolHost } = await createArcanaSession({ workspaceRoot, agentHomeRoot, execPolicy });
         const turnKey = buildTurnKey(effectiveAgentId, sessionKey, sid);

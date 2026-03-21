@@ -131,6 +131,77 @@ async function createWindow(){
 
 async function start(){
   try{
+    const isMac = process.platform === 'darwin';
+    if (isMac && app.isPackaged){
+      let shouldBlock = false;
+      try{
+        if (typeof app.isInApplicationsFolder === 'function'){
+          const inApps = app.isInApplicationsFolder();
+          if (!inApps) shouldBlock = true;
+        }
+      } catch {}
+
+      try{
+        const execPath = process.execPath || '';
+        if (execPath.startsWith('/Volumes/')) shouldBlock = true;
+      } catch {}
+
+      try{
+        const appPath = app.getAppPath && app.getAppPath();
+        if (typeof appPath === 'string' && appPath.startsWith('/Volumes/')){
+          shouldBlock = true;
+        }
+      } catch {}
+
+      if (shouldBlock){
+        const message = [
+          'Arcana is currently running from a disk image (DMG).',
+          '',
+          'To install Arcana properly, please move it to the /Applications folder.',
+          '',
+          'After moving Arcana to /Applications, please launch it again from there.'
+        ].join('\n');
+
+        const buttons = [];
+        let moveIndex = -1;
+        if (typeof app.moveToApplicationsFolder === 'function'){
+          buttons.push('Move to Applications');
+          moveIndex = 0;
+          buttons.push('Quit');
+        } else {
+          buttons.push('OK');
+        }
+
+        try{
+          const result = dialog.showMessageBoxSync({
+            type: 'info',
+            buttons,
+            defaultId: 0,
+            cancelId: buttons.length - 1,
+            title: 'Move Arcana to Applications',
+            message: 'Arcana needs to be moved to /Applications before it can run.',
+            detail: message,
+          });
+
+          if (moveIndex !== -1 && result === moveIndex){
+            try{
+              const moved = app.moveToApplicationsFolder();
+              if (moved){
+                app.relaunch();
+              }
+            } catch {}
+          }
+        } catch {}
+
+        try{
+          app.exit(0);
+        } catch {
+          process.exit(0);
+        }
+        return;
+      }
+    }
+
     const { workspace, arcanaHome, config } = ensureUserWorkspace();
     arcanaHomeDir = arcanaHome;
     // Expose workspace and config locations to Arcana server

@@ -1,4 +1,4 @@
-// Arcana web chat (WeChat-like UI) — streaming via SSE
+// Arcana web chat (WeChat-like UI) — streaming via Gateway v2
 const messages = document.querySelector('#messages');
 const input = document.querySelector('#input');
 const sendBtn = document.querySelector('#send');
@@ -21,11 +21,22 @@ try{
   }
 } catch {}
 
+let __arcana_showToolMessages = false;
+try{
+  if (typeof window !== 'undefined' && window.location && typeof window.location.search === 'string'){
+    const params = new URLSearchParams(window.location.search || '');
+    const v = params.get('showToolMessages');
+    if (v && v !== '0' && v.toLowerCase() !== 'false'){
+      __arcana_showToolMessages = true;
+    }
+  }
+} catch {}
+
 const GATEWAY_V2_SESSION_KEY_LS = 'arcana.v2.sessionKey.v1';
 const API_TOKEN_LS_KEY = 'arcana.apiToken.v1';
 const VOICE_INGRESS_BASE_URL = 'http://127.0.0.1:28920/voice';
 const VOICE_TRIGGER_CN = '\u6253\u5f00\u8bed\u97f3';
-let gatewayV2Enabled = false;
+let gatewayV2Enabled = true;
 let gatewayV2Detected = false;
 let gatewayV2ProbePromise = null;
 let gatewayV2SessionKey = '';
@@ -398,6 +409,251 @@ function warnStorageQuota(){
 const LOG_CAP = 400; // per session per tab
 const logStore = new Map(); // sessionId -> { main:[], tools:[], subagents:[] }
 
+// Heavy WebUI persistence (main logs + tool panels)
+// Prefer IndexedDB with a 100MB soft cap and LRU eviction,
+// falling back to legacy localStorage buckets when needed.
+const WEBUI_PERSIST_SOFT_MAX_BYTES = 100 * 1024 * 1024;
+const WEBUI_PERSIST_DB_NAME = 'arcana.webui.persist.v1';
+const WEBUI_PERSIST_STORE = 'webui';
+let __webuiIdbPromise = null;
+let __webuiIdbDisabled = false;
+
+function isIndexedDbAvailable(){
+  try{ return (typeof indexedDB !== 'undefined') && !!indexedDB; } catch { return false; }
+}
+
+function webuiIdbKey(kind, sessionId){
+  const sid = String(sessionId || '');
+  const k = String(kind || '');
+  if (!sid) return '';
+  if (k === 'mainLogs') return 'arcana.persist.mainLogs.v1:' + sid;
+  if (k === 'toolPanel') return 'arcana.persist.toolPanels.v1:' + sid;
+  return k + ':' + sid;
+}
+
+function openWebuiDb(){
+  if (!isIndexedDbAvailable()) return Promise.reject(new Error('indexedDB_unavailable'));
+  if (__webuiIdbPromise) return __webuiIdbPromise;
+  __webuiIdbPromise = new Promise((resolve, reject)=>{
+    try{
+      const req = indexedDB.open(WEBUI_PERSIST_DB_NAME, 1);
+      req.onupgradeneeded = (ev)=>{
+        try{
+          const db = ev.target && ev.target.result;
+          if (!db) return;
+          if (!db.objectStoreNames || !db.objectStoreNames.contains(WEBUI_PERSIST_STORE)){
+            const store = db.createObjectStore(WEBUI_PERSIST_STORE, { keyPath: 'key' });
+            try{ store.createIndex('lastAccess', 'lastAccess', { unique: false }); } catch {}
+          }
+        } catch {}
+      };
+      req.onsuccess = (ev)=>{
+        try{
+          const db = ev.target && ev.target.result;
+          if (!db){ reject(new Error('idb_no_db')); return; }
+          resolve(db);
+        } catch(e){ reject(e); }
+      };
+      req.onerror = ()=>{
+        try{ __webuiIdbDisabled = true; } catch {}
+        reject(req.error || new Error('idb_open_failed'));
+      };
+      req.onblocked = ()=>{
+        // best-effort: nothing to do; another tab may be open
+      };
+    } catch(e){
+      try{ __webuiIdbDisabled = true; } catch {}
+      reject(e);
+    }
+  });
+  return __webuiIdbPromise;
+}
+
+function webuiIdbWithStore(mode, fn){
+  return openWebuiDb().then((db)=>{
+    return new Promise((resolve, reject)=>{
+      try{
+        const tx = db.transaction(WEBUI_PERSIST_STORE, mode);
+        const store = tx.objectStore(WEBUI_PERSIST_STORE);
+        let done = false;
+        tx.oncomplete = ()=>{ if (!done){ done = true; resolve(); } };
+        tx.onerror = ()=>{
+          try{ __webuiIdbDisabled = true; } catch {}
+          if (!done){ done = true; reject(tx.error || new Error('idb_tx_failed')); }
+        };
+        fn(store, tx);
+      } catch(e){
+        try{ __webuiIdbDisabled = true; } catch {}
+        reject(e);
+      }
+    });
+  });
+}
+
+function approximateSizeBytes(value){
+  try{
+    const s = JSON.stringify(value);
+    if (!s) return 0;
+    // Rough UTF-16 -> bytes approximation; soft cap only.
+    return s.length * 2;
+  } catch { return 0; }
+}
+
+function webuiIdbPut(kind, sessionId, value){
+  const sid = String(sessionId || '');
+  if (!sid || __webuiIdbDisabled) return Promise.resolve();
+  const key = webuiIdbKey(kind, sid);
+  const sizeBytes = approximateSizeBytes(value);
+  const record = {
+    key,
+    kind: String(kind || ''),
+    sessionId: sid,
+    value,
+    sizeBytes: (typeof sizeBytes === 'number' && sizeBytes >= 0) ? sizeBytes : 0,
+    lastAccess: Date.now(),
+  };
+  const p = webuiIdbWithStore('readwrite', (store)=>{
+    store.put(record);
+  }).then(()=>{
+    return webuiIdbEnforceSoftLimit(key);
+  });
+  return p.catch((err)=>{
+    try{ __webuiIdbDisabled = true; } catch {}
+    throw err;
+  });
+}
+
+function webuiIdbGet(kind, sessionId){
+  const sid = String(sessionId || '');
+  if (!sid || __webuiIdbDisabled) return Promise.resolve(null);
+  const key = webuiIdbKey(kind, sid);
+  return openWebuiDb().then((db)=>{
+    return new Promise((resolve, reject)=>{
+      try{
+        const tx = db.transaction(WEBUI_PERSIST_STORE, 'readonly');
+        const store = tx.objectStore(WEBUI_PERSIST_STORE);
+        const req = store.get(key);
+        req.onsuccess = ()=>{
+          const rec = req.result || null;
+          if (!rec){ resolve(null); return; }
+          // Best-effort LRU bump (fire-and-forget)
+          try{
+            rec.lastAccess = Date.now();
+            const tx2 = db.transaction(WEBUI_PERSIST_STORE, 'readwrite');
+            const s2 = tx2.objectStore(WEBUI_PERSIST_STORE);
+            s2.put(rec);
+          } catch {}
+          resolve(rec.value);
+        };
+        req.onerror = ()=>{
+          try{ __webuiIdbDisabled = true; } catch {}
+          reject(req.error || new Error('idb_get_failed'));
+        };
+      } catch(e){
+        try{ __webuiIdbDisabled = true; } catch {}
+        reject(e);
+      }
+    });
+  }).catch(()=>{ return null; });
+}
+
+function webuiIdbGetAllByKind(kind){
+  if (__webuiIdbDisabled) return Promise.resolve([]);
+  const k = String(kind || '');
+  return openWebuiDb().then((db)=>{
+    return new Promise((resolve, reject)=>{
+      try{
+        const tx = db.transaction(WEBUI_PERSIST_STORE, 'readonly');
+        const store = tx.objectStore(WEBUI_PERSIST_STORE);
+        const req = store.getAll();
+        req.onsuccess = ()=>{
+          const rows = Array.isArray(req.result) ? req.result : [];
+          const out = [];
+          for (const row of rows){
+            if (!row || !row.kind || row.kind !== k) continue;
+            out.push(row);
+          }
+          resolve(out);
+        };
+        req.onerror = ()=>{
+          try{ __webuiIdbDisabled = true; } catch {}
+          reject(req.error || new Error('idb_getAll_failed'));
+        };
+      } catch(e){
+        try{ __webuiIdbDisabled = true; } catch {}
+        reject(e);
+      }
+    });
+  }).catch((err)=>{
+    try{ __webuiIdbDisabled = true; } catch {}
+    throw err;
+  });
+}
+
+function webuiIdbDelete(kind, sessionId){
+  const sid = String(sessionId || '');
+  if (!sid || __webuiIdbDisabled) return Promise.resolve();
+  const key = webuiIdbKey(kind, sid);
+  return webuiIdbWithStore('readwrite', (store)=>{
+    store.delete(key);
+  }).catch((err)=>{
+    try{ __webuiIdbDisabled = true; } catch {}
+    throw err;
+  });
+}
+
+function webuiIdbEnforceSoftLimit(excludeKey){
+  if (!WEBUI_PERSIST_SOFT_MAX_BYTES || WEBUI_PERSIST_SOFT_MAX_BYTES <= 0 || __webuiIdbDisabled) return Promise.resolve();
+  const exclude = (typeof excludeKey === 'string') ? excludeKey : String(excludeKey || '');
+  return openWebuiDb().then((db)=>{
+    return new Promise((resolve, reject)=>{
+      try{
+        const tx = db.transaction(WEBUI_PERSIST_STORE, 'readonly');
+        const store = tx.objectStore(WEBUI_PERSIST_STORE);
+        const req = store.getAll();
+        req.onsuccess = ()=>{
+          const rows = Array.isArray(req.result) ? req.result : [];
+          let total = 0;
+          for (const row of rows){
+            const sz = (row && typeof row.sizeBytes === 'number' && row.sizeBytes >= 0) ? row.sizeBytes : 0;
+            total += sz;
+          }
+          if (total <= WEBUI_PERSIST_SOFT_MAX_BYTES){ resolve(); return; }
+          // Sort by lastAccess ascending to evict least-recently used entries first.
+          rows.sort((a, b)=>{
+            const aa = (a && typeof a.lastAccess === 'number') ? a.lastAccess : 0;
+            const bb = (b && typeof b.lastAccess === 'number') ? b.lastAccess : 0;
+            return aa - bb;
+          });
+          const tx2 = db.transaction(WEBUI_PERSIST_STORE, 'readwrite');
+          const store2 = tx2.objectStore(WEBUI_PERSIST_STORE);
+          let remaining = total;
+          for (const row of rows){
+            if (remaining <= WEBUI_PERSIST_SOFT_MAX_BYTES) break;
+            if (!row || !row.key) continue;
+            if (exclude && row.key === exclude) continue;
+            const sz = (row && typeof row.sizeBytes === 'number' && row.sizeBytes >= 0) ? row.sizeBytes : 0;
+            remaining -= sz;
+            try{ store2.delete(row.key); } catch {}
+          }
+          tx2.oncomplete = ()=>{ resolve(); };
+          tx2.onerror = ()=>{
+            try{ __webuiIdbDisabled = true; } catch {}
+            reject(tx2.error || new Error('idb_tx_failed'));
+          };
+        };
+        req.onerror = ()=>{
+          try{ __webuiIdbDisabled = true; } catch {}
+          reject(req.error || new Error('idb_getAll_failed'));
+        };
+      } catch(e){
+        try{ __webuiIdbDisabled = true; } catch {}
+        reject(e);
+      }
+    });
+  }).catch(()=>{ return; });
+}
+
 const MAIN_LOGS_KEY = 'arcana.logs.main.v1';
 const MAIN_LOGS_SAVE_DEBOUNCE_MS = 250;
 const mainLogsSaveTimers = new Map(); // sessionId -> timeout id
@@ -636,12 +892,10 @@ function deserializeToolPanel(obj){
   return panel;
 }
 
-
 function scheduleSaveToolPanel(sessionId){
   try{
     const sid = String(sessionId || '');
     if (!sid) return;
-    try{ if (typeof localStorage === 'undefined') return; } catch { return; }
     if (!toolPanels.has(sid)) return;
     const existing = toolPanelSaveTimers.get(sid);
     if (existing){
@@ -653,17 +907,18 @@ function scheduleSaveToolPanel(sessionId){
         const panel = toolPanels.get(sid);
         if (!panel) return;
         const payload = serializeToolPanel(panel);
-        let root = {};
+        const canUseIdb = isIndexedDbAvailable() && !__webuiIdbDisabled;
+        if (!canUseIdb){
+          try{ persistToolPanelToLocalStorage(sid, payload); } catch {}
+          return;
+        }
         try{
-          const raw = localStorage.getItem(TOOL_PANELS_KEY);
-          if (raw){
-            const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === 'object') root = parsed;
-          }
-        } catch {}
-        if (!root || typeof root !== 'object') root = {};
-        root[sid] = payload;
-        try{ localStorage.setItem(TOOL_PANELS_KEY, JSON.stringify(root)); } catch(e){ try{ warnStorageQuota(); } catch{} }
+          webuiIdbPut('toolPanel', sid, payload).catch(()=>{
+            try{ persistToolPanelToLocalStorage(sid, payload); } catch {}
+          });
+        } catch{
+          try{ persistToolPanelToLocalStorage(sid, payload); } catch {}
+        }
       } catch {}
     }, TOOL_PANELS_SAVE_DEBOUNCE_MS);
     toolPanelSaveTimers.set(sid, handle);
@@ -674,7 +929,6 @@ function scheduleSaveMainLogs(sessionId){
   try{
     const sid = String(sessionId || '');
     if (!sid) return;
-    try{ if (typeof localStorage === 'undefined') return; } catch { return; }
     const existing = mainLogsSaveTimers.get(sid);
     if (existing){
       try { clearTimeout(existing); } catch {}
@@ -686,23 +940,24 @@ function scheduleSaveMainLogs(sessionId){
         if (!buckets || !Array.isArray(buckets.main)) return;
         const arr = buckets.main;
         const lines = Array.isArray(arr) ? arr.slice(-LOG_CAP) : [];
-        let root = {};
+        const canUseIdb = isIndexedDbAvailable() && !__webuiIdbDisabled;
+        if (!canUseIdb){
+          try{ persistMainLogsToLocalStorage(sid, lines); } catch {}
+          return;
+        }
         try{
-          const raw = localStorage.getItem(MAIN_LOGS_KEY);
-          if (raw){
-            const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === 'object') root = parsed;
-          }
-        } catch {}
-        if (!root || typeof root !== 'object') root = {};
-        root[sid] = lines;
-        try{ localStorage.setItem(MAIN_LOGS_KEY, JSON.stringify(root)); } catch(e){ try{ warnStorageQuota(); } catch{} }
+          webuiIdbPut('mainLogs', sid, lines).catch(()=>{
+            try{ persistMainLogsToLocalStorage(sid, lines); } catch {}
+          });
+        } catch{
+          try{ persistMainLogsToLocalStorage(sid, lines); } catch {}
+        }
       } catch {}
     }, MAIN_LOGS_SAVE_DEBOUNCE_MS);
     mainLogsSaveTimers.set(sid, handle);
   } catch {}
 }
-function loadMainLogsFromStorage(){
+function loadMainLogsFromLocalStorage(migrateToIdb){
   try{
     try{ if (typeof localStorage === 'undefined') return; } catch { return; }
     let raw = null;
@@ -712,6 +967,7 @@ function loadMainLogsFromStorage(){
     try{ obj = JSON.parse(raw); } catch { obj = null; }
     if (!obj || typeof obj !== 'object') return;
     const entries = Object.entries(obj);
+    const migratePromises = [];
     for (const [sidRaw, lines] of entries){
       const sid = String(sidRaw || '');
       if (!sid) continue;
@@ -723,11 +979,21 @@ function loadMainLogsFromStorage(){
         mainArr.push(line);
         if (mainArr.length > LOG_CAP) mainArr.splice(0, mainArr.length - LOG_CAP);
       }
+      if (migrateToIdb && isIndexedDbAvailable() && !__webuiIdbDisabled){
+        try{ migratePromises.push(webuiIdbPut('mainLogs', sid, arr)); } catch {}
+      }
+    }
+    if (migrateToIdb && migratePromises.length){
+      try{
+        Promise.allSettled(migratePromises).then(()=>{
+          try{ localStorage.removeItem(MAIN_LOGS_KEY); } catch {}
+        });
+      } catch {}
     }
   } catch {}
 }
 
-function loadToolPanelsFromStorage(){
+function loadToolPanelsFromLocalStorage(migrateToIdb){
   try{
     try{ if (typeof localStorage === 'undefined') return; } catch { return; }
     let raw = null;
@@ -737,6 +1003,7 @@ function loadToolPanelsFromStorage(){
     try{ obj = JSON.parse(raw); } catch { obj = null; }
     if (!obj || typeof obj !== 'object') return;
     const entries = Object.entries(obj);
+    const migratePromises = [];
     for (const [sidRaw, stored] of entries){
       const sid = String(sidRaw || '');
       if (!sid) continue;
@@ -761,8 +1028,103 @@ function loadToolPanelsFromStorage(){
         if (maxTurn >= 0){
           lastToolTurnBySession.set(sid, maxTurn);
         }
+        if (migrateToIdb && isIndexedDbAvailable() && !__webuiIdbDisabled){
+          try{ migratePromises.push(webuiIdbPut('toolPanel', sid, stored || {})); } catch {}
+        }
       } catch {}
     }
+    if (migrateToIdb && migratePromises.length){
+      try{
+        Promise.allSettled(migratePromises).then(()=>{
+          try{ localStorage.removeItem(TOOL_PANELS_KEY); } catch {}
+        });
+      } catch {}
+    }
+  } catch {}
+}
+
+function loadMainLogsFromStorage(){
+  try{
+    const canUseIdb = isIndexedDbAvailable() && !__webuiIdbDisabled;
+    if (!canUseIdb){
+      loadMainLogsFromLocalStorage(false);
+      return;
+    }
+    (async ()=>{
+      let loadedFromIdb = false;
+      try{
+        const rows = await webuiIdbGetAllByKind('mainLogs');
+        if (Array.isArray(rows) && rows.length){
+          loadedFromIdb = true;
+          for (const row of rows){
+            if (!row) continue;
+            const sid = String(row.sessionId || '');
+            if (!sid) continue;
+            const arr = Array.isArray(row.value) ? row.value.map((s)=>String(s||'')) : [];
+            if (!arr.length) continue;
+            const buckets = ensureBuckets(sid);
+            const mainArr = buckets.main || (buckets.main = []);
+            for (const line of arr){
+              mainArr.push(line);
+              if (mainArr.length > LOG_CAP) mainArr.splice(0, mainArr.length - LOG_CAP);
+            }
+          }
+        }
+      } catch {}
+      if (!loadedFromIdb){
+        loadMainLogsFromLocalStorage(true);
+      }
+    })();
+  } catch {}
+}
+
+function loadToolPanelsFromStorage(){
+  try{
+    const canUseIdb = isIndexedDbAvailable() && !__webuiIdbDisabled;
+    if (!canUseIdb){
+      loadToolPanelsFromLocalStorage(false);
+      return;
+    }
+    (async ()=>{
+      let loadedFromIdb = false;
+      try{
+        const rows = await webuiIdbGetAllByKind('toolPanel');
+        if (Array.isArray(rows) && rows.length){
+          loadedFromIdb = true;
+          for (const row of rows){
+            if (!row) continue;
+            const sid = String(row.sessionId || '');
+            if (!sid) continue;
+            try{
+              const stored = row.value || {};
+              const panel = deserializeToolPanel(stored);
+              toolPanels.set(sid, panel);
+              let maxTurn = -1;
+              if (panel.turnStatus && typeof panel.turnStatus.forEach === 'function'){
+                panel.turnStatus.forEach((v, k)=>{
+                  if (v !== 'running' && v !== 'done') return;
+                  const idx = Number(k);
+                  if (!Number.isNaN(idx) && idx > maxTurn) maxTurn = idx;
+                });
+              }
+              if (panel.actions && typeof panel.actions.forEach === 'function'){
+                panel.actions.forEach((a)=>{
+                  if (!a) return;
+                  const idx = (typeof a.turnIndex === 'number' && !Number.isNaN(a.turnIndex)) ? a.turnIndex : 0;
+                  if (idx > maxTurn) maxTurn = idx;
+                });
+              }
+              if (maxTurn >= 0){
+                lastToolTurnBySession.set(sid, maxTurn);
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+      if (!loadedFromIdb){
+        loadToolPanelsFromLocalStorage(true);
+      }
+    })();
   } catch {}
 }
 
@@ -884,6 +1246,102 @@ function markTurnDone(sessionId){
     panel.turnStatus.set(turnIdx, 'done');
     try{ scheduleSaveToolPanel(sid); } catch {}
   } catch {}
+}
+
+// Ensure there is an open (running) turn for a session and
+// initialize per-turn usage bookkeeping. Returns the current turn index.
+function ensureTurnOpenForSession(sessionId, snap){
+  try{
+    const sid = String(sessionId || '');
+    if (!sid) return 0;
+    const panel = getToolPanel(sid);
+    if (!panel) return 0;
+    if (!panel.turnStatus) panel.turnStatus = new Map();
+    if (!panel.turnUsage) panel.turnUsage = new Map();
+
+    // If there is already a running turn, reuse it instead of
+    // creating/incrementing a new one.
+    let runningIdx = null;
+    try{
+      if (panel.turnStatus && typeof panel.turnStatus.forEach === 'function'){
+        panel.turnStatus.forEach((status, key)=>{
+          const idx = Number(key);
+          if (status !== 'running' || Number.isNaN(idx)) return;
+          if (runningIdx === null || idx > runningIdx) runningIdx = idx;
+        });
+      }
+    } catch {}
+
+    let idx;
+    if (runningIdx !== null){
+      idx = runningIdx;
+    } else {
+      // No running turn: derive the next turn index based on
+      // the last known turn and existing actions/turnStatus.
+      let prev = lastToolTurnBySession.get(sid);
+      if (typeof prev !== 'number' || Number.isNaN(prev)){
+        prev = -1;
+        try{
+          if (panel.turnStatus && typeof panel.turnStatus.forEach === 'function'){
+            panel.turnStatus.forEach((v, k)=>{
+              const n = Number(k);
+              if (!Number.isNaN(n) && n > prev) prev = n;
+            });
+          }
+        } catch {}
+        try{
+          if (panel.actions && typeof panel.actions.forEach === 'function'){
+            panel.actions.forEach((a)=>{
+              if (!a) return;
+              const n = (typeof a.turnIndex === 'number' && !Number.isNaN(a.turnIndex)) ? a.turnIndex : null;
+              if (n !== null && n > prev) prev = n;
+            });
+          }
+        } catch {}
+      }
+      idx = prev + 1;
+      if (!Number.isFinite(idx) || idx < 0) idx = 0;
+      panel.turnStatus.set(idx, 'running');
+    }
+
+    lastToolTurnBySession.set(sid, idx);
+
+    // Initialize or update per-turn usage for this index using the
+    // latest live snapshot when available.
+    const existing = panel.turnUsage.get(idx) || {};
+    let startSessionTokens = (typeof existing.startSessionTokens === 'number' && existing.startSessionTokens >= 0) ? existing.startSessionTokens : undefined;
+    let lastSessionTokens = (typeof existing.lastSessionTokens === 'number' && existing.lastSessionTokens >= 0) ? existing.lastSessionTokens : undefined;
+    let lastContextTokens = (typeof existing.lastContextTokens === 'number' && existing.lastContextTokens >= 0) ? existing.lastContextTokens : undefined;
+    const turnTokens = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
+    const toolTokens = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
+    const llmTokens = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
+
+    const snapObj = snap && typeof snap === 'object' ? snap : null;
+    const snapSession = (snapObj && typeof snapObj.sessionTokens === 'number' && snapObj.sessionTokens >= 0) ? snapObj.sessionTokens : null;
+    const snapContext = (snapObj && typeof snapObj.contextTokens === 'number' && snapObj.contextTokens >= 0) ? snapObj.contextTokens : null;
+
+    if (startSessionTokens === undefined){
+      startSessionTokens = (snapSession !== null) ? snapSession : 0;
+    }
+    if (lastSessionTokens === undefined){
+      lastSessionTokens = (snapSession !== null) ? snapSession : startSessionTokens;
+    }
+    if (lastContextTokens === undefined){
+      lastContextTokens = (snapContext !== null) ? snapContext : 0;
+    }
+
+    panel.turnUsage.set(idx, {
+      startSessionTokens,
+      lastSessionTokens,
+      lastContextTokens,
+      turnTokens,
+      toolTokens,
+      llmTokens,
+    });
+
+    try{ scheduleSaveToolPanel(sid); } catch {}
+    return idx;
+  } catch { return 0 }
 }
 
 function toolCategory(toolName){
@@ -1015,19 +1473,9 @@ function upsertToolAction(data){
         if (usage && typeof usage.totalTokens === 'number' && usage.totalTokens >= 0){
           action.tokTokens = Number(usage.totalTokens) || 0;
         }
-        let ctxVal = undefined;
         if (typeof data.contextTokens === 'number' && data.contextTokens >= 0){
-          ctxVal = Number(data.contextTokens) || 0;
-        } else {
-          try{
-            const snap = ensureLiveForSession(sid);
-            if (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0){
-              ctxVal = Number(snap.contextTokens) || 0;
-            }
-          } catch {}
-        }
-        if (typeof ctxVal === 'number' && ctxVal >= 0){
-          action.ctxTokens = ctxVal;
+          const ctxVal = Number(data.contextTokens) || 0;
+          if (ctxVal >= 0) action.ctxTokens = ctxVal;
         }
       } catch {}
     }
@@ -1197,9 +1645,7 @@ function renderToolsPanel(sessionId){
       if (typeof usage.lastContextTokens === 'number' && usage.lastContextTokens >= 0) lastCtx = usage.lastContextTokens;
       if (typeof usage.turnTokens === 'number' && usage.turnTokens >= 0) turnTokens = usage.turnTokens;
     }
-    if (lastSess < startSess) lastSess = startSess;
-    const delta = Math.max(0, lastSess - startSess);
-    const tokValue = (typeof turnTokens === 'number' && turnTokens > 0) ? turnTokens : delta;
+    const tokValue = (typeof turnTokens === 'number' && turnTokens > 0) ? turnTokens : 0;
 
     const badges = document.createElement('div');
     badges.className = 'tools-turn-badges';
@@ -1465,7 +1911,7 @@ function ensureBubbleParts(bubble){
   return parts;
 }
 
-// Client-side MEDIA: helpers (mirror server/server.mjs behavior)
+// Client-side MEDIA: helpers (mirror legacy server behavior)
 function normalizeMediaRef(raw){
   if (!raw) return '';
   let s = String(raw).trim();
@@ -1525,6 +1971,19 @@ function extractMediaFromAssistantText(text){
   }
   return { text: outLines.join('\n'), mediaRefs };
 }
+function mediaRefToImgSrc(ref, sessionId){
+  try{
+    const raw = String(ref || '').trim();
+    if (!raw) return '';
+    const lower = raw.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:')) return raw;
+    const pathParam = encodeURIComponent(raw);
+    const sid = String(sessionId || '').trim();
+    const sidParam = sid ? '&sessionId=' + encodeURIComponent(sid) : '';
+    return '/api/local-file?path=' + pathParam + sidParam;
+  } catch { return String(ref || ''); }
+}
+
 
 // Backward‑compatible helper used by non‑SSE UI bits (config/doctor/etc).
 function appendLog(txt){ addLogLine(getCurrentSessionId() || '', 'main', String(txt||'')); }
@@ -1712,7 +2171,7 @@ async function loadConfigUI(){
     // Update default (global) model label cache
     try { __setCachedModelLabel(DEFAULT_AGENT_ID, globalCfg); } catch {}
 
-    // Current agent override config
+    // Current agent override config + skills
     try{
       const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
       const url = '/api/agent-config?agentId=' + encodeURIComponent(aid);
@@ -1752,6 +2211,62 @@ async function loadConfigUI(){
       const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!agentCompressEnabled;
       const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(agentCompressThreshold);
       const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(agentCompressKeep);
+      // Load skills for current agent
+      try{
+        const skillsWrap = qs('skills-config'); if (skillsWrap) skillsWrap.textContent = '加载中...';
+        const skillsStatus = qs('skills-status'); if (skillsStatus) skillsStatus.textContent = '';
+        const aidSkills = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+        const urlSkills = '/api/skills?agentId=' + encodeURIComponent(aidSkills);
+        const tokenS = getStoredApiToken();
+        const headersS = tokenS ? { 'authorization':'Bearer ' + tokenS } : undefined;
+        const rS = await fetch(urlSkills, headersS ? { headers: headersS } : undefined);
+        let jS = null;
+        try { jS = await rS.json(); } catch { jS = null; }
+        const skillsArr = jS && Array.isArray(jS.skills) ? jS.skills : [];
+        const disabledArr = jS && Array.isArray(jS.disabled) ? jS.disabled : [];
+        const disabledSet = new Set();
+        for (const raw of disabledArr){
+          if (typeof raw !== 'string') continue;
+          const n = raw.trim();
+          if (n) disabledSet.add(n);
+        }
+        if (skillsWrap){
+          skillsWrap.innerHTML = '';
+          if (!skillsArr.length){
+            const empty = document.createElement('div');
+            empty.textContent = '未发现技能';
+            empty.style.color = '#666';
+            skillsWrap.appendChild(empty);
+          } else {
+            for (const s of skillsArr){
+              const name = String(s && s.name || '').trim(); if (!name) continue;
+              const row = document.createElement('label');
+              row.style.display = 'flex';
+              row.style.alignItems = 'center';
+              row.style.gap = '6px';
+              row.style.marginBottom = '2px';
+              const cb = document.createElement('input');
+              cb.type = 'checkbox';
+              cb.dataset.skillName = name;
+              cb.checked = !disabledSet.has(name);
+              const span = document.createElement('span');
+              span.textContent = name;
+              row.appendChild(cb);
+              row.appendChild(span);
+              skillsWrap.appendChild(row);
+            }
+          }
+        }
+      } catch {
+        const skillsWrap = qs('skills-config');
+        if (skillsWrap){
+          skillsWrap.innerHTML = '';
+          const err = document.createElement('div');
+          err.textContent = '技能列表加载失败';
+          err.style.color = '#a00';
+          skillsWrap.appendChild(err);
+        }
+      }
     }catch(e){
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = '';
       if (qs('cfg-model-agent')) qs('cfg-model-agent').value = '';
@@ -1853,6 +2368,37 @@ async function saveAgentConfigUI(){
     await loadConfigUI();
     appendLog('[config] 已保存 Agent 配置');
   }catch(e){ appendLog('[config] 保存 Agent 配置失败'); }
+}
+
+async function saveSkillsConfigUI(){
+  try{
+    const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const disabled = [];
+    try {
+      const wrap = qs('skills-config');
+      if (wrap){
+        const boxes = wrap.querySelectorAll('input[type="checkbox"][data-skill-name]');
+        boxes.forEach((cb)=>{
+          const name = cb && cb.getAttribute && cb.getAttribute('data-skill-name');
+          if (!name) return;
+          if (!cb.checked) disabled.push(name);
+        });
+      }
+    } catch {}
+
+    const body = { agentId: aid, disabled };
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    const r = await fetch('/api/skills', { method:'POST', headers, body: JSON.stringify(body) });
+    let j = null;
+    try { j = await r.json(); } catch { j = null; }
+    const ok = r && r.ok && j && j.ok !== false;
+    const statusEl = qs('skills-status');
+    if (statusEl){ statusEl.textContent = ok ? '已保存' : '保存失败'; }
+    if (!ok){ appendLog('[skills] 保存技能配置失败'); return; }
+    try { if (currentId) renderLiveInfoFor(currentId); } catch {}
+    appendLog('[skills] 已保存技能配置');
+  } catch(e){ appendLog('[skills] 保存技能配置失败'); }
 }
 
 async function clearAgentConfigUI(){
@@ -1958,6 +2504,7 @@ try { qs('cfg-save-agent').addEventListener('click', ()=>{ saveAgentConfigUI().c
 try { qs('cfg-clear-agent').addEventListener('click', ()=>{ clearAgentConfigUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-run-doctor').addEventListener('click', ()=>{ runDoctorUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-support-bundle').addEventListener('click', ()=>{ createSupportBundleUI().catch(()=>{}) }) } catch {}
+try { qs('skills-save').addEventListener('click', ()=>{ saveSkillsConfigUI().catch(()=>{}) }) } catch {}
 
 // --- Sessions state ---
 const CKEY = 'arcana.currentSessionId';
@@ -2359,6 +2906,14 @@ function renderSessionList(items){
             try{ liveInfoBySession.delete(sid); } catch {}
             try{ typing.delete(sid); } catch {}
 
+            // Purge IndexedDB-backed heavy logs and tool panels
+            try{
+              if (isIndexedDbAvailable && isIndexedDbAvailable() && !__webuiIdbDisabled){
+                try{ webuiIdbDelete('toolPanel', sid).catch(()=>{}); } catch{}
+                try{ webuiIdbDelete('mainLogs', sid).catch(()=>{}); } catch{}
+              }
+            } catch{}
+
             // Purge persisted per-session data
             try{
               if (typeof localStorage !== 'undefined'){
@@ -2531,7 +3086,9 @@ async function openSession(id){
 function renderMessages(msgs){
   messages.innerHTML = '';
   for (const m of (msgs||[])){
+    if (!m) continue;
     const role = (m && m.role) ? m.role : '';
+    if (!__arcana_showToolMessages && (role === 'tool' || role === 'system')) continue;
     const rawText = (m && typeof m.text === 'string') ? m.text : '';
     if (role === 'assistant'){
       const isHb = rawText.startsWith('[heartbeat]');
@@ -2794,78 +3351,47 @@ try {
   const stopBtn = document.querySelector('#stop');
   if (stopBtn) stopBtn.addEventListener('click', async ()=>{
     try{
-      const mode = await ensureTransportReady();
-      if (mode === 'v2'){
-        const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-        const sessionKey = getGatewayV2SessionKeyForCurrent();
-        if (!sessionKey) return;
-        const token = getStoredApiToken();
-        const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
-        await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
-        return;
-      }
-      const sid = getCurrentSessionId(); if (!sid) return;
-      const aid = currentAgentId || DEFAULT_AGENT_ID;
-      const ws = (!hasAgents || !currentAgentId) ? String(currentWorkspace || '').trim() : '';
-      const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
+      await ensureTransportReady();
+      const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+      const sessionKey = getGatewayV2SessionKeyForCurrent();
+      if (!sessionKey) return;
       const token = getStoredApiToken();
       const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
-      await fetch('/api/abort', { method:'POST', headers, body: JSON.stringify({ sessionId: sid, agentId: aid, workspace: ws || undefined, policy }) });
+      await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
     } catch {}
   });
 } catch {}
 
-// SSE: single connection; filter UI updates by sessionId
+// Clear internal context button
+try {
+  const clearCtxBtn = document.querySelector('#clear-context');
+  if (clearCtxBtn) clearCtxBtn.addEventListener('click', async ()=>{
+    if (!confirm('清理 Agent 内部上下文？\n\n这将清除当前会话中 Agent 的工具调用记忆，\n但保留对话历史（prelude）。\n\n适用于话题转换、上下文过大等情况。')) return;
+    try{
+      await ensureTransportReady();
+      const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+      const sessionKey = getGatewayV2SessionKeyForCurrent();
+      if (!sessionKey) return;
+      const token = getStoredApiToken();
+      const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+      const resp = await fetch('/v2/clear-context', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
+      const result = await resp.json().catch(()=>({}));
+      if (result.ok){
+        clearCtxBtn.style.opacity = '1';
+        clearCtxBtn.style.color = '#07c160';
+        setTimeout(()=>{ clearCtxBtn.style.color = ''; clearCtxBtn.style.opacity = '0.5'; }, 1500);
+      }
+    } catch {}
+  });
+} catch {}
+
+// Gateway v2: ensure transport (WebSocket + runner)
 async function ensureTransportReady(){
   try{
-    if (gatewayV2Detected){
-    if (gatewayV2Enabled){
-      try { setupGatewayV2WebSocket(); } catch {}
-      try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
-      return 'v2';
-    }
-      try {
-        if (!window.__arcana_sse_initialized){
-          setupSseConnection();
-          try { window.__arcana_sse_initialized = true; } catch {}
-        }
-      } catch {}
-      return 'legacy';
-    }
-    if (gatewayV2ProbePromise){
-      try { return await gatewayV2ProbePromise; } catch { return 'legacy'; }
-    }
-    gatewayV2ProbePromise = (async ()=>{
-      let isV2 = false;
-      try{
-        const token = getStoredApiToken();
-        const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
-        const r = await fetch('/v2/health', headers ? { method:'GET', headers } : { method:'GET' });
-        if (r && r.ok){
-          let j = null;
-          try { j = await r.json(); } catch {}
-          if (j && j.ok && String(j.kind || '') === 'gateway-v2'){
-            isV2 = true;
-          }
-        }
-      } catch {}
-      gatewayV2Detected = true;
-      gatewayV2Enabled = isV2;
-      if (isV2){
-        try { setupGatewayV2WebSocket(); } catch {}
-        try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
-        return 'v2';
-      }
-      try {
-        if (!window.__arcana_sse_initialized){
-          setupSseConnection();
-          try { window.__arcana_sse_initialized = true; } catch {}
-        }
-      } catch {}
-      return 'legacy';
-    })();
-    try { return await gatewayV2ProbePromise; } catch { return 'legacy'; }
-  } catch { return 'legacy'; }
+    try { setupGatewayV2WebSocket(); } catch {}
+    try { ensureV2RunnerStarted().catch(()=>{}); } catch {}
+  } catch {}
+  return 'v2';
 }
 
 function setupGatewayV2WebSocket(){
@@ -2946,7 +3472,7 @@ function handleGatewayV2Envelope(payload){
           try{ requestRefreshList(); } catch{}
           return;
         }
-        const text = data && data.text ? String(data.text) : '';
+        const text = data && typeof data.text === 'string' ? data.text : '';
         let bubble = null;
         if (replyId && gatewayV2Pending.has(replyId)){
           bubble = gatewayV2Pending.get(replyId) || null;
@@ -2956,9 +3482,64 @@ function handleGatewayV2Envelope(payload){
           bubble = appendMessage('assistant', '');
         }
         setTyping(bubble, false);
-        if (text){
-          bubble.textContent = text;
+
+        const extracted = extractMediaFromAssistantText(text || '');
+        const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : (text || '');
+        const mediaRefsFromText = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+
+        const parts = ensureBubbleParts(bubble);
+        if (parts && parts.text){
+          parts.text.textContent = cleanText;
+        } else {
+          bubble.textContent = cleanText;
         }
+
+        if (parts && parts.media && mediaRefsFromText.length){
+          const mediaEl = parts.media;
+          const sidCurrent = String(msgSessionId || '');
+          const existingSrcs = new Set();
+          try{
+            if (mediaEl.querySelectorAll){
+              const imgs = mediaEl.querySelectorAll('img');
+              for (const img of imgs){
+                if (!img) continue;
+                try{
+                  if (img.src) existingSrcs.add(img.src);
+                } catch {}
+              }
+            }
+          } catch {}
+          for (const refRaw of mediaRefsFromText){
+            const ref = String(refRaw || '').trim();
+            if (!ref) continue;
+            const src = mediaRefToImgSrc(ref, sidCurrent);
+            let isDup = false;
+            try{
+              for (const existing of existingSrcs){
+                if (existing === src){
+                  isDup = true;
+                  break;
+                }
+                try{
+                  if (existing.includes(encodeURIComponent(ref))){
+                    isDup = true;
+                    break;
+                  }
+                } catch {}
+              }
+            } catch {}
+            if (isDup) continue;
+            const img = document.createElement('img');
+            img.src = src;
+            img.style.maxWidth = '100%';
+            img.style.borderRadius = '6px';
+            img.style.display = 'block';
+            img.style.marginTop = '8px';
+            mediaEl.appendChild(img);
+            try{ existingSrcs.add(img.src); } catch {}
+          }
+        }
+
         messages.scrollTop = messages.scrollHeight;
         return;
       }
@@ -3125,8 +3706,9 @@ function handleArcanaEvent(data){
         if (!data.sessionId) { return; }
         const targetId = data.sessionId || sid;
         try { if (data.sessionId) { typing.set(data.sessionId, true); try { requestRefreshList(); } catch {} } } catch {}
+        let snap = null;
         try {
-          const snap = ensureLiveForSession(targetId);
+          snap = ensureLiveForSession(targetId);
           if (snap){
             snap.usedThisTurn = new Set();
             snap.turns = (snap.turns || 0) + 1;
@@ -3134,36 +3716,17 @@ function handleArcanaEvent(data){
           try {
             const sid2 = String(targetId || '');
             if (sid2){
-              let prev = lastToolTurnBySession.get(sid2);
-              if (typeof prev !== 'number' || Number.isNaN(prev)) prev = -1;
-              const idx = prev + 1;
-              lastToolTurnBySession.set(sid2, idx);
-              const panel = getToolPanel(sid2);
-              if (panel){
-                if (!panel.turnStatus) panel.turnStatus = new Map();
-                panel.turnStatus.set(idx, 'running');
-                if (!panel.turnUsage) panel.turnUsage = new Map();
-                const start = (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : 0;
-                const ctx = (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
-                panel.turnUsage.set(idx, {
-                  startSessionTokens: start,
-                  lastSessionTokens: start,
-                  lastContextTokens: ctx,
-                  turnTokens: 0,
-                  toolTokens: 0,
-                  llmTokens: 0,
-                });
-                try{ scheduleSaveToolPanel(sid2); } catch {}
-              }
+              ensureTurnOpenForSession(sid2, snap);
             }
           } catch {}
         } catch {}
         logMain(sid, 'turn start');
         try {
           const sid3 = String(targetId || "");
-          let idx2 = Number(lastToolTurnBySession.get(sid3));
-          if (!Number.isFinite(idx2)) idx2 = 0;
-          upsertLlmAction(sid3, idx2, { status: "running", argsSummary: "Generating…" });
+          if (sid3){
+            const idx2 = ensureTurnOpenForSession(sid3, snap);
+            upsertLlmAction(sid3, idx2, { status: "running", argsSummary: "Generating…" });
+          }
         } catch {}
 
         if (targetId === currentId){
@@ -3250,13 +3813,18 @@ function handleArcanaEvent(data){
 
       if (data.type === 'tool_execution_start'){
         const targetId = data.sessionId || sid;
+        let info = null;
         try {
-          const info = ensureLiveForSession(targetId);
+          info = ensureLiveForSession(targetId);
           if (info && data.toolName){
             if (!info.usedThisTurn || !(info.usedThisTurn instanceof Set)) info.usedThisTurn = new Set();
             info.usedThisTurn.add(String(data.toolName));
           }
           if (targetId === currentId){ renderLiveInfoFor(targetId); }
+        } catch {}
+        try {
+          const sid2 = String(targetId || '');
+          if (sid2){ ensureTurnOpenForSession(sid2, info); }
         } catch {}
         try { upsertToolAction(data); } catch {}
         const summary = summarizeArgs(data.args || {});
@@ -3356,8 +3924,8 @@ function handleArcanaEvent(data){
           const target = data.sessionId || sid;
           const ss = String(target || "");
           if (ss){
-            let ti = Number(lastToolTurnBySession.get(ss));
-            if (!Number.isFinite(ti)) ti = 0;
+            const snap = ensureLiveForSession(ss);
+            const ti = ensureTurnOpenForSession(ss, snap);
             upsertLlmAction(ss, ti, { appendLog: "thinking start" });
           }
         } catch {}
@@ -3377,8 +3945,8 @@ function handleArcanaEvent(data){
           const target = data.sessionId || sid;
           const ss = String(target || "");
           if (ss){
-            let ti = Number(lastToolTurnBySession.get(ss));
-            if (!Number.isFinite(ti)) ti = 0;
+            const snap = ensureLiveForSession(ss);
+            const ti = ensureTurnOpenForSession(ss, snap);
             const n = (typeof data.chars === "number" && data.chars >= 0) ? data.chars : 0;
             upsertLlmAction(ss, ti, { appendLog: "thinking +" + n + " chars" });
           }
@@ -3392,8 +3960,8 @@ function handleArcanaEvent(data){
           const target = data.sessionId || sid;
           const ss = String(target || "");
           if (ss){
-            let ti = Number(lastToolTurnBySession.get(ss));
-            if (!Number.isFinite(ti)) ti = 0;
+            const snap = ensureLiveForSession(ss);
+            const ti = ensureTurnOpenForSession(ss, snap);
             const n = (typeof data.chars === "number") ? (data.chars||0) : 0;
             const ms = (typeof data.tookMs === "number") ? (data.tookMs||0) : undefined;
             const line = "thinking end: " + n + " chars" + (typeof ms === "number" ? ", " + ms + " ms" : "");
@@ -3414,6 +3982,28 @@ function handleArcanaEvent(data){
       }
 
       if (data.type === 'skills_refresh'){ try { LI.skillsHint = '技能已刷新'; } catch {} return }
+      // Per-LLM-call usage: update the current Turn's LLM card with single-call tokens
+      if (data.type === 'llm_call_usage'){
+        try {
+          const targetId = data.sessionId || sid;
+          const sid2 = String(targetId || '');
+          if (sid2){
+            const idx = lastToolTurnBySession.get(sid2);
+            if (typeof idx === 'number' && !Number.isNaN(idx)){
+              const ctxVal = (typeof data.contextTokens === 'number' && data.contextTokens > 0) ? data.contextTokens : null;
+              const tokVal = (typeof data.totalTokens === 'number' && data.totalTokens > 0) ? data.totalTokens : null;
+              if (ctxVal !== null || tokVal !== null){
+                const update = {};
+                if (ctxVal !== null) update.ctxTokens = ctxVal;
+                if (tokVal !== null) update.tokTokens = tokVal;
+                try { upsertLlmAction(sid2, idx, update); } catch {}
+              }
+            }
+          }
+        } catch {}
+        return;
+      }
+
       if (data.type === 'llm_usage'){
         const targetId = data.sessionId || sid;
         try {
@@ -3424,41 +4014,65 @@ function handleArcanaEvent(data){
           }
           const sid2 = String(targetId || '');
           if (sid2){
-            const idx = lastToolTurnBySession.get(sid2);
-            if (typeof idx === 'number' && !Number.isNaN(idx)){
-              const panel = getToolPanel(sid2);
-              if (panel){
-                if (!panel.turnUsage) panel.turnUsage = new Map();
-                const existing = panel.turnUsage.get(idx) || {};
-                let start = 0;
-                if (typeof existing.startSessionTokens === 'number' && existing.startSessionTokens >= 0){
-                  start = existing.startSessionTokens;
-                } else if (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0){
-                  start = snap.sessionTokens;
-                }
-                const lastSessionTokens = (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : start;
-                const lastContextTokens = (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
-                const add = (typeof data.totalTokens === 'number' && data.totalTokens > 0) ? Number(data.totalTokens) || 0 : 0;
-                const curTurn = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
-                const curTool = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
-                const curLlm = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
-                const nextLlm = curLlm + add;
-                const nextTurn = curTurn + add;
-                panel.turnUsage.set(idx, {
-                  startSessionTokens: start,
-                  lastSessionTokens,
-                  lastContextTokens,
-                  turnTokens: nextTurn,
-                  toolTokens: curTool,
-                  llmTokens: nextLlm,
+            const idx = ensureTurnOpenForSession(sid2, snap);
+            // Use per-call values for LLM card display (not cumulative)
+            const ctxForCard = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens > 0)
+              ? data.lastCallContextTokens
+              : (typeof data.contextTokens === 'number' && data.contextTokens >= 0) ? (Number(data.contextTokens) || 0) : null;
+            const tokForCard = (typeof data.lastCallTotalTokens === 'number' && data.lastCallTotalTokens > 0)
+              ? data.lastCallTotalTokens
+              : (typeof data.totalTokens === 'number' && data.totalTokens >= 0) ? (Number(data.totalTokens) || 0) : null;
+            if (ctxForCard !== null || tokForCard !== null){
+              const update = {};
+              if (ctxForCard !== null) update.ctxTokens = ctxForCard;
+              if (tokForCard !== null) update.tokTokens = tokForCard;
+              try { upsertLlmAction(sid2, idx, update); } catch {}
+            }
+            const panel = getToolPanel(sid2);
+            if (panel){
+              if (!panel.turnUsage) panel.turnUsage = new Map();
+              const existing = panel.turnUsage.get(idx) || {};
+              let start = 0;
+              if (typeof existing.startSessionTokens === 'number' && existing.startSessionTokens >= 0){
+                start = existing.startSessionTokens;
+              } else if (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0){
+                start = snap.sessionTokens;
+              }
+              const lastSessionTokens = (snap && typeof snap.sessionTokens === 'number' && snap.sessionTokens >= 0) ? snap.sessionTokens : start;
+              const lastContextTokens = (snap && typeof snap.contextTokens === 'number' && snap.contextTokens >= 0) ? snap.contextTokens : 0;
+              // Use per-call value for this turn's usage (not cumulative)
+              const add = (typeof data.lastCallTotalTokens === 'number' && data.lastCallTotalTokens > 0)
+                ? Number(data.lastCallTotalTokens) || 0
+                : (typeof data.totalTokens === 'number' && data.totalTokens > 0) ? Number(data.totalTokens) || 0 : 0;
+              const curTurn = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
+              const curTool = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
+              const curLlm = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
+              const nextLlm = curLlm + add;
+              const nextTurn = curTurn + add;
+              panel.turnUsage.set(idx, {
+                startSessionTokens: start,
+                lastSessionTokens,
+                lastContextTokens,
+                turnTokens: nextTurn,
+                toolTokens: curTool,
+                llmTokens: nextLlm,
+              });
+              const ctxForTools = (typeof data.contextTokens === 'number' && data.contextTokens >= 0) ? (Number(data.contextTokens) || 0) : null;
+              if (ctxForTools !== null && panel.actions && typeof panel.actions.forEach === 'function'){
+                panel.actions.forEach((action)=>{
+                  if (!action) return;
+                  if (typeof action.turnIndex !== 'number' || Number.isNaN(action.turnIndex)) return;
+                  if (action.turnIndex !== idx) return;
+                  if (typeof action.ctxTokens === 'number' && action.ctxTokens > 0) return;
+                  action.ctxTokens = ctxForTools;
                 });
-                try{ scheduleSaveToolPanel(sid2); } catch {}
-                if (sid2 === getCurrentSessionId()){
-                  if (activeLogTab === 'tools'){
-                    renderToolsPanel(sid2);
-                  } else if (activeLogTab === 'details'){
-                    renderToolDetails(sid2);
-                  }
+              }
+              try{ scheduleSaveToolPanel(sid2); } catch {}
+              if (sid2 === getCurrentSessionId()){
+                if (activeLogTab === 'tools'){
+                  renderToolsPanel(sid2);
+                } else if (activeLogTab === 'details'){
+                  renderToolDetails(sid2);
                 }
               }
             }
@@ -3500,9 +4114,12 @@ function handleArcanaEvent(data){
         const mediaRefsFromText = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
         try {
           const txt = typeof cleanText === "string" ? cleanText : "";
-          let ti = Number(lastToolTurnBySession.get(String(sid2)));
-          if (!Number.isFinite(ti)) ti = 0;
-          upsertLlmAction(String(sid2), ti, { argsSummary: "Output: " + txt.length + " chars" });
+          const sessId = String(sid2 || '');
+          if (sessId){
+            const snap = ensureLiveForSession(sessId);
+            const ti = ensureTurnOpenForSession(sessId, snap);
+            upsertLlmAction(sessId, ti, { argsSummary: "Output: " + txt.length + " chars" });
+          }
         } catch {}
 
         if (!activeAssistant) activeAssistant = appendMessage('assistant','');
@@ -3553,17 +4170,66 @@ function handleArcanaEvent(data){
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
+        const refRaw = (data && typeof data.url === 'string') ? data.url : '';
+        const ref = String(refRaw || '').trim();
+        if (!ref){
+          return;
+        }
         if (!activeAssistant) activeAssistant = appendMessage('assistant','');
         setTyping(activeAssistant, false);
         const parts = ensureBubbleParts(activeAssistant);
-        const img = document.createElement('img');
-        img.src = data.url;
-        img.style.maxWidth = '100%';
-        img.style.borderRadius = '6px';
-        img.style.display = 'block';
-        img.style.marginTop = '8px';
-        if (parts && parts.media) parts.media.appendChild(img);
-        else activeAssistant.appendChild(img);
+        const container = (parts && parts.media) ? parts.media : activeAssistant;
+        const src = mediaRefToImgSrc(ref, sid2);
+        let updatedExisting = false;
+        try{
+          if (container && container.querySelectorAll){
+            const imgs = container.querySelectorAll('img');
+            for (const img of imgs){
+              if (!img) continue;
+              let rawAttr = '';
+              try{
+                if (img.getAttribute) rawAttr = String(img.getAttribute('src') || '');
+              } catch {}
+              if (rawAttr && rawAttr === ref){
+                img.src = src;
+                updatedExisting = true;
+                break;
+              }
+              try{
+                if (!rawAttr && img.src === src){
+                  updatedExisting = true;
+                  break;
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+        if (!updatedExisting && container){
+          let isDup = false;
+          try{
+            if (container.querySelectorAll){
+              const imgs2 = container.querySelectorAll('img');
+              for (const img of imgs2){
+                if (!img) continue;
+                try{
+                  if (img.src === src){
+                    isDup = true;
+                    break;
+                  }
+                } catch {}
+              }
+            }
+          } catch {}
+          if (!isDup){
+            const img = document.createElement('img');
+            img.src = src;
+            img.style.maxWidth = '100%';
+            img.style.borderRadius = '6px';
+            img.style.display = 'block';
+            img.style.marginTop = '8px';
+            if (container.appendChild) container.appendChild(img);
+          }
+        }
         messages.scrollTop = messages.scrollHeight;
         try { if (currentId) markSessionSeen(currentId); } catch {}
         return;
@@ -3756,9 +4422,7 @@ function liSet(id, text){ const el=document.getElementById(id); if (el) el.textC
 function renderLiveInfo(){
   liSet('li-model', LI.model || '—');
   liSet('li-workspace', LI.workspace || '—');
-  liSet('li-tools', (LI.tools && LI.tools.length) ? LI.tools.join(', ') : '—');
   liSet('li-tools-used', (LI.usedThisTurn && LI.usedThisTurn.size) ? Array.from(LI.usedThisTurn).join(', ') : '—');
-  liSet('li-skills', (LI.skills && LI.skills.length) ? LI.skills.join(', ') : '—');
   liSet('li-session-tokens', (typeof LI.sessionTokens === 'number' && LI.sessionTokens >= 0) ? String(LI.sessionTokens) : '—');
 }
 
@@ -4087,6 +4751,8 @@ function upsertLlmAction(sessionId, turnIndex, update){
         endedAt: "",
         sessionId: sid,
         turnIndex: idx,
+        ctxTokens: (update && typeof update.ctxTokens === 'number' && update.ctxTokens >= 0) ? Number(update.ctxTokens) || 0 : undefined,
+        tokTokens: (update && typeof update.tokTokens === 'number' && update.tokTokens >= 0) ? Number(update.tokTokens) || 0 : undefined,
         log: "",
       };
       panel.actions.set(id, a);
@@ -4097,6 +4763,8 @@ function upsertLlmAction(sessionId, turnIndex, update){
       if (update.status){ a.status = String(update.status); }
       if (typeof update.argsSummary !== "undefined"){ a.argsSummary = String(update.argsSummary || ""); }
       if (update.setEndedAt){ a.endedAt = ts; }
+      if (typeof update.ctxTokens === "number" && update.ctxTokens >= 0){ a.ctxTokens = Number(update.ctxTokens) || 0; }
+      if (typeof update.tokTokens === "number" && update.tokTokens >= 0){ a.tokTokens = Number(update.tokTokens) || 0; }
       if (typeof update.appendLog === "string" && update.appendLog){
         a.log = a.log ? (a.log + "\n" + update.appendLog) : update.appendLog;
       }
@@ -4114,4 +4782,42 @@ function upsertLlmAction(sessionId, turnIndex, update){
     }
     return a;
   } catch { return null }
+}
+
+function persistToolPanelToLocalStorage(sessionId, payload){
+  try{
+    const sid = String(sessionId || '');
+    if (!sid) return;
+    try{ if (typeof localStorage === 'undefined') return; } catch { return; }
+    let root = {};
+    try{
+      const raw = localStorage.getItem(TOOL_PANELS_KEY);
+      if (raw){
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') root = parsed;
+      }
+    } catch {}
+    if (!root || typeof root !== 'object') root = {};
+    root[sid] = payload;
+    try{ localStorage.setItem(TOOL_PANELS_KEY, JSON.stringify(root)); } catch(e){ try{ warnStorageQuota(); } catch{} }
+  } catch {}
+}
+
+function persistMainLogsToLocalStorage(sessionId, lines){
+  try{
+    const sid = String(sessionId || '');
+    if (!sid) return;
+    try{ if (typeof localStorage === 'undefined') return; } catch { return; }
+    let root = {};
+    try{
+      const raw = localStorage.getItem(MAIN_LOGS_KEY);
+      if (raw){
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') root = parsed;
+      }
+    } catch {}
+    if (!root || typeof root !== 'object') root = {};
+    root[sid] = Array.isArray(lines) ? lines : [];
+    try{ localStorage.setItem(MAIN_LOGS_KEY, JSON.stringify(root)); } catch(e){ try{ warnStorageQuota(); } catch{} }
+  } catch {}
 }

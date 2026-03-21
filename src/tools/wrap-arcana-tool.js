@@ -8,6 +8,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { createSafeOps } from './safe-ops.js';
+import { getContext } from '../event-bus.js';
 import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
 
 function readSkillToolOverrides(skillDir, toolName){
@@ -52,8 +53,11 @@ export function wrapArcanaTool(factory, opts={}){
     description: ov.description || base.description,
     async execute(callId, args, signal, onUpdate, ctx){
       const safeOps = createSafeOps(mergedSafety);
+      // Merge AsyncLocalStorage context with provided ctx; explicit ctx wins.
+      const alsCtx = (typeof getContext === 'function' ? (getContext() || null) : null);
+      const mergedCtx = { ...(alsCtx || {}), ...(ctx || {}) };
       // Provide SafeOps to tool via ctx.safeOps
-      const ctxWithOps = { ...(ctx||{}), safeOps };
+      const ctxWithOps = { ...mergedCtx, safeOps };
       return base.execute(callId, args, signal, onUpdate, ctxWithOps);
     }
   };

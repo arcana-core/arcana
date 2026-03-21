@@ -220,6 +220,23 @@ export class ProfileManager {
     }
     if (!context) throw new Error("no_browser_context");
     const page = await context.newPage();
+    try {
+      var viewportSpec = String(process.env["ARCANA_BROWSER_VIEWPORT"] || "").trim();
+      var width = 1280;
+      var height = 720;
+      if (viewportSpec) {
+        var m = viewportSpec.match(/^([0-9]+)x([0-9]+)$/i);
+        if (m) {
+          var w = parseInt(m[1], 10);
+          var h = parseInt(m[2], 10);
+          if (w > 0 && h > 0) {
+            width = w;
+            height = h;
+          }
+        }
+      }
+      try { page.setViewportSize({ width: width, height: height }); } catch {}
+    } catch {}
     entry.page = page;
     try { page.setDefaultTimeout(30000); } catch {}
     try {

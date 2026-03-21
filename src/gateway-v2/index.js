@@ -27,9 +27,10 @@ import { createOutbox } from './runtime/outbox.js';
 import { createPolicyEngine } from './runtime/policy.js';
 import { createEngine } from './runtime/engine.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../arcana-home.js';
-import { runChatMessage, abortChat } from './chat-runtime.js';
+import { runChatMessage, abortChat, clearChatContext } from './chat-runtime.js';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed } from '../workspace-guard.js';
 import { loadArcanaConfig, loadAgentConfig } from '../config.js';
+import { loadArcanaSkills } from '../skills.js';
 import {
   createSession as ssCreate,
   listSessions as ssList,
@@ -45,6 +46,8 @@ import { readToolOutputBundle } from '../tool-output-store.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WEB_ROOT = resolvePath(__dirname, "..", "..", "web");
+const PKG_ROOT = resolvePath(__dirname, "..", "..");
+const REPO_ROOT = dirname(PKG_ROOT);
 let apiToken = "";
 
 const DEFAULT_AGENT_ID = 'default';
@@ -69,10 +72,60 @@ function sanitizeConfig(cfg){
     path: cfg.path || '',
   };
   out.has_key = !!cfg.key || !!cfg.api_key || !!cfg.apiKey;
+  // Non-secret history compression fields — expose if present
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_enabled')) {
+      out.history_compression_enabled = cfg.history_compression_enabled;
+    }
+  } catch {}
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_threshold_tokens')) {
+      out.history_compression_threshold_tokens = cfg.history_compression_threshold_tokens;
+    }
+  } catch {}
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_keep_user_turns')) {
+      out.history_compression_keep_user_turns = cfg.history_compression_keep_user_turns;
+    }
+  } catch {}
   delete out.key;
   delete out.api_key;
   delete out.apiKey;
   return out;
+}
+
+function applyStringConfigField(target, body, fieldName, options){
+  try {
+    if (!target || typeof target !== 'object') return;
+    if (!body || typeof body !== 'object') return;
+    const opts = options || {};
+    const allowDeleteOnEmpty = !!opts.allowDeleteOnEmpty;
+    if (!Object.prototype.hasOwnProperty.call(body, fieldName)) return;
+    const value = String(body[fieldName] || '').trim();
+    if (value){
+      target[fieldName] = value;
+    } else if (allowDeleteOnEmpty){
+      try { delete target[fieldName]; } catch {}
+    }
+  } catch {}
+}
+
+function mergeAgentConfigForGateway(globalCfg, agentCfg){
+  const base = (globalCfg && typeof globalCfg === 'object') ? { ...globalCfg } : {};
+  const agent = (agentCfg && typeof agentCfg === 'object') ? agentCfg : null;
+  if (agent){
+    for (const [k, vRaw] of Object.entries(agent)){
+      if (k === 'path') continue;
+      const v = vRaw;
+      if (v == null) continue;
+      if (typeof v === 'string'){
+        if (v.trim() === '') continue;
+      }
+      base[k] = v;
+    }
+    if (agent.path) base.path = agent.path;
+  }
+  return base;
 }
 
 function nowIso(){
@@ -121,9 +174,9 @@ async function refreshGatewayServerInfo(){
   } catch (e) {
     try { logError('[arcana:gateway-v2] server info refresh failed', e); } catch {}
   }
-}
+	}
 
-function buildServerInfoEvent(){
+	function buildServerInfoEvent(){
   const info = gatewayServerInfo;
   if (!info) return null;
   return {
@@ -373,6 +426,81 @@ export async function startGatewayV2({ port } = {}) {
         const t = ev.type ? String(ev.type) : '';
         if (!t) return;
 
+
+        if (t === 'llm_usage'){
+          try {
+            const data = (ev && typeof ev.data === 'object' && ev.data) ? ev.data : {};
+
+            let contextTokens = Number(
+              data.contextTokens ?? data.context_tokens ?? ev.contextTokens ?? ev.context_tokens ?? 0,
+            ) || 0;
+            let outputTokens = Number(
+              data.outputTokens ?? data.output_tokens ?? ev.outputTokens ?? ev.output_tokens ?? 0,
+            ) || 0;
+            let totalTokens = Number(
+              data.totalTokens ?? data.total_tokens ?? ev.totalTokens ?? ev.total_tokens ?? 0,
+            ) || 0;
+            let sessionTokens = Number(
+              data.sessionTokens ?? data.session_tokens ?? ev.sessionTokens ?? ev.session_tokens ?? 0,
+            ) || 0;
+
+            if (!totalTokens && (contextTokens || outputTokens)){
+              totalTokens = contextTokens + outputTokens;
+            }
+
+            if (contextTokens > 0 || outputTokens > 0 || totalTokens > 0 || sessionTokens > 0){
+              const agentIdRaw = ev.agentId;
+              const agentId = agentIdRaw != null && String(agentIdRaw).trim() ? String(agentIdRaw) : 'default';
+              const sessionKeyRaw = (ev.sessionKey != null ? ev.sessionKey : (ev.sessionId != null ? ev.sessionId : 'session'));
+              const sessionKey = String(sessionKeyRaw || 'session');
+              const sessionId = (data.sessionId != null ? String(data.sessionId) : (ev.sessionId != null ? String(ev.sessionId) : null));
+              const tsMsRaw = ev.tsMs != null ? ev.tsMs : ev.ts;
+              const tsNum = Number(tsMsRaw);
+              const tsMs = (Number.isFinite(tsNum) && tsNum > 0) ? tsNum : nowMs();
+              let model = '';
+              try {
+                if (Object.prototype.hasOwnProperty.call(data, 'model') && data.model != null){
+                  model = String(data.model);
+                } else if (Object.prototype.hasOwnProperty.call(ev, 'model') && ev.model != null){
+                  model = String(ev.model);
+                }
+              } catch {}
+
+              void eventStore.appendEvent({
+                agentId,
+                sessionKey,
+                type: 'llm_usage',
+                source: 'chat',
+                tsMs,
+                data: {
+                  sessionId,
+                  contextTokens,
+                  outputTokens,
+                  totalTokens,
+                  sessionTokens,
+                  model: model || undefined,
+                },
+              }).catch(() => {});
+
+              const normalizedEv = {
+                type: 'llm_usage',
+                agentId,
+                sessionKey,
+                sessionId,
+                contextTokens,
+                outputTokens,
+                totalTokens,
+                sessionTokens,
+              };
+              if (model) normalizedEv.model = model;
+              if (tsMs) normalizedEv.tsMs = tsMs;
+
+              wsHub.broadcast(normalizedEv);
+              return;
+            }
+          } catch {}
+        }
+
         if (t === 'thinking_start' || t === 'thinking_delta' || t === 'thinking_end') {
           const rawSessionId = (ev.sessionId != null ? ev.sessionId : (ev.session_id != null ? ev.session_id : undefined));
           const sessionId = rawSessionId != null ? String(rawSessionId) : '';
@@ -576,6 +704,19 @@ export async function startGatewayV2({ port } = {}) {
           scheduler.requestWake({ agentId, sessionKey, priority, reason, delayMs });
         } catch {}
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === 'POST' && u.pathname === '/v2/clear-context'){
+        const body = await readBodyJson(req).catch(() => null);
+        const agentId = body && body.agentId ? String(body.agentId) : 'default';
+        const sessionKey = body && body.sessionKey ? String(body.sessionKey) : 'session';
+        try {
+          const result = await clearChatContext({ agentId, sessionKey });
+          sendJson(res, 200, result);
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+        }
         return;
       }
 
@@ -1184,13 +1325,6 @@ export async function startGatewayV2({ port } = {}) {
             sendJson(res, 400, { error: 'invalid_json', message: 'Request body must be valid JSON' });
             return;
           }
-          const provider = String(body.provider || '').trim();
-          const modelId = String(body.model || '').trim();
-          const baseUrl = String(body.base_url || '').trim();
-          const key = String(body.key || '').trim();
-          const cfgObj = { provider, model: modelId, base_url: baseUrl };
-          if (key) cfgObj.key = key;
-
           const envCfg = String(process.env.ARCANA_CONFIG || '').trim();
           let pathCfg = '';
           if (envCfg) pathCfg = envCfg;
@@ -1198,7 +1332,63 @@ export async function startGatewayV2({ port } = {}) {
             ensureArcanaHomeDir();
             pathCfg = arcanaHomePath('config.json');
           }
-          await fsp.writeFile(pathCfg, JSON.stringify(cfgObj, null, 2), 'utf-8');
+
+          let nextCfg = {};
+          try {
+            if (existsSync(pathCfg)){
+              const rawExisting = readFileSync(pathCfg, 'utf-8');
+              const parsed = JSON.parse(rawExisting);
+              if (parsed && typeof parsed === 'object') nextCfg = parsed;
+            }
+          } catch {}
+
+          // provider/model/base_url: if present and empty, delete; if present and non-empty, set.
+          applyStringConfigField(nextCfg, body, 'provider', { allowDeleteOnEmpty: true });
+          applyStringConfigField(nextCfg, body, 'model', { allowDeleteOnEmpty: true });
+          applyStringConfigField(nextCfg, body, 'base_url', { allowDeleteOnEmpty: true });
+
+          // key: keep existing behavior (only set when non-empty; never delete on empty).
+          applyStringConfigField(nextCfg, body, 'key', { allowDeleteOnEmpty: false });
+
+          // Optional history compression settings (non-secret)
+          try {
+            if (Object.prototype.hasOwnProperty.call(body, 'history_compression_enabled')) {
+              const enabledRaw = body.history_compression_enabled;
+              let enabledVal;
+              if (typeof enabledRaw === 'boolean') {
+                enabledVal = enabledRaw;
+              } else if (enabledRaw != null) {
+                const s = String(enabledRaw).trim().toLowerCase();
+                if (s) {
+                  if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') enabledVal = false;
+                  else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') enabledVal = true;
+                }
+              }
+              if (typeof enabledVal === 'boolean') nextCfg.history_compression_enabled = enabledVal;
+            }
+          } catch {}
+
+          try {
+            if (Object.prototype.hasOwnProperty.call(body, 'history_compression_threshold_tokens')) {
+              const raw = body.history_compression_threshold_tokens;
+              const num = Number(raw);
+              if (Number.isFinite(num) && num > 0) {
+                nextCfg.history_compression_threshold_tokens = Math.floor(num);
+              }
+            }
+          } catch {}
+
+          try {
+            if (Object.prototype.hasOwnProperty.call(body, 'history_compression_keep_user_turns')) {
+              const raw = body.history_compression_keep_user_turns;
+              const num = Number(raw);
+              if (Number.isFinite(num) && num > 0) {
+                nextCfg.history_compression_keep_user_turns = Math.floor(num);
+              }
+            }
+          } catch {}
+
+          await fsp.writeFile(pathCfg, JSON.stringify(nextCfg, null, 2), 'utf-8');
 
           // Refresh cached server_info so the UI sees updated model/base_url.
           try {
@@ -1223,11 +1413,12 @@ export async function startGatewayV2({ port } = {}) {
           const meta = findAgentMetaGateway(agentId) || (agentId === DEFAULT_AGENT_ID ? ensureDefaultAgentExistsGateway() : null);
           const baseHome = meta && (meta.agentHomeDir || meta.agentDir) ? (meta.agentHomeDir || meta.agentDir) : arcanaHomePath('agents', agentId);
           const agentHomeDir = baseHome || arcanaHomePath('agents', agentId);
-          const rawCfg = loadAgentConfig(agentHomeDir);
+          const globalCfg = loadArcanaConfig();
+          const rawAgentCfg = loadAgentConfig(agentHomeDir);
+          const mergedCfg = mergeAgentConfigForGateway(globalCfg, rawAgentCfg);
           const cfgPath = join(agentHomeDir, 'config.json');
-          const merged = rawCfg ? { ...rawCfg } : { path: cfgPath };
-          if (!merged.path) merged.path = cfgPath;
-          const out = sanitizeConfig(merged) || { provider: '', base_url: '', model: '', path: cfgPath, has_key: false };
+          if (!mergedCfg.path) mergedCfg.path = cfgPath;
+          const out = sanitizeConfig(mergedCfg) || { provider: '', base_url: '', model: '', path: cfgPath, has_key: false };
           sendJson(res, 200, out);
         } catch {
           sendJson(res, 200, {});
@@ -1258,16 +1449,66 @@ export async function startGatewayV2({ port } = {}) {
           if (shouldClear){
             try { await fsp.unlink(cfgPath); } catch {}
           } else {
-            const provider = String(body.provider || '').trim();
-            const modelId = String(body.model || '').trim();
-            const baseUrl = String(body.base_url || '').trim();
-            const key = String(body.key || '').trim();
-            const cfgObj = { provider, model: modelId, base_url: baseUrl };
-            if (key) cfgObj.key = key;
             const baseDir = String(agentHomeDir || '').trim();
             if (baseDir){
               try { mkdirSync(baseDir, { recursive: true }); } catch {}
-              await fsp.writeFile(cfgPath, JSON.stringify(cfgObj, null, 2), 'utf-8');
+
+              let nextCfg = {};
+              try {
+                if (existsSync(cfgPath)){
+                  const rawExisting = readFileSync(cfgPath, 'utf-8');
+                  const parsed = JSON.parse(rawExisting);
+                  if (parsed && typeof parsed === 'object') nextCfg = parsed;
+                }
+              } catch {}
+
+              // provider/model/base_url: if present and empty, delete; if present and non-empty, set.
+              applyStringConfigField(nextCfg, body, 'provider', { allowDeleteOnEmpty: true });
+              applyStringConfigField(nextCfg, body, 'model', { allowDeleteOnEmpty: true });
+              applyStringConfigField(nextCfg, body, 'base_url', { allowDeleteOnEmpty: true });
+
+              // key: keep existing behavior (only set when non-empty; never delete on empty).
+              applyStringConfigField(nextCfg, body, 'key', { allowDeleteOnEmpty: false });
+
+              // Optional history compression settings (non-secret)
+              try {
+                if (Object.prototype.hasOwnProperty.call(body, 'history_compression_enabled')) {
+                  const enabledRaw = body.history_compression_enabled;
+                  let enabledVal;
+                  if (typeof enabledRaw === 'boolean') {
+                    enabledVal = enabledRaw;
+                  } else if (enabledRaw != null) {
+                    const s = String(enabledRaw).trim().toLowerCase();
+                    if (s) {
+                      if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') enabledVal = false;
+                      else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') enabledVal = true;
+                    }
+                  }
+                  if (typeof enabledVal === 'boolean') nextCfg.history_compression_enabled = enabledVal;
+                }
+              } catch {}
+
+              try {
+                if (Object.prototype.hasOwnProperty.call(body, 'history_compression_threshold_tokens')) {
+                  const raw = body.history_compression_threshold_tokens;
+                  const num = Number(raw);
+                  if (Number.isFinite(num) && num > 0) {
+                    nextCfg.history_compression_threshold_tokens = Math.floor(num);
+                  }
+                }
+              } catch {}
+
+              try {
+                if (Object.prototype.hasOwnProperty.call(body, 'history_compression_keep_user_turns')) {
+                  const raw = body.history_compression_keep_user_turns;
+                  const num = Number(raw);
+                  if (Number.isFinite(num) && num > 0) {
+                    nextCfg.history_compression_keep_user_turns = Math.floor(num);
+                  }
+                }
+              } catch {}
+
+              await fsp.writeFile(cfgPath, JSON.stringify(nextCfg, null, 2), 'utf-8');
             }
           }
 
@@ -1283,6 +1524,143 @@ export async function startGatewayV2({ port } = {}) {
           sendJson(res, 200, { ok: true });
         } catch (e) {
           sendJson(res, 400, { error: 'agent_config_write_failed', message: e && e.message ? String(e.message) : String(e || '') });
+        }
+        return;
+      }
+
+      if (method === 'GET' && u.pathname === '/api/skills'){
+        try {
+          const agentIdParam = String(u.searchParams.get('agentId') || '').trim();
+          const agentId = agentIdParam || DEFAULT_AGENT_ID;
+          const meta = findAgentMetaGateway(agentId) || (agentId === DEFAULT_AGENT_ID ? ensureDefaultAgentExistsGateway() : null);
+          const baseHome = meta && (meta.agentHomeDir || meta.agentDir) ? (meta.agentHomeDir || meta.agentDir) : arcanaHomePath('agents', agentId);
+          const agentHomeDir = baseHome || arcanaHomePath('agents', agentId);
+          const globalCfg = loadArcanaConfig();
+          const agentCfg = loadAgentConfig(agentHomeDir);
+          const mergedCfg = mergeAgentConfigForGateway(globalCfg, agentCfg);
+
+          let ws = '';
+          try {
+            if (meta && meta.workspaceRoot) ws = String(meta.workspaceRoot || '');
+          } catch {}
+          if (!ws){
+            try { ws = resolveWorkspaceRoot(); } catch { ws = process.cwd(); }
+          }
+
+          let skills = [];
+          try {
+            skills = loadArcanaSkills({ workspaceRoot: ws, agentHomeRoot: agentHomeDir, cfg: mergedCfg, pkgRoot: PKG_ROOT, repoRoot: REPO_ROOT }) || [];
+          } catch {}
+
+          const outSkills = [];
+          for (const s of skills){
+            try {
+              const name = String(s && s.name || '').trim();
+              if (!name) continue;
+              const item = { name };
+              try {
+                if (s && s.filePath){
+                  item.filePath = String(s.filePath || '');
+                }
+              } catch {}
+              outSkills.push(item);
+            } catch {}
+          }
+
+          const disabledArr = agentCfg && agentCfg.skills && Array.isArray(agentCfg.skills.disabled) ? agentCfg.skills.disabled : [];
+          const disabled = [];
+          try {
+            const seen = new Set();
+            for (const raw of disabledArr || []){
+              if (typeof raw !== 'string') continue;
+              const n = raw.trim();
+              if (!n || seen.has(n)) continue;
+              seen.add(n);
+              disabled.push(n);
+            }
+          } catch {}
+
+          sendJson(res, 200, { ok: true, skills: outSkills, disabled });
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: 'skills_list_failed', message: e && e.message ? String(e.message) : String(e || '') });
+        }
+        return;
+      }
+
+      if (method === 'POST' && u.pathname === '/api/skills'){
+        try {
+          const body = await readBodyJson(req).catch(() => null);
+          if (!body || typeof body !== 'object'){
+            sendJson(res, 400, { ok: false, error: 'invalid_json' });
+            return;
+          }
+          let agentId = '';
+          try {
+            if (Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null){
+              agentId = String(body.agentId || '').trim();
+            }
+          } catch {}
+          if (!agentId) agentId = DEFAULT_AGENT_ID;
+          const meta = findAgentMetaGateway(agentId) || (agentId === DEFAULT_AGENT_ID ? ensureDefaultAgentExistsGateway() : null);
+          const baseHome = meta && (meta.agentHomeDir || meta.agentDir) ? (meta.agentHomeDir || meta.agentDir) : arcanaHomePath('agents', agentId);
+          const agentHomeDir = baseHome || arcanaHomePath('agents', agentId);
+          const cfgPath = join(agentHomeDir, 'config.json');
+
+          let disabled = [];
+          try {
+            const src = Array.isArray(body.disabled) ? body.disabled : [];
+            const seen = new Set();
+            for (const raw of src){
+              if (typeof raw !== 'string') continue;
+              const n = raw.trim();
+              if (!n || seen.has(n)) continue;
+              seen.add(n);
+              disabled.push(n);
+            }
+          } catch {}
+
+          const baseDir = String(agentHomeDir || '').trim();
+          if (baseDir){
+            try { mkdirSync(baseDir, { recursive: true }); } catch {}
+
+            let cfg = {};
+            try {
+              if (existsSync(cfgPath)){
+                const rawExisting = readFileSync(cfgPath, 'utf-8');
+                const parsed = JSON.parse(rawExisting);
+                if (parsed && typeof parsed === 'object') cfg = parsed;
+              }
+            } catch {}
+
+            if (disabled.length){
+              const skillsCfg = cfg.skills && typeof cfg.skills === 'object' ? cfg.skills : {};
+              skillsCfg.disabled = disabled;
+              cfg.skills = skillsCfg;
+            } else {
+              if (cfg.skills && typeof cfg.skills === 'object'){
+                try { delete cfg.skills.disabled; } catch {}
+                try {
+                  if (!Object.keys(cfg.skills).length){
+                    delete cfg.skills;
+                  }
+                } catch {}
+              }
+            }
+
+            await fsp.writeFile(cfgPath, JSON.stringify(cfg, null, 2), 'utf-8');
+          }
+
+          try {
+            await refreshGatewayServerInfo();
+            const ev = buildServerInfoEvent();
+            if (ev) {
+              try { eventBus.emit('event', ev); } catch {}
+            }
+          } catch {}
+
+          sendJson(res, 200, { ok: true });
+        } catch (e) {
+          sendJson(res, 400, { ok: false, error: 'skills_update_failed', message: e && e.message ? String(e.message) : String(e || '') });
         }
         return;
       }

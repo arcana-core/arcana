@@ -305,7 +305,10 @@ export function buildHistoryPreludeText(obj, opts){
     const lines = [];
     lines.push('[Conversation History \u2014 keep for context]\n');
     for (const m of msgs){
-      const role = (m.role === 'assistant' ? 'Assistant' : 'User');
+      let role = 'User';
+      if (m.role === 'assistant') role = 'Assistant';
+      else if (m.role === 'tool') role = 'Tool';
+      else if (m.role === 'system') role = 'System';
       const t = String(m.text || '');
       const chunk = t.length > 3000 ? ('\u2026' + t.slice(-3000)) : t;
       lines.push(role + ': ' + chunk);
@@ -327,7 +330,10 @@ export function buildHistoryPreludeText(obj, opts){
   const convLines = [];
   convLines.push('[Conversation History \u2014 keep for context]\n');
   for (const m of recent){
-    const role = (m.role === 'assistant' ? 'Assistant' : 'User');
+    let role = 'User';
+    if (m.role === 'assistant') role = 'Assistant';
+    else if (m.role === 'tool') role = 'Tool';
+    else if (m.role === 'system') role = 'System';
     const t = String(m.text || '');
     const chunk = t.length > maxMessageChars ? ('\u2026' + t.slice(-maxMessageChars)) : t;
     convLines.push(role + ': ' + chunk);
