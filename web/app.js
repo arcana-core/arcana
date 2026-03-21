@@ -1344,6 +1344,110 @@ function ensureTurnOpenForSession(sessionId, snap){
   } catch { return 0 }
 }
 
+// Get the appropriate turn index for an event without opening a new turn
+// when all existing turns are already done. If there is a running turn,
+// reuse its highest index. Otherwise, reuse the latest existing turn index.
+// Only when there is no existing turn at all do we create turn 0 as running.
+function getTurnIndexForEvent(sessionId, snap){
+  try{
+    const sid = String(sessionId || '');
+    if (!sid) return 0;
+    const panel = getToolPanel(sid);
+    if (!panel) return 0;
+    if (!panel.turnStatus) panel.turnStatus = new Map();
+    if (!panel.turnUsage) panel.turnUsage = new Map();
+
+    // First, prefer any existing running turn (highest index).
+    let runningIdx = null;
+    try{
+      if (panel.turnStatus && typeof panel.turnStatus.forEach === 'function'){
+        panel.turnStatus.forEach((status, key)=>{
+          const idx = Number(key);
+          if (status !== 'running' || Number.isNaN(idx)) return;
+          if (runningIdx === null || idx > runningIdx) runningIdx = idx;
+        });
+      }
+    } catch {}
+    if (runningIdx !== null){
+      lastToolTurnBySession.set(sid, runningIdx);
+      return runningIdx;
+    }
+
+    // No running turn: reuse the latest existing turn index if any.
+    let latest = null;
+    try{
+      if (panel.turnStatus && typeof panel.turnStatus.forEach === 'function'){
+        panel.turnStatus.forEach((status, key)=>{
+          const idx = Number(key);
+          if (Number.isNaN(idx)) return;
+          if (latest === null || idx > latest) latest = idx;
+        });
+      }
+    } catch {}
+    if (latest === null){
+      try{
+        if (panel.actions && typeof panel.actions.forEach === 'function'){
+          panel.actions.forEach((a)=>{
+            if (!a) return;
+            const idx = (typeof a.turnIndex === 'number' && !Number.isNaN(a.turnIndex)) ? a.turnIndex : null;
+            if (idx === null) return;
+            if (latest === null || idx > latest) latest = idx;
+          });
+        }
+      } catch {}
+    }
+    if (latest === null){
+      const prev = lastToolTurnBySession.get(sid);
+      if (typeof prev === 'number' && !Number.isNaN(prev) && Number.isFinite(prev) && prev >= 0){
+        latest = prev;
+      }
+    }
+    if (latest !== null && Number.isFinite(latest) && latest >= 0){
+      lastToolTurnBySession.set(sid, latest);
+      return latest;
+    }
+
+    // No existing turn at all: create turn 0 as running and initialize usage.
+    const idx0 = 0;
+    panel.turnStatus.set(idx0, 'running');
+    lastToolTurnBySession.set(sid, idx0);
+
+    const existing = panel.turnUsage.get(idx0) || {};
+    let startSessionTokens = (typeof existing.startSessionTokens === 'number' && existing.startSessionTokens >= 0) ? existing.startSessionTokens : undefined;
+    let lastSessionTokens = (typeof existing.lastSessionTokens === 'number' && existing.lastSessionTokens >= 0) ? existing.lastSessionTokens : undefined;
+    let lastContextTokens = (typeof existing.lastContextTokens === 'number' && existing.lastContextTokens >= 0) ? existing.lastContextTokens : undefined;
+    const turnTokens = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
+    const toolTokens = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
+    const llmTokens = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
+
+    const snapObj = snap && typeof snap === 'object' ? snap : null;
+    const snapSession = (snapObj && typeof snapObj.sessionTokens === 'number' && snapObj.sessionTokens >= 0) ? snapObj.sessionTokens : null;
+    const snapContext = (snapObj && typeof snapObj.contextTokens === 'number' && snapObj.contextTokens >= 0) ? snapObj.contextTokens : null;
+
+    if (startSessionTokens === undefined){
+      startSessionTokens = (snapSession !== null) ? snapSession : 0;
+    }
+    if (lastSessionTokens === undefined){
+      lastSessionTokens = (snapSession !== null) ? snapSession : startSessionTokens;
+    }
+    if (lastContextTokens === undefined){
+      lastContextTokens = (snapContext !== null) ? snapContext : 0;
+    }
+
+    panel.turnUsage.set(idx0, {
+      startSessionTokens,
+      lastSessionTokens,
+      lastContextTokens,
+      turnTokens,
+      toolTokens,
+      llmTokens,
+    });
+
+    try{ scheduleSaveToolPanel(sid); } catch {}
+    return idx0;
+  } catch { return 0 }
+}
+
 function toolCategory(toolName){
   const name = String(toolName || '').toLowerCase();
   if (!name) return 'other';
@@ -1634,30 +1738,7 @@ function renderToolsPanel(sessionId){
       label.appendChild(done);
     }
 
-    const usage = (usageMap && typeof usageMap.get === 'function') ? usageMap.get(turnKey) : null;
-    let startSess = 0;
-    let lastSess = 0;
-    let lastCtx = 0;
-    let turnTokens = 0;
-    if (usage && typeof usage === 'object'){
-      if (typeof usage.startSessionTokens === 'number' && usage.startSessionTokens >= 0) startSess = usage.startSessionTokens;
-      if (typeof usage.lastSessionTokens === 'number' && usage.lastSessionTokens >= 0) lastSess = usage.lastSessionTokens;
-      if (typeof usage.lastContextTokens === 'number' && usage.lastContextTokens >= 0) lastCtx = usage.lastContextTokens;
-      if (typeof usage.turnTokens === 'number' && usage.turnTokens >= 0) turnTokens = usage.turnTokens;
-    }
-    const tokValue = (typeof turnTokens === 'number' && turnTokens > 0) ? turnTokens : 0;
-
-    const badges = document.createElement('div');
-    badges.className = 'tools-turn-badges';
-
-    const tokBadge = document.createElement('div');
-    tokBadge.className = 'tools-turn-badge tools-turn-badge-tok';
-    tokBadge.textContent = 'TOK ' + formatCompactNumber(tokValue);
-
-    badges.appendChild(tokBadge);
-
     label.appendChild(labelText);
-    label.appendChild(badges);
     group.appendChild(label);
     const items = byTurn.get(turnKey) || [];
     for (const a of items){
@@ -3781,8 +3862,13 @@ function handleArcanaEvent(data){
         try { markTurnDone(targetId); } catch {}
         try {
           const sid3 = String(targetId || "");
-          let ti = Number(lastToolTurnBySession.get(sid3));
-          if (Number.isFinite(ti)) upsertLlmAction(sid3, ti, { status: "done", setEndedAt: true });
+          if (sid3){
+            const snap2 = ensureLiveForSession(sid3);
+            const ti = getTurnIndexForEvent(sid3, snap2);
+            if (typeof ti === "number" && Number.isFinite(ti)){
+              upsertLlmAction(sid3, ti, { status: "done", setEndedAt: true });
+            }
+          }
         } catch {}
 
         // For background sessions, just refresh the list/unread state.
@@ -3925,7 +4011,7 @@ function handleArcanaEvent(data){
           const ss = String(target || "");
           if (ss){
             const snap = ensureLiveForSession(ss);
-            const ti = ensureTurnOpenForSession(ss, snap);
+            const ti = getTurnIndexForEvent(ss, snap);
             upsertLlmAction(ss, ti, { appendLog: "thinking start" });
           }
         } catch {}
@@ -3946,7 +4032,7 @@ function handleArcanaEvent(data){
           const ss = String(target || "");
           if (ss){
             const snap = ensureLiveForSession(ss);
-            const ti = ensureTurnOpenForSession(ss, snap);
+            const ti = getTurnIndexForEvent(ss, snap);
             const n = (typeof data.chars === "number" && data.chars >= 0) ? data.chars : 0;
             upsertLlmAction(ss, ti, { appendLog: "thinking +" + n + " chars" });
           }
@@ -3961,7 +4047,7 @@ function handleArcanaEvent(data){
           const ss = String(target || "");
           if (ss){
             const snap = ensureLiveForSession(ss);
-            const ti = ensureTurnOpenForSession(ss, snap);
+            const ti = getTurnIndexForEvent(ss, snap);
             const n = (typeof data.chars === "number") ? (data.chars||0) : 0;
             const ms = (typeof data.tookMs === "number") ? (data.tookMs||0) : undefined;
             const line = "thinking end: " + n + " chars" + (typeof ms === "number" ? ", " + ms + " ms" : "");
@@ -3988,7 +4074,7 @@ function handleArcanaEvent(data){
           const targetId = data.sessionId || sid;
           const sid2 = String(targetId || '');
           if (sid2){
-            const idx = lastToolTurnBySession.get(sid2);
+            const idx = getTurnIndexForEvent(sid2, null);
             if (typeof idx === 'number' && !Number.isNaN(idx)){
               const ctxVal = (typeof data.contextTokens === 'number' && data.contextTokens > 0) ? data.contextTokens : null;
               const tokVal = (typeof data.totalTokens === 'number' && data.totalTokens > 0) ? data.totalTokens : null;
@@ -4014,14 +4100,14 @@ function handleArcanaEvent(data){
           }
           const sid2 = String(targetId || '');
           if (sid2){
-            const idx = ensureTurnOpenForSession(sid2, snap);
+            const idx = getTurnIndexForEvent(sid2, snap);
             // Use per-call values for LLM card display (not cumulative)
-            const ctxForCard = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens > 0)
+            const ctxForCard = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens >= 0)
               ? data.lastCallContextTokens
-              : (typeof data.contextTokens === 'number' && data.contextTokens >= 0) ? (Number(data.contextTokens) || 0) : null;
-            const tokForCard = (typeof data.lastCallTotalTokens === 'number' && data.lastCallTotalTokens > 0)
+              : null;
+            const tokForCard = (typeof data.lastCallTotalTokens === 'number' && data.lastCallTotalTokens >= 0)
               ? data.lastCallTotalTokens
-              : (typeof data.totalTokens === 'number' && data.totalTokens >= 0) ? (Number(data.totalTokens) || 0) : null;
+              : null;
             if (ctxForCard !== null || tokForCard !== null){
               const update = {};
               if (ctxForCard !== null) update.ctxTokens = ctxForCard;
@@ -4117,7 +4203,7 @@ function handleArcanaEvent(data){
           const sessId = String(sid2 || '');
           if (sessId){
             const snap = ensureLiveForSession(sessId);
-            const ti = ensureTurnOpenForSession(sessId, snap);
+            const ti = getTurnIndexForEvent(sessId, snap);
             upsertLlmAction(sessId, ti, { argsSummary: "Output: " + txt.length + " chars" });
           }
         } catch {}
