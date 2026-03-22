@@ -17,7 +17,7 @@
           <div id="agents-list"></div>
         </div>
         <div id="sidebar" class="sidebar" style="width:240px">
-          <div style="padding:8px"><button id="new-session">新会话</button></div>
+          <div style="padding:8px"><button id="new-session" class="btn btn-secondary btn-sm">新会话</button></div>
           <div id="session-list"></div>
         </div>
       </div>
@@ -35,8 +35,18 @@
     <footer class="composer">
       <button class="icon" title="更多">＋</button>
       <textarea id="input" rows="1" placeholder="发送消息"></textarea>
-      <button id="stop" style="margin-right:6px">停止</button>
-      <button id="send" class="send">发送</button>
+      <button
+        id="stop"
+        class="btn btn-outline btn-secondary btn-stop"
+        type="button"
+        aria-label="停止"
+        title="停止"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <rect x="7" y="7" width="10" height="10" rx="1"></rect>
+        </svg>
+      </button>
+      <button id="send" class="btn btn-primary">发送</button>
     </footer>
       <div id="more-panel" style="position:absolute;left:8px;right:8px;bottom:66px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);padding:10px;display:none;">
         <div style="font-weight:600;margin-bottom:6px;">高级选项</div>
@@ -48,109 +58,132 @@
         <hr style="margin:10px 0;border:none;border-top:1px dashed #eee;" />
         <div style="font-weight:600;margin-bottom:6px;">设置 / 诊断</div>
 
-        <div style="font-size:12px;color:#666;margin-bottom:4px;">全局默认配置</div>
-        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
-          <div>Provider</div>
-          <select id="cfg-provider-global">
-            <option value="">(auto)</option>
-            <option value="openai">OpenAI</option>
-            <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
-            <option value="azure-openai-responses">Azure OpenAI Responses</option>
-            <option value="openai-codex">OpenAI Codex</option>
-            <option value="anthropic">Anthropic</option>
-            <option value="google">Google AI Studio</option>
-            <option value="google-vertex">Google Vertex AI</option>
-            <option value="google-gemini-cli">Google Gemini CLI</option>
-            <option value="mistral">Mistral</option>
-            <option value="groq">Groq</option>
-            <option value="cerebras">Cerebras</option>
-            <option value="xai">xAI</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="vercel-ai-gateway">Vercel AI Gateway</option>
-            <option value="minimax">MiniMax</option>
-            <option value="github-copilot">GitHub Copilot</option>
-            <option value="antigravity">Antigravity</option>
-            <option value="amazon-bedrock">Amazon Bedrock</option>
-            <option value="moonshot">Moonshot</option>
-            <option value="generic">自定义/Generic</option>
-          </select>
-          <div>Model</div>
-          <input id="cfg-model-global" placeholder="model-id" />
-          <div>Base URL</div>
-          <input id="cfg-base-url-global" placeholder="可选，自定义网关" />
-          <div>API Key</div>
-          <div style="display:flex;gap:8px;align-items:center;">
-            <input id="cfg-key-global" type="password" placeholder="仅用于更新，不会回显" />
-            <span id="cfg-key-set-global" style="font-size:12px;color:#666;">未设置</span>
-          </div>
-          <div>历史压缩</div>
-          <div>
-            <label style="display:flex;align-items:center;gap:6px;">
-              <input id="cfg-compress-enabled-global" type="checkbox" />
-              启用（根据长度自动压缩历史）
-            </label>
-          </div>
-          <div>压缩阈值</div>
-          <input id="cfg-compress-threshold-global" type="number" min="0" placeholder="触发压缩的 token 数" />
-          <div>保留用户轮数</div>
-          <input id="cfg-compress-keep-user-turns-global" type="number" min="0" placeholder="至少保留的最近用户轮数" />
+        <div class="cfg-scope-tabs" aria-label="配置作用域">
+          <button id="cfg-scope-tab-global" class="cfg-scope-tab active" type="button" data-scope="global">全局默认</button>
+          <button id="cfg-scope-tab-agent" class="cfg-scope-tab" type="button" data-scope="agent">当前 Agent</button>
         </div>
 
-        <div style="font-size:12px;color:#666;margin-bottom:4px;">当前 Agent 覆盖</div>
-        <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
-          <div>Provider</div>
-          <select id="cfg-provider-agent">
-            <option value="">(inherit global)</option>
-            <option value="openai">OpenAI</option>
-            <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
-            <option value="azure-openai-responses">Azure OpenAI Responses</option>
-            <option value="openai-codex">OpenAI Codex</option>
-            <option value="anthropic">Anthropic</option>
-            <option value="google">Google AI Studio</option>
-            <option value="google-vertex">Google Vertex AI</option>
-            <option value="google-gemini-cli">Google Gemini CLI</option>
-            <option value="mistral">Mistral</option>
-            <option value="groq">Groq</option>
-            <option value="cerebras">Cerebras</option>
-            <option value="xai">xAI</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="vercel-ai-gateway">Vercel AI Gateway</option>
-            <option value="minimax">MiniMax</option>
-            <option value="github-copilot">GitHub Copilot</option>
-            <option value="antigravity">Antigravity</option>
-            <option value="amazon-bedrock">Amazon Bedrock</option>
-            <option value="moonshot">Moonshot</option>
-            <option value="generic">自定义/Generic</option>
-          </select>
-          <div>Model</div>
-          <input id="cfg-model-agent" placeholder="留空则使用全局默认" />
-          <div>Base URL</div>
-          <input id="cfg-base-url-agent" placeholder="留空则使用全局默认" />
-          <div>API Key</div>
-          <div style="display:flex;gap:8px;align-items:center;">
-            <input id="cfg-key-agent" type="password" placeholder="仅用于更新，不会回显" />
-            <span id="cfg-key-set-agent" style="font-size:12px;color:#666;">未设置</span>
+        <div class="cfg-scope-panels">
+          <div class="cfg-scope-panel" data-cfg-scope="global">
+            <div style="font-size:12px;color:#666;margin-bottom:4px;">全局默认配置</div>
+            <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
+              <div>Provider</div>
+              <select id="cfg-provider-global">
+                <option value="">(auto)</option>
+                <option value="openai">OpenAI</option>
+                <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
+                <option value="azure-openai-responses">Azure OpenAI Responses</option>
+                <option value="openai-codex">OpenAI Codex</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="google">Google AI Studio</option>
+                <option value="google-vertex">Google Vertex AI</option>
+                <option value="google-gemini-cli">Google Gemini CLI</option>
+                <option value="mistral">Mistral</option>
+                <option value="groq">Groq</option>
+                <option value="cerebras">Cerebras</option>
+                <option value="xai">xAI</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="vercel-ai-gateway">Vercel AI Gateway</option>
+                <option value="minimax">MiniMax</option>
+                <option value="github-copilot">GitHub Copilot</option>
+                <option value="antigravity">Antigravity</option>
+                <option value="amazon-bedrock">Amazon Bedrock</option>
+                <option value="moonshot">Moonshot</option>
+                <option value="generic">自定义/Generic</option>
+              </select>
+              <div>Model</div>
+              <input id="cfg-model-global" placeholder="model-id" />
+              <div>Base URL</div>
+              <input id="cfg-base-url-global" placeholder="可选，自定义网关" />
+              <div>API Key</div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input id="cfg-key-global" type="password" placeholder="仅用于更新，不会回显" />
+                <span id="cfg-key-set-global" style="font-size:12px;color:#666;">未设置</span>
+              </div>
+              <div>历史压缩</div>
+              <div>
+                <label style="display:flex;align-items:center;gap:6px;">
+                  <input id="cfg-compress-enabled-global" type="checkbox" />
+                  启用（根据长度自动压缩历史）
+                </label>
+              </div>
+              <div>压缩阈值</div>
+              <input id="cfg-compress-threshold-global" type="number" min="0" placeholder="触发压缩的 token 数" />
+              <div>保留用户轮数</div>
+              <input id="cfg-compress-keep-user-turns-global" type="number" min="0" placeholder="至少保留的最近用户轮数" />
+            </div>
           </div>
-          <div>历史压缩</div>
-          <div>
-            <label style="display:flex;align-items:center;gap:6px;">
-              <input id="cfg-compress-enabled-agent" type="checkbox" />
-              启用（为当前 Agent 历史压缩）
-            </label>
+
+          <div class="cfg-scope-panel" data-cfg-scope="agent" style="display:none;">
+            <div style="font-size:12px;color:#666;margin-bottom:4px;">当前 Agent 覆盖</div>
+            <div style="display:grid;grid-template-columns:90px 1fr;gap:6px 8px;align-items:center;font-size:13px;margin-bottom:8px;">
+              <div>Provider</div>
+              <select id="cfg-provider-agent">
+                <option value="">(inherit global)</option>
+                <option value="openai">OpenAI</option>
+                <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
+                <option value="azure-openai-responses">Azure OpenAI Responses</option>
+                <option value="openai-codex">OpenAI Codex</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="google">Google AI Studio</option>
+                <option value="google-vertex">Google Vertex AI</option>
+                <option value="google-gemini-cli">Google Gemini CLI</option>
+                <option value="mistral">Mistral</option>
+                <option value="groq">Groq</option>
+                <option value="cerebras">Cerebras</option>
+                <option value="xai">xAI</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="vercel-ai-gateway">Vercel AI Gateway</option>
+                <option value="minimax">MiniMax</option>
+                <option value="github-copilot">GitHub Copilot</option>
+                <option value="antigravity">Antigravity</option>
+                <option value="amazon-bedrock">Amazon Bedrock</option>
+                <option value="moonshot">Moonshot</option>
+                <option value="generic">自定义/Generic</option>
+              </select>
+              <div>Model</div>
+              <input id="cfg-model-agent" placeholder="留空则使用全局默认" />
+              <div>Base URL</div>
+              <input id="cfg-base-url-agent" placeholder="留空则使用全局默认" />
+              <div>API Key</div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input id="cfg-key-agent" type="password" placeholder="仅用于更新，不会回显" />
+                <span id="cfg-key-set-agent" style="font-size:12px;color:#666;">未设置</span>
+              </div>
+              <div>历史压缩</div>
+              <div>
+                <label style="display:flex;align-items:center;gap:6px;">
+                  <input id="cfg-compress-enabled-agent" type="checkbox" />
+                  启用（为当前 Agent 历史压缩）
+                </label>
+              </div>
+              <div>压缩阈值</div>
+              <input id="cfg-compress-threshold-agent" type="number" min="0" placeholder="留空则继承全局" />
+              <div>保留用户轮数</div>
+              <input id="cfg-compress-keep-user-turns-agent" type="number" min="0" placeholder="留空则继承全局" />
+            </div>
           </div>
-          <div>压缩阈值</div>
-          <input id="cfg-compress-threshold-agent" type="number" min="0" placeholder="留空则继承全局" />
-          <div>保留用户轮数</div>
-          <input id="cfg-compress-keep-user-turns-agent" type="number" min="0" placeholder="留空则继承全局" />
+        </div>
+
+        <div class="cfg-effective-card">
+          <div class="cfg-effective-title">生效配置</div>
+          <div class="cfg-effective-grid">
+            <div class="cfg-effective-label">Provider</div>
+            <div id="cfg-effective-provider" class="cfg-effective-value">(auto)</div>
+            <div class="cfg-effective-label">Model</div>
+            <div id="cfg-effective-model" class="cfg-effective-value">—</div>
+            <div class="cfg-effective-label">Base URL</div>
+            <div id="cfg-effective-base-url" class="cfg-effective-value">—</div>
+          </div>
         </div>
 
         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center;">
-          <button id="cfg-save-global">保存全局</button>
-          <button id="cfg-save-agent">保存 Agent</button>
-          <button id="cfg-clear-agent">清除 Agent 覆盖</button>
-          <button id="cfg-run-doctor">运行诊断</button>
-          <button id="cfg-support-bundle">导出支持包</button>
-          <button id="cfg-secrets" title="管理加密密钥（API Key 等敏感信息）">密钥箱</button>
+          <button id="cfg-save-global" class="btn btn-primary btn-sm cfg-scope-global-only">保存全局</button>
+          <button id="cfg-save-agent" class="btn btn-primary btn-sm cfg-scope-agent-only">保存 Agent</button>
+          <button id="cfg-clear-agent" class="btn btn-danger btn-outline btn-sm cfg-scope-agent-only">清除 Agent 覆盖</button>
+          <button id="cfg-run-doctor" class="btn btn-secondary btn-sm">运行诊断</button>
+          <button id="cfg-support-bundle" class="btn btn-secondary btn-sm">导出支持包</button>
+          <button id="cfg-secrets" class="btn btn-secondary btn-sm" title="管理加密密钥（API Key 等敏感信息）">密钥箱</button>
           <span id="support-link" style="margin-left:auto;font-size:12px;"></span>
         </div>
       </div>
@@ -179,7 +212,7 @@
                 </div>
                 <div id="skills-config" class="main-skills-list"></div>
                 <div class="main-skills-actions">
-                  <button id="skills-save" type="button">保存技能配置</button>
+                  <button id="skills-save" class="btn btn-primary btn-sm" type="button">保存技能配置</button>
                   <div class="main-skills-hint">取消勾选=禁用该技能</div>
                 </div>
               </section>
@@ -200,8 +233,8 @@
 	              <div class="tools-details-header">
 	                <div id="tools-details-title" class="tools-details-title">No action selected</div>
                 <div id="tools-details-meta" class="tools-details-meta"></div>
-                <button id="fetch-tool-output" type="button">Fetch tool output</button>
-                <button id="toggle-tool-stream" type="button">实时工具输出: 关</button>
+                <button id="fetch-tool-output" class="btn btn-secondary btn-xs" type="button">Fetch tool output</button>
+                <button id="toggle-tool-stream" class="btn btn-secondary btn-xs" type="button">实时工具输出: 关</button>
 	              </div>
 	              <details class="tools-details-args-wrap" open>
 	                <summary>参数</summary>

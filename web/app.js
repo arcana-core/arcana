@@ -2,6 +2,7 @@
 const messages = document.querySelector('#messages');
 const input = document.querySelector('#input');
 const sendBtn = document.querySelector('#send');
+const stopBtn = document.querySelector('#stop');
 let activeAssistant = null; // current assistant bubble to stream text into
 
 // Detect Electron + macOS to enable custom draggable titlebar
@@ -1472,6 +1473,19 @@ function formatCompactNumber(value){
   } catch { return '0'; }
 }
 
+function formatSessionLabel(sessionId){
+  const sid = String(sessionId || '').trim();
+  if (!sid) return '';
+  try{
+    if (/^\d{4}-\d{2}-\d{2}/.test(sid)){
+      return sid.slice(0, 10);
+    }
+    return sid.slice(0, 10);
+  } catch {
+    try{ return sid.slice(0, 10); } catch { return ''; }
+  }
+}
+
 function summarizeArgs(args){
   if (!args) return '';
   try{
@@ -1811,7 +1825,7 @@ function renderToolsPanel(sessionId){
       timeEl.textContent = a.startedAt + (a.endedAt ? ' · ' + a.endedAt : '');
       const sidEl = document.createElement('div');
       sidEl.className = 'tools-card-session';
-      sidEl.textContent = sid ? ('Session ' + sid.slice(0, 6)) : '';
+      sidEl.textContent = formatSessionLabel(sid);
       metaRow.appendChild(timeEl);
       metaRow.appendChild(sidEl);
       card.appendChild(header);
@@ -1918,8 +1932,8 @@ async function pickWorkspace(){
         '<div style="font-size:13px;color:#666;margin-bottom:8px">建议使用桌面应用获取系统级文件夹选择器。当前在浏览器环境下，仅支持手动输入工作区绝对路径。</div>' +
         '<input id="ws-input" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="/绝对/路径" />' +
         '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
-        '  <button id="ws-cancel">取消</button>' +
-        '  <button id="ws-ok">确定</button>' +
+        '  <button id="ws-cancel" class="btn btn-secondary btn-sm">取消</button>' +
+        '  <button id="ws-ok" class="btn btn-primary btn-sm">确定</button>' +
         '</div>';
       overlay.appendChild(dialog);
       document.body.appendChild(overlay);
@@ -2097,6 +2111,8 @@ try {
         loaded = true;
         try { await loadConfigUI(); } catch(e){}
       }
+      try{ updateConfigScopeUi('global'); }catch{}
+      try{ updateEffectiveConfigSummary(); }catch{}
     }
   });
 } catch {}
@@ -2186,6 +2202,76 @@ try{
 const HISTORY_COMPRESSION_DEFAULT_ENABLED = true;
 const HISTORY_COMPRESSION_DEFAULT_THRESHOLD = 100000;
 const HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS = 10;
+
+function getConfigInputValue(id){
+  try{
+    const el = qs(id);
+    if (!el) return '';
+    if (typeof el.value === 'string') return el.value;
+  }catch{}
+  return '';
+}
+
+function computeEffectiveConfigSummary(){
+  try{
+    const gProvider = (getConfigInputValue('cfg-provider-global') || '').trim();
+    const gModel = (getConfigInputValue('cfg-model-global') || '').trim();
+    const gBase = (getConfigInputValue('cfg-base-url-global') || '').trim();
+
+    const aProvider = (getConfigInputValue('cfg-provider-agent') || '').trim();
+    const aModel = (getConfigInputValue('cfg-model-agent') || '').trim();
+    const aBase = (getConfigInputValue('cfg-base-url-agent') || '').trim();
+
+    const provider = aProvider || gProvider;
+    const model = aModel || gModel;
+    const base = aBase || gBase;
+
+    const providerLabel = provider || '(auto)';
+    const modelLabel = model || '—';
+    const baseLabel = base || '—';
+
+    return { provider: providerLabel, model: modelLabel, base_url: baseLabel };
+  }catch{ return { provider:'(auto)', model:'—', base_url:'—' } }
+}
+
+function updateEffectiveConfigSummary(){
+  try{
+    const eff = computeEffectiveConfigSummary();
+    const p = qs('cfg-effective-provider'); if (p) p.textContent = eff.provider;
+    const m = qs('cfg-effective-model'); if (m) m.textContent = eff.model;
+    const b = qs('cfg-effective-base-url'); if (b) b.textContent = eff.base_url;
+  }catch{}
+}
+
+function updateConfigScopeUi(scope){
+  try{
+    const want = (scope === 'agent') ? 'agent' : 'global';
+    const tabs = document.querySelectorAll('.cfg-scope-tab');
+    tabs.forEach(btn=>{
+      try{
+        const s = btn.getAttribute('data-scope') || '';
+        if (s === want) btn.classList.add('active');
+        else btn.classList.remove('active');
+      }catch{}
+    });
+    const panels = document.querySelectorAll('.cfg-scope-panel');
+    panels.forEach(panel=>{
+      try{
+        const s = panel.getAttribute('data-cfg-scope') || '';
+        panel.style.display = (s === want) ? '' : 'none';
+      }catch{}
+    });
+    const isAgent = (want === 'agent');
+    const globalOnly = document.querySelectorAll('.cfg-scope-global-only');
+    globalOnly.forEach(btn=>{
+      try{ btn.style.display = isAgent ? 'none' : ''; }catch{}
+    });
+    const agentOnly = document.querySelectorAll('.cfg-scope-agent-only');
+    agentOnly.forEach(btn=>{
+      try{ btn.style.display = isAgent ? '' : 'none'; }catch{}
+    });
+  }catch{}
+}
 
 function parseHistoryCompressionEnabled(raw, fallback){
   let out = !!fallback;
@@ -2358,6 +2444,7 @@ async function loadConfigUI(){
       const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(globalCompressKeep);
       appendLog('[config] 读取 Agent 配置失败');
     }
+    try{ updateEffectiveConfigSummary(); }catch{}
     // Best-effort: refresh live info model label immediately
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
   }catch(e){ appendLog('[config] 读取失败'); }
@@ -2395,6 +2482,7 @@ async function saveGlobalConfigUI(){
     if (!r.ok || !j.ok){ appendLog('[config] 保存全局配置失败'); return; }
     if (qs('cfg-key-global')) qs('cfg-key-global').value = '';
     await loadConfigUI();
+    try{ updateEffectiveConfigSummary(); }catch{}
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     appendLog('[config] 已保存全局配置');
   }catch(e){ appendLog('[config] 保存全局配置失败'); }
@@ -2447,6 +2535,7 @@ async function saveAgentConfigUI(){
     if (qs('cfg-key-agent')) qs('cfg-key-agent').value = '';
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     await loadConfigUI();
+    try{ updateEffectiveConfigSummary(); }catch{}
     appendLog('[config] 已保存 Agent 配置');
   }catch(e){ appendLog('[config] 保存 Agent 配置失败'); }
 }
@@ -2586,6 +2675,28 @@ try { qs('cfg-clear-agent').addEventListener('click', ()=>{ clearAgentConfigUI()
 try { qs('cfg-run-doctor').addEventListener('click', ()=>{ runDoctorUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-support-bundle').addEventListener('click', ()=>{ createSupportBundleUI().catch(()=>{}) }) } catch {}
 try { qs('skills-save').addEventListener('click', ()=>{ saveSkillsConfigUI().catch(()=>{}) }) } catch {}
+try{
+  const tabG = qs('cfg-scope-tab-global');
+  const tabA = qs('cfg-scope-tab-agent');
+  if (tabG) tabG.addEventListener('click', ()=>{ updateConfigScopeUi('global'); });
+  if (tabA) tabA.addEventListener('click', ()=>{ updateConfigScopeUi('agent'); });
+}catch{}
+
+try{
+  const ids = [
+    'cfg-provider-global','cfg-model-global','cfg-base-url-global',
+    'cfg-provider-agent','cfg-model-agent','cfg-base-url-agent'
+  ];
+  ids.forEach(id=>{
+    try{
+      const el = qs(id);
+      if (!el || !el.addEventListener) return;
+      const handler = ()=>{ try{ updateEffectiveConfigSummary(); }catch{} };
+      el.addEventListener('input', handler);
+      el.addEventListener('change', handler);
+    }catch{}
+  });
+}catch{}
 
 // --- Sessions state ---
 const CKEY = 'arcana.currentSessionId';
@@ -3429,18 +3540,19 @@ sendBtn.addEventListener('click', ()=>{ handleSend().catch(()=>{}) });
 input.addEventListener('keydown', (e)=>{ if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); handleSend().catch(()=>{}) } });
 // Stop button -> hard abort current run
 try {
-  const stopBtn = document.querySelector('#stop');
-  if (stopBtn) stopBtn.addEventListener('click', async ()=>{
-    try{
-      await ensureTransportReady();
-      const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-      const sessionKey = getGatewayV2SessionKeyForCurrent();
-      if (!sessionKey) return;
-      const token = getStoredApiToken();
-      const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
-      await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
-    } catch {}
-  });
+  if (stopBtn && stopBtn.addEventListener){
+    stopBtn.addEventListener('click', async ()=>{
+      try{
+        await ensureTransportReady();
+        const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+        const sessionKey = getGatewayV2SessionKeyForCurrent();
+        if (!sessionKey) return;
+        const token = getStoredApiToken();
+        const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+        await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
+      } catch {}
+    });
+  }
 } catch {}
 
 // Clear internal context button
@@ -4577,7 +4689,7 @@ async function openSecrets(requestedNames, opts){
       const r = await fetch('/api/secrets?agentId=' + encodeURIComponent(agentId));
       data = await r.json();
     } catch (e) {
-      dialog.innerHTML = '<div style="color:red;">加载失败: ' + String(e) + '</div><div style="margin-top:8px;"><button id="sec-close">关闭</button></div>';
+      dialog.innerHTML = '<div style="color:red;">加载失败: ' + String(e) + '</div><div style="margin-top:8px;"><button id="sec-close" class="btn btn-secondary btn-sm">关闭</button></div>';
       dialog.querySelector('#sec-close').addEventListener('click', close);
       return;
     }
@@ -4592,7 +4704,7 @@ async function openSecrets(requestedNames, opts){
     let html = '<div style="display:flex;align-items:center;gap:8px;">' +
       '<div style="font-weight:600;font-size:15px;">🔐 密钥箱（Secrets）</div>' +
       '<div id="sec-status" style="font-size:12px;color:#666;"></div>' +
-      '<div style="margin-left:auto;"><button id="sec-close-top">×</button></div>' +
+      '<div style="margin-left:auto;"><button id="sec-close-top" class="btn btn-ghost btn-icon" type="button">×</button></div>' +
       '</div>';
 
     if (!initialized) {
@@ -4601,7 +4713,7 @@ async function openSecrets(requestedNames, opts){
         '<div style="font-size:12px;color:#666;margin-bottom:8px;">首次使用需要设置口令。口令用于加密所有密钥，请牢记。</div>' +
         '<div style="display:flex;gap:8px;align-items:center;">' +
         '  <input id="sec-pass" type="password" placeholder="设置密钥箱口令" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px;" />' +
-        '  <button id="sec-init" style="padding:8px 16px;background:#2d7ff9;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;">初始化密钥箱</button>' +
+        '  <button id="sec-init" class="btn btn-primary btn-sm">初始化密钥箱</button>' +
         '</div>' +
         '</div>';
     } else if (locked) {
@@ -4610,8 +4722,8 @@ async function openSecrets(requestedNames, opts){
         '<div style="font-size:12px;color:#666;margin-bottom:8px;">输入口令解锁后才能查看或管理密钥。</div>' +
         '<div style="display:flex;gap:8px;align-items:center;">' +
         '  <input id="sec-pass" type="password" placeholder="输入密钥箱口令" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px;" />' +
-        '  <button id="sec-unlock" style="padding:8px 16px;background:#2d7ff9;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;">解锁</button>' +
-        '  <button id="sec-reset-locked" style="padding:8px 16px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap;">重置密钥箱</button>' +
+        '  <button id="sec-unlock" class="btn btn-primary btn-sm">解锁</button>' +
+        '  <button id="sec-reset-locked" class="btn btn-danger btn-sm">重置密钥箱</button>' +
         '</div>' +
         '</div>';
     } else {
@@ -4621,7 +4733,7 @@ async function openSecrets(requestedNames, opts){
       html += '<div style="margin-top:12px;">' +
         '<div style="font-size:12px;color:#27ae60;margin-bottom:8px;">🔓 ' + statusText + '</div>';
       html += '<div style="margin:8px 0 12px 0;text-align:right;">' +
-        '<button id="sec-reset" style="padding:6px 10px;background:#e74c3c;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;">重置密钥箱</button>' +
+        '<button id="sec-reset" class="btn btn-danger btn-sm">重置密钥箱</button>' +
       '</div>';
 
       if (names.length > 0) {
@@ -4638,7 +4750,7 @@ async function openSecrets(requestedNames, opts){
             '</div>';
         }
         html += '</div>';
-        html += '<div style="margin-top:6px;text-align:right;"><button id="sec-batch-delete" style="font-size:12px;padding:4px 12px;background:#e74c3c;color:#fff;border:none;border-radius:4px;cursor:pointer;">删除选中</button></div>';
+        html += '<div style="margin-top:6px;text-align:right;"><button id="sec-batch-delete" class="btn btn-danger btn-xs">删除选中</button></div>';
       } else {
         html += '<div style="font-size:12px;color:#999;margin-bottom:8px;">暂无密钥，请在下方添加。</div>';
       }
@@ -4657,7 +4769,7 @@ async function openSecrets(requestedNames, opts){
         '    <option value="global">全局</option>' +
         '    <option value="agent">代理</option>' +
         '  </select>' +
-        '  <button id="sec-add-btn" style="padding:6px 14px;background:#27ae60;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap;">添加</button>' +
+        '  <button id="sec-add-btn" class="btn btn-primary btn-sm">添加</button>' +
         '</div>' +
         '</div>';
 
@@ -4665,7 +4777,7 @@ async function openSecrets(requestedNames, opts){
     }
 
     html += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">' +
-      '<button id="sec-close-bottom">关闭</button>' +
+      '<button id="sec-close-bottom" class="btn btn-secondary btn-sm">关闭</button>' +
       '</div>';
 
     dialog.innerHTML = html;
