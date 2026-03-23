@@ -19,6 +19,41 @@ export const DEFAULT_CONTEXT_POLICY = {
   maxUserMessageChars: 60000,
 };
 
+function sliceMessagesByRecentUserTurns(messages, keepRecentUserTurns){
+  const msgs = Array.isArray(messages) ? messages : [];
+  const keepNum = Number(keepRecentUserTurns);
+  const keepTurns = (Number.isFinite(keepNum) && keepNum > 0) ? Math.floor(keepNum) : 0;
+
+  if (!msgs.length || !keepTurns){
+    return { older: [], recent: msgs, keepTurns: 0, userTurns: 0 };
+  }
+
+  let idx = 0;
+  let userCount = 0;
+  for (let i = msgs.length - 1; i >= 0; i -= 1){
+    const m = msgs[i];
+    if (m && m.role === 'user'){
+      userCount += 1;
+      if (userCount === keepTurns){
+        idx = i;
+        break;
+      }
+    }
+  }
+
+  if (userCount === 0){
+    return { older: [], recent: msgs, keepTurns: 0, userTurns: 0 };
+  }
+
+  if (userCount < keepTurns){
+    return { older: [], recent: msgs, keepTurns: userCount, userTurns: userCount };
+  }
+
+  const older = msgs.slice(0, idx);
+  const recent = msgs.slice(idx);
+  return { older, recent, keepTurns, userTurns: userCount };
+}
+
 export function estimateTokensFromText(text) {
   try {
     const s = String(text || '');
@@ -41,19 +76,31 @@ export function trimUserMessage(message, policy = DEFAULT_CONTEXT_POLICY) {
   );
 }
 
-export function buildSessionPrelude(sessionObj, policy = DEFAULT_CONTEXT_POLICY) {
+export function buildSessionPrelude(sessionObj, policy = DEFAULT_CONTEXT_POLICY, opts) {
   try {
     const p = policy || DEFAULT_CONTEXT_POLICY;
     const summaryRaw = sessionObj && typeof sessionObj.summary === 'string' ? sessionObj.summary : '';
     const summary = String(summaryRaw || '').trim();
-    const msgs = sessionObj && Array.isArray(sessionObj.messages) ? sessionObj.messages : [];
-    const opts = {
+    let msgs = sessionObj && Array.isArray(sessionObj.messages) ? sessionObj.messages : [];
+    const preludeOpts = {
       summary,
       maxMessages: p.preludeMaxMessages,
       maxMessageChars: p.preludeMaxMessageChars,
       maxTotalChars: p.preludeMaxTotalChars,
     };
-    return buildHistoryPreludeText({ messages: msgs }, opts) || '';
+
+    if (opts && typeof opts === 'object'){
+      const keepTurnsRaw = opts.keepRecentUserTurns;
+      const keepNum = Number(keepTurnsRaw);
+      if (Number.isFinite(keepNum) && keepNum > 0){
+        const sliced = sliceMessagesByRecentUserTurns(msgs, keepNum);
+        if (sliced && Array.isArray(sliced.recent)){
+          msgs = sliced.recent;
+        }
+      }
+    }
+
+    return buildHistoryPreludeText({ messages: msgs }, preludeOpts) || '';
   } catch {
     return '';
   }
@@ -152,7 +199,6 @@ export async function compactSession({
 
   const splitIndex = msgs.length - keep;
   const older = msgs.slice(0, splitIndex);
-  const recent = msgs.slice(splitIndex);
 
   try {
     if (typeof broadcast === 'function') {
@@ -189,7 +235,6 @@ export async function compactSession({
   }
 
   obj.summary = text;
-  obj.messages = recent;
   obj.sessionTokens = 0;
   try { saveSession(obj, { agentId }); } catch {}
 
@@ -223,22 +268,8 @@ export async function compactSessionByUserTurns({
   const msgs = obj && Array.isArray(obj.messages) ? obj.messages : [];
   if (!obj || !msgs.length) return { compacted: false };
 
-  let idx = 0;
-  let userCount = 0;
-  for (let i = msgs.length - 1; i >= 0; i -= 1) {
-    const m = msgs[i];
-    if (m && m.role === 'user') {
-      userCount += 1;
-      if (userCount === keepTurns) {
-        idx = i;
-        break;
-      }
-    }
-  }
-  if (userCount < keepTurns) idx = 0;
-
-  const older = msgs.slice(0, idx);
-  const recent = msgs.slice(idx);
+  const sliced = sliceMessagesByRecentUserTurns(msgs, keepTurns);
+  const older = sliced.older;
 
   if (!older.length) return { compacted: false };
 
@@ -289,7 +320,6 @@ export async function compactSessionByUserTurns({
   }
 
   obj.summary = text;
-  obj.messages = recent;
   obj.sessionTokens = 0;
   try { saveSession(obj, { agentId }); } catch {}
 

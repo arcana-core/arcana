@@ -14,9 +14,9 @@ import { createCronTool } from './tools/cron.js';
 import { createHeartbeatTool } from './tools/heartbeat.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname } from 'node:path';
-import { resolveArcanaHome } from './arcana-home.js';
+import { resolveArcanaHome, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
-import { existsSync, readFileSync, promises as fsp } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, promises as fsp } from 'node:fs';
 import { buildArcanaSkillsPrompt, loadArcanaSkills } from './skills.js';
 import { loadSkillTools } from './skill-tools.js';
 import { ensureArcanaSkillsWatcher } from './skills-watch.js';
@@ -526,6 +526,21 @@ export async function createArcanaSession(opts={}){
   }
   const repoRoot = dirname(pkgRoot);
 
+  // Seed $ARCANA_HOME/APPEND_SYSTEM.md on first session creation.
+  try {
+    const homeDir = ensureArcanaHomeDir();
+    const homeAppendPath = join(homeDir, 'APPEND_SYSTEM.md');
+    if (!existsSync(homeAppendPath)){
+      const packagedAppendPath = join(pkgRoot, '.pi', 'APPEND_SYSTEM.md');
+      if (existsSync(packagedAppendPath)){
+        try {
+          const contents = readFileSync(packagedAppendPath, 'utf-8');
+          if (contents && contents.length) writeFileSync(homeAppendPath, contents, 'utf-8');
+        } catch {}
+      }
+    }
+  } catch {}
+
   let minimalAgentBootstrap = false;
   let contextSessionId = '';
   try {
@@ -622,11 +637,26 @@ export async function createArcanaSession(opts={}){
       return { agentsFiles: merged };
     },
     appendSystemPromptOverride: (base)=>{
-      const extras = [
-        join(repoRoot, '.pi', 'APPEND_SYSTEM.md'),
-        join(pkgRoot, '.pi', 'APPEND_SYSTEM.md'),
-        join(resolveArcanaHome(), 'APPEND_SYSTEM.md'),
-      ].map(readIfExists).filter(Boolean);
+      const extras = [];
+
+      // Workspace override: repo-local .pi/APPEND_SYSTEM.md
+      try {
+        const repoAppend = readIfExists(join(repoRoot, '.pi', 'APPEND_SYSTEM.md'));
+        if (repoAppend) extras.push(repoAppend);
+      } catch {}
+
+      // Base APPEND_SYSTEM: prefer $ARCANA_HOME/APPEND_SYSTEM.md, fall back to packaged default.
+      try {
+        let baseAppend = '';
+        try {
+          const homeDir = resolveArcanaHome();
+          if (homeDir) baseAppend = readIfExists(join(homeDir, 'APPEND_SYSTEM.md'));
+        } catch {}
+        if (!baseAppend){
+          baseAppend = readIfExists(join(pkgRoot, '.pi', 'APPEND_SYSTEM.md'));
+        }
+        if (baseAppend) extras.push(baseAppend);
+      } catch {}
       const soulLine = hasSoulHint
         ? 'If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.'
         : '';

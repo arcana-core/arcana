@@ -34,3 +34,4 @@ Notes
 - If Playwright launch fails, run npx playwright install then retry.
 - Force engine via ARCANA_PW_ENGINE=chromium|firefox|webkit.
 - Long-term memory for the default agent lives at $ARCANA_HOME/agents/default/MEMORY.md (ARCANA_HOME defaults to ~/.arcana).
+- On first run, Arcana seeds $ARCANA_HOME/APPEND_SYSTEM.md from the packaged default so you can customize global system behavior; this file is user-editable and will not be overwritten on later runs.

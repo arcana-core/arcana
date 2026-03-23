@@ -1406,6 +1406,7 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
 
   // Load session history object for prelude & persistence
   let historyObj = null;
+  let keepUserTurnsForPrelude = null;
   try { historyObj = ssLoad(sessionId, { agentId }); } catch {}
   if (historyObj){
     let changed = false;
@@ -1478,21 +1479,28 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
 
       const keepDefault = 10;
       const keepRaw = readCompressionKey('history_compression_keep_user_turns');
-      let keepUserTurns = keepDefault;
+      let keepTurnsConfig = keepDefault;
       const keepNum = Number(keepRaw);
       if (Number.isFinite(keepNum) && keepNum > 0){
-        keepUserTurns = Math.floor(keepNum);
+        keepTurnsConfig = Math.floor(keepNum);
       }
 
-      if (historyCompressionEnabled && thresholdTokens > 0 && keepUserTurns > 0){
-        const historyText = buildHistoryPreludeText(historyObj) || '';
+      if (historyCompressionEnabled && keepTurnsConfig > 0){
+        keepUserTurnsForPrelude = keepTurnsConfig;
+      }
+
+      if (historyCompressionEnabled && thresholdTokens > 0 && keepTurnsConfig > 0){
         const summaryTextRaw = historyObj && typeof historyObj.summary === 'string' ? historyObj.summary : '';
         const summaryText = String(summaryTextRaw || '').trim();
-        let combinedText = historyText;
+
+        let estimatedTokens = 0;
         if (summaryText){
-          combinedText = summaryText + '\n\n' + historyText;
+          const preludeText = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY, { keepRecentUserTurns: keepTurnsConfig }) || '';
+          estimatedTokens = estimateTokensFromText(preludeText);
+        } else {
+          const historyText = buildHistoryPreludeText(historyObj) || '';
+          estimatedTokens = estimateTokensFromText(historyText);
         }
-        const estimatedTokens = estimateTokensFromText(combinedText);
 
         if (estimatedTokens > thresholdTokens){
           let userTurns = 0;
@@ -1504,7 +1512,7 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
           } catch {}
 
           if (userTurns > 0){
-            let keepTurns = keepUserTurns;
+            let keepTurns = keepTurnsConfig;
             if (userTurns < keepTurns){
               keepTurns = Math.min(5, userTurns);
             }
@@ -1538,7 +1546,14 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
   const session = record.session;
 
   // Build prelude before appending current user message
-  const prelude = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY);
+  let prelude;
+  const summaryTextRaw = historyObj && typeof historyObj.summary === 'string' ? historyObj.summary : '';
+  const summaryText = String(summaryTextRaw || '').trim();
+  if (summaryText && keepUserTurnsForPrelude != null){
+    prelude = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY, { keepRecentUserTurns: keepUserTurnsForPrelude });
+  } else {
+    prelude = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY);
+  }
 
   // Persist user message
   ssAppend(sessionId, { role: 'user', text: trimmed, agentId });
