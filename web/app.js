@@ -3532,6 +3532,11 @@ async function sendWithGatewayV2(){
     const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
     const sessionId = (typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || '';
     const body = { agentId, sessionKey, sessionId, text, policy };
+    // Attach content-type and Authorization (if available) like other v2 calls
+    const token = getStoredApiToken();
+    const headers = token
+      ? { 'content-type': 'application/json', 'authorization': 'Bearer ' + token }
+      : { 'content-type': 'application/json' };
     const r = await fetch('/v2/turn', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
     try { j = await r.json(); } catch {}
