@@ -36,6 +36,15 @@ This skill scaffolds a new skill for the active agent under `$ARCANA_HOME/agents
 
 ## When This Skill Owns Tools（与工具绑定）
 
+### Execution model（默认：isolated 沙箱）
+
+- **用户自定义 Skill/Tool：默认永远以 isolated 方式执行**（每次调用在独立 Node 子进程中运行）。
+  - 优点：代码改动后下次调用立刻生效（避免 ESM 缓存问题）；每次调用都有独立权限沙箱。
+  - 你的工具代码无需理解 tool-daemon；只要按约定放在 `<skill>/tools/<tool>/tool.js` 并在 frontmatter 暴露即可。
+- **tool-daemon 属于高级用法**：仅当你需要“跨调用持久会话/重资源复用”（例如 Playwright 浏览器会话、bash 宿主级取消/超时治理）时才考虑。
+  - 多数情况下更推荐把长生命周期工作做成 `services/` 后台服务，tool 只做控制面。
+
+
 - 工具位置：`<skill>/tools/<tool>/`（无论该 Skill 位于 Agent Home 还是工作区 ./skills，下游加载器都会自动发现）。
 - 可见性：在本 Skill 的 `SKILL.md` 顶部使用 `arcana.tools` 声明（示例）：
 

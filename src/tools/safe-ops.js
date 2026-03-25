@@ -33,6 +33,7 @@ function normalizeHostPort(h){
 
 export function createSafeOps(options = {}){
   const allowNetwork = options.allowNetwork !== false; // default true
+  const fetchImpl = (options && typeof options.fetchImpl === 'function') ? options.fetchImpl : (typeof fetch === 'function' ? fetch : null);
   const allowWrite = options.allowWrite !== false;     // default true
   const allowedHosts = Array.isArray(options.allowedHosts) ? options.allowedHosts.map(normalizeHostPort) : null;
   const allowedWritePaths = Array.isArray(options.allowedWritePaths) ? options.allowedWritePaths.slice() : null;
@@ -60,7 +61,8 @@ export function createSafeOps(options = {}){
       const onUserAbort = ()=>{ try { controller.abort(); } catch{} };
       if (userSignal) userSignal.addEventListener('abort', onUserAbort, { once:true });
       const timer = setTimeout(()=>controller.abort(), timeoutMs);
-      const res = await fetch(u, { ...init, signal: controller.signal, redirect: init.redirect || 'follow' });
+      if (!fetchImpl) throw new Error('fetch_unavailable');
+      const res = await fetchImpl(u, { ...init, signal: controller.signal, redirect: init.redirect || 'follow' });
       clearTimeout(timer);
       if (userSignal) try { userSignal.removeEventListener('abort', onUserAbort); } catch{}
       return res;

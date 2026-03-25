@@ -3,6 +3,7 @@ import { promises as fsp, readFileSync } from 'node:fs';
 import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
 import { arcanaHomePath } from '../arcana-home.js';
 import { resolveWorkspaceRoot } from '../workspace-guard.js';
+import { getSessionIdForKey } from '../session-key-store.js';
 import { createArcanaSession } from '../session.js';
 import { ensureSessionId } from '../cron/arcana-task.js';
 import { runWithContext, emit } from '../event-bus.js';
@@ -19,6 +20,7 @@ import {
   trimUserMessage,
   estimateTokensFromText,
   compactSessionByUserTurns,
+  compactSession,
 } from '../context-manager.js';
 import { buildErrorStack } from '../util/error.js';
 import { nowMs, ensureDir } from './util.js';
@@ -273,7 +275,7 @@ async function ensureChatSession({ sessionId, agentId, policy }){
   await runWithContext(
     { sessionId: sid || 'default', agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws },
     async () => {
-      created = await createArcanaSession({ workspaceRoot: ws, agentHomeRoot: agentHomeDir, execPolicy: pol });
+      created = await createArcanaSession({ workspaceRoot: ws, agentHomeRoot: agentHomeDir, execPolicy: pol, agentId: effectiveAgentId });
     },
   );
   if (!created || !created.session){
@@ -625,7 +627,73 @@ function isRetryableCompletionError(err, finishReason, stopReason){
     return false;
   } catch { return false; }
 }
+function _getCompressionThresholdTokens(agentHomeDir) {
+  try {
+    const globalCfg = loadArcanaConfig();
+    const agentCfg = loadAgentConfig(agentHomeDir);
+    if (agentCfg && typeof agentCfg === 'object') {
+      const raw = agentCfg.history_compression_threshold_tokens;
+      if (raw != null) {
+        const n = Number(raw);
+        if (Number.isFinite(n) && n > 0) return Math.floor(n);
+      }
+    }
+    if (globalCfg && typeof globalCfg === 'object') {
+      const raw = globalCfg.history_compression_threshold_tokens;
+      if (raw != null) {
+        const n = Number(raw);
+        if (Number.isFinite(n) && n > 0) return Math.floor(n);
+      }
+    }
+    return null;
+  } catch { return null; }
+}
 
+function isContextOverflowError(err, finishReason, stopReason, errorMessage){
+  try {
+    const reasons = [finishReason, stopReason].filter(Boolean).map((r) => String(r).toLowerCase());
+    for (const r of reasons){
+      if (!r) continue;
+      if (r.includes('context_length') || r.includes('context-length')) return true;
+      if (r.includes('max_context') || r.includes('max-context')) return true;
+      if (r.includes('context window') || r.includes('context_window')) return true;
+      if (r.includes('token limit') || r.includes('too many tokens')) return true;
+      if (r.includes('input too long') || r.includes('prompt too long')) return true;
+      if (r.includes('exceeds') && r.includes('context')) return true;
+    }
+    // Check the errorMessage from the assistant message (pi-agent-core puts overflow details here)
+    if (errorMessage){
+      const em = String(errorMessage).toLowerCase();
+      if (em.includes('context_length') || em.includes('context-length') || em.includes('context length')) return true;
+      if (em.includes('max_context') || em.includes('max-context') || em.includes('maximum context')) return true;
+      if (em.includes('context window') || em.includes('context_window')) return true;
+      if (em.includes('token limit') || em.includes('too many tokens')) return true;
+      if (em.includes('input too long') || em.includes('prompt too long') || em.includes('prompt is too long')) return true;
+      if (em.includes('exceeds') && (em.includes('context') || em.includes('maximum') || em.includes('limit'))) return true;
+      if (em.includes('input token count') && em.includes('exceeds')) return true;
+      if (em.includes('maximum prompt length')) return true;
+      if (em.includes('reduce the length')) return true;
+      if (em.includes('context window exceeds limit')) return true;
+      if (em.includes('exceeded model token limit')) return true;
+      if (/^4(00|13)\s*(status code)?\s*\(no body\)/i.test(errorMessage)) return true;
+      if (/\b413\b/.test(errorMessage)) return true;
+    }
+    if (err){
+      const status = typeof err.status === 'number' ? err.status : (typeof err.statusCode === 'number' ? err.statusCode : 0);
+      const code = String(err.code || err.type || '').toLowerCase();
+      const msg = String(err.message || err || '').toLowerCase();
+      if (status === 413) return true; // payload too large
+      if (code.includes('context_length') || code.includes('max_context') || code.includes('prompt_too_long')) return true;
+      if (msg.includes('maximum context') || msg.includes('context length') || msg.includes('context window')) return true;
+      if (msg.includes('prompt too long') || msg.includes('input too long') || msg.includes('too many tokens')) return true;
+      if (msg.includes('prompt is too long')) return true;
+      if (msg.includes('input token count') && msg.includes('exceeds')) return true;
+      if (msg.includes('maximum prompt length')) return true;
+      if (msg.includes('reduce') && msg.includes('length') && (msg.includes('context') || msg.includes('tokens'))) return true;
+    }
+    return false;
+  } catch { return false; }
+}
 function buildDiagnosticsPayload({ record, finishReason, stopReason, completionErrorReason, assistantMessageMeta, diagnosticEvents }){
   try {
     const diag = {};
@@ -980,7 +1048,9 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   } catch {
     usePrelude = prelude || '';
   }
-  const payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+  let payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+  let dynamicPrelude = prelude || '';
+  let overflowRetries = 0;
   const usageHelper = sess.__arcana_chat_usage;
   if (usageHelper) usageHelper.reset();
 
@@ -1008,6 +1078,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   const assistantBlockTypes = new Set();
   let finishReason = '';
   let stopReason = '';
+  let lastErrorMessage = '';
   let sawAssistantText = false;
   let diagnosticEvents = [];
   let assistantMessageMeta = null;
@@ -1019,8 +1090,94 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     assistantBlockTypes.clear(); finishReason = ''; stopReason = '';
     sawAssistantText = false; diagnosticEvents = []; assistantMessageMeta = null;
     promptError = null;
+    lastErrorMessage = '';
+    // Build payload for this attempt (may be updated on overflow retries)
+    payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+
+    // --- Pre-prompt context overflow prevention ---
+    // The sessions-store threshold check (in handleUserMessage) only measures text summaries,
+    // not pi-agent-core's in-memory context which includes full tool call results.
+    // Check the actual pi-agent-core context usage before sending the prompt.
+    try {
+      if (sess && typeof sess.getContextUsage === 'function') {
+        const ctxUsage = sess.getContextUsage();
+        if (ctxUsage && ctxUsage.tokens != null && ctxUsage.contextWindow > 0) {
+          const configuredThreshold = _getCompressionThresholdTokens(agentHomeDir) || 100000;
+          const windowThreshold = Math.floor(ctxUsage.contextWindow * 0.8);
+          const effectiveThreshold = Math.min(configuredThreshold, windowThreshold);
+
+          if (ctxUsage.tokens > effectiveThreshold) {
+            try {
+              await compactSession({
+                sessionId,
+                agentId,
+                workspaceRoot,
+                agentHomeDir,
+                keepRecentMessages: 10,
+                policy: DEFAULT_CONTEXT_POLICY,
+                broadcast(ev) {
+                  try {
+                    if (!ev || typeof ev !== 'object') return;
+                    emit({ ...ev, sessionId, agentId, sessionKey });
+                  } catch {}
+                },
+                reason: 'pre_prompt_context_overflow',
+              });
+            } catch {}
+
+            try {
+              const agent = sess && sess.agent ? sess.agent : null;
+              if (agent && typeof agent.replaceMessages === 'function') {
+                agent.replaceMessages([]);
+              }
+            } catch {}
+
+            let hist = null;
+            try { hist = ssLoad(sessionId, { agentId }); } catch {}
+            try {
+              if (hist && Array.isArray(hist.messages) && hist.messages.length) {
+                const lastIdx = hist.messages.length - 1;
+                const last = hist.messages[lastIdx];
+                if (last && last.role === 'user') {
+                  const lastText = String(last.text || '').trim();
+                  const msgTrim = String(message || '').trim();
+                  if (lastText && msgTrim && lastText === msgTrim) {
+                    hist.messages = hist.messages.slice(0, -1);
+                  }
+                }
+              }
+            } catch {}
+
+            dynamicPrelude = buildSessionPrelude(hist, DEFAULT_CONTEXT_POLICY) || '';
+            usePrelude = dynamicPrelude || '';
+            payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+
+          }
+        }
+      }
+    } catch {}
+
+    if (usageHelper) usageHelper.reset();
+
+    // Idle timeout to detect stuck agent (no stream events for extended period)
+    const _idleTimeoutRaw = Number(process.env.ARCANA_PROMPT_IDLE_TIMEOUT_MS);
+    const _idleTimeoutMs = (Number.isFinite(_idleTimeoutRaw) && _idleTimeoutRaw > 0) ? _idleTimeoutRaw : 120000;
+    let _idleTimer = null;
+    let _idleReject = null;
+    const _idlePromise = new Promise((_, reject) => { _idleReject = reject; });
+    const _resetIdleTimer = () => {
+      if (_idleTimer) clearTimeout(_idleTimer);
+      if (_idleReject) {
+        _idleTimer = setTimeout(() => {
+          try { if (sess && typeof sess.abort === 'function') sess.abort(); } catch {}
+          try { _idleReject(new Error('Agent prompt idle timeout (' + _idleTimeoutMs + 'ms) — no stream events received. The agent may be stuck.')); } catch {}
+          _idleReject = null;
+        }, _idleTimeoutMs);
+      }
+    };
 
     const unsub = sess.subscribe((ev) => {
+      try { _resetIdleTimer(); } catch {}
       try {
         const t = ev && ev.type ? String(ev.type) : '';
 
@@ -1084,35 +1241,139 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
             }
           } catch {}
           try {
+            if (msg.errorMessage){
+              lastErrorMessage = String(msg.errorMessage);
+            }
+          } catch {}
+          try {
             const meta = extractAssistantMessageMeta(msg);
             if (meta) assistantMessageMeta = meta;
           } catch {}
         }
       } catch {}
     });
+    _resetIdleTimer(); // start idle timer
     try {
-      await runWithContext(ctx, () => sess.prompt(payloadMsg));
+      await Promise.race([
+        runWithContext(ctx, () => sess.prompt(payloadMsg)),
+        _idlePromise,
+      ]);
     } catch (e) {
       promptError = e;
     } finally {
+      if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+      _idleReject = null;
       try { unsub && unsub(); } catch {}
     }
 
+    // Fallback: if subscriber didn't capture error info (e.g. HTTP 413 only emits
+    // agent_end, not message_end), read directly from pi-agent-core's agent state.
+    try {
+      const agent = sess && sess.agent ? sess.agent : null;
+      if (agent) {
+        const agentError = agent.state && agent.state.error ? String(agent.state.error) : '';
+        if (agentError && !lastErrorMessage) {
+          lastErrorMessage = agentError;
+        }
+        // Also check the last message in agent state for stopReason/errorMessage
+        const msgs = agent.state && Array.isArray(agent.state.messages) ? agent.state.messages : [];
+        if (msgs.length > 0) {
+          const last = msgs[msgs.length - 1];
+          if (last && last.role === 'assistant') {
+            if (last.stopReason && !stopReason) stopReason = String(last.stopReason);
+            if (last.errorMessage && !lastErrorMessage) lastErrorMessage = String(last.errorMessage);
+          }
+        }
+      }
+    } catch {}
+
     // Determine if this attempt had an error
     const _completionErr = isCompletionErrorReason(finishReason) ? finishReason : (isCompletionErrorReason(stopReason) ? stopReason : '');
-    const _hasError = !!(promptError || _completionErr);
+    const _hasError = !!(promptError || _completionErr || lastErrorMessage);
     if (!_hasError) break; // success
 
+    // Context overflow handling: compact + reset + immediate retry
+    const overflowMax = (DEFAULT_CONTEXT_POLICY && Number.isFinite(DEFAULT_CONTEXT_POLICY.maxOverflowRetries))
+      ? Number(DEFAULT_CONTEXT_POLICY.maxOverflowRetries)
+      : 3;
+    if (isContextOverflowError(promptError, finishReason, stopReason, lastErrorMessage) && overflowRetries < overflowMax) {
+      try {
+        const steps = (DEFAULT_CONTEXT_POLICY && Array.isArray(DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps) && DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps.length)
+          ? DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps
+          : [20, 10, 6];
+        const step = steps[Math.min(overflowRetries, steps.length - 1)];
+
+        await compactSession({
+          sessionId,
+          agentId,
+          workspaceRoot,
+          agentHomeDir,
+          keepRecentMessages: step,
+          policy: DEFAULT_CONTEXT_POLICY,
+          broadcast(ev){
+            try {
+              if (!ev || typeof ev !== 'object') return;
+              emit({ ...ev, sessionId, agentId, sessionKey });
+            } catch {}
+          },
+          reason: 'overflow',
+        });
+
+        // Clear pi-agent-core's in-memory messages so the next prompt starts fresh.
+        // The prelude will be rebuilt from the (now-compacted) sessions-store.
+        try {
+          const agent = sess && sess.agent ? sess.agent : null;
+          if (agent && typeof agent.replaceMessages === 'function'){
+            agent.replaceMessages([]);
+          }
+        } catch {}
+
+        // Reload history and drop trailing duplicate user message
+        let hist = null;
+        try { hist = ssLoad(sessionId, { agentId }); } catch {}
+        try {
+          if (hist && Array.isArray(hist.messages) && hist.messages.length){
+            const lastIdx = hist.messages.length - 1;
+            const last = hist.messages[lastIdx];
+            if (last && last.role === 'user'){
+              const lastText = String(last.text || '').trim();
+              const msgTrim = String(message || '').trim();
+              if (lastText && msgTrim && lastText === msgTrim){
+                hist.messages = hist.messages.slice(0, -1);
+              }
+            }
+          }
+        } catch {}
+
+        // Build a tighter prelude for retry
+        const retryPolicy = { ...(DEFAULT_CONTEXT_POLICY || {}), preludeMaxMessages: step };
+        dynamicPrelude = buildSessionPrelude(hist, retryPolicy) || '';
+        usePrelude = dynamicPrelude || '';
+        payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+
+        overflowRetries += 1;
+
+        // Reset usage helper before retry
+        if (usageHelper) usageHelper.reset();
+
+        // Do not consume transient retry budget for overflow compaction
+        _attempt -= 1;
+        continue;
+      } catch {
+        // If compaction/reset fails, fall through to transient retry logic below.
+      }
+    }
+
+    // Transient retry logic
     const _retryable = isRetryableCompletionError(promptError, finishReason, stopReason);
     if (!_retryable || _attempt >= maxAttempts) break; // final failure or non-retryable
 
     try { console.warn('[arcana:gateway-v2] completion retry attempt=%d/%d delay=%dms reason=%s', _attempt, maxAttempts, retryDelayMs, promptError ? String(promptError.message || promptError).slice(0, 200) : _completionErr); } catch {}
-    await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
 
     // Reset usage helper for next attempt
     if (usageHelper) usageHelper.reset();
   }
-
   const usage = sess.__arcana_chat_usage ? sess.__arcana_chat_usage.snapshot() : { contextTokens: 0, outputTokens: 0, totalTokens: 0 };
   let sessionTokensTotal = 0;
   let sessionObjForTokens = null;
@@ -1614,6 +1875,8 @@ export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessio
     } catch {}
   }
   if (!sessionId) return { ok: false, reason: 'missing_sessionId' };
+  // Ensure a session record exists so reset works after restarts
+  try { await ensureChatSession({ sessionId, agentId, policy: 'restricted' }); } catch {}
 
   let cleared = false;
   for (const rec of chatSessions.values()){

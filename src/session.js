@@ -13,7 +13,7 @@ import createSubagentsTool from './tools/subagents.js';
 import { createCronTool } from './tools/cron.js';
 import { createHeartbeatTool } from './tools/heartbeat.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
-import { join, dirname, extname } from 'node:path';
+import { join, dirname, extname, basename } from 'node:path';
 import { resolveArcanaHome, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, writeFileSync, promises as fsp } from 'node:fs';
@@ -124,11 +124,23 @@ export async function createArcanaSession(opts={}){
       agentHomeRoot = workspaceRoot;
     }
   }
+  // Agent id is needed for per-agent secret names like:
+  // agents/<agentId>/providers/<provider>/api_key
+  let agentId = String(opts.agentId || '').trim();
+  if (!agentId) {
+    try { agentId = basename(String(agentHomeRoot || '').replace(/[\/\\]+$/, '')); } catch {}
+  }
+  if (!agentId) agentId = 'default';
+
   const globalCfg = loadArcanaConfig();
-  applyProviderEnv(globalCfg);
 
   const agentCfg = loadAgentConfig(agentHomeRoot);
   const cfg = mergeAgentConfig(globalCfg, agentCfg);
+
+  // Apply provider env wiring based on the *effective* merged config so
+  // per-agent overrides take precedence and we don't leak global provider
+  // base URLs into inference for other providers.
+  applyProviderEnv(cfg);
 
   const secrets = createSecretsContext({ agentHomeRoot });
 
@@ -484,22 +496,110 @@ export async function createArcanaSession(opts={}){
 
   let model = resolveModel();
 
-  // Inject Codex CLI identification headers for OpenAI provider.
-  // The OpenAI API requires `originator: codex_cli_rs` header for certain models/endpoints,
-  // otherwise it returns 400 "This API endpoint is only accessible via the official Codex CLI".
-  if (model){
-    const modelProviderNorm = String(model.provider || '').trim().toLowerCase();
-    if (modelProviderNorm === 'openai' && providerName.toLowerCase() === 'openai') {
-      model = {
-        ...model,
-        headers: {
-          ...model.headers,
-          'originator': 'codex_cli_rs',
-          'User-Agent': 'codex/0.1.0',
+  // --- Configurable HTTP request headers (HEADERS.json) ---
+  // Load and apply header rules after model resolution and before tools are created.
+  try {
+    function pickCaseInsensitive(obj, key){
+      try {
+        if (!obj || typeof obj !== 'object') return null;
+        const want = String(key || '').toLowerCase();
+        for (const [k, v] of Object.entries(obj)){
+          if (String(k).toLowerCase() === want) return (v && typeof v === 'object') ? v : null;
         }
-      };
+      } catch {}
+      return null;
     }
-  }
+
+    function mergeHeadersCaseInsensitive(base, patch){
+      const map = new Map(); // lowerName -> [preservedCaseName, value]
+      try {
+        const addFrom = (src, isPatch)=>{
+          if (!src || typeof src !== 'object') return;
+          for (const [k, v] of Object.entries(src)){
+            const lower = String(k).toLowerCase();
+            if (isPatch && v == null){
+              map.delete(lower);
+              continue;
+            }
+            if (v == null) continue;
+            map.set(lower, [k, v]);
+          }
+        };
+        addFrom(base, false);
+        addFrom(patch, true);
+        const out = {};
+        for (const [, [name, val]] of map){ out[name] = val; }
+        return out;
+      } catch { return { ...(base||{}) }; }
+    }
+
+    function readJsonIfExists(p){
+      try {
+        if (!p || !existsSync(p)) return null;
+        const raw = readFileSync(p, 'utf-8');
+        if (!raw) return null;
+        try { const obj = JSON.parse(raw); return (obj && typeof obj === 'object') ? obj : null; } catch { return null; }
+      } catch { return null; }
+    }
+
+    function applyHeaderRulesToModel(modelIn){
+      try {
+        if (!modelIn || typeof modelIn !== 'object') return modelIn;
+        const prov = String(modelIn.provider || '').trim().toLowerCase();
+        const api = String(modelIn.api || '').trim();
+        const id = String(modelIn.id || '').trim();
+
+        // Collect HEADERS.json files in increasing precedence; later wins.
+        const pkgRootLocal = arcanaPkgRoot();
+        const repoRootLocal = dirname(pkgRootLocal);
+        let arcanaHome = '';
+        try { arcanaHome = resolveArcanaHome() || ''; } catch { arcanaHome = ''; }
+
+        const files = [
+          join(pkgRootLocal, '.pi', 'HEADERS.json'),
+          arcanaHome ? join(arcanaHome, 'HEADERS.json') : null,
+          join(repoRootLocal, '.pi', 'HEADERS.json'),
+          agentHomeRoot ? join(agentHomeRoot, 'HEADERS.json') : null,
+        ].filter(Boolean);
+
+        let merged = (modelIn.headers && typeof modelIn.headers === 'object') ? { ...modelIn.headers } : {};
+
+        for (const f of files){
+          const root = readJsonIfExists(f);
+          if (!root || typeof root !== 'object') continue;
+
+          const hasSchemaKeys = (
+            Object.prototype.hasOwnProperty.call(root, 'all') ||
+            Object.prototype.hasOwnProperty.call(root, 'providers') ||
+            Object.prototype.hasOwnProperty.call(root, 'apis') ||
+            Object.prototype.hasOwnProperty.call(root, 'models')
+          );
+
+          const allPatch = hasSchemaKeys ? (root.all && typeof root.all === 'object' ? root.all : null) : root;
+          const provPatch = (hasSchemaKeys && root.providers && prov) ? pickCaseInsensitive(root.providers, prov) : null;
+          const apiPatch = (hasSchemaKeys && root.apis && api) ? pickCaseInsensitive(root.apis, api) : null;
+          const modelsObj = hasSchemaKeys && root.models && typeof root.models === 'object' ? root.models : null;
+
+          if (allPatch) merged = mergeHeadersCaseInsensitive(merged, allPatch);
+          if (provPatch) merged = mergeHeadersCaseInsensitive(merged, provPatch);
+          if (apiPatch) merged = mergeHeadersCaseInsensitive(merged, apiPatch);
+          if (modelsObj && id){
+            const keysToTry = [];
+            if (prov) keysToTry.push(`${prov}:${id}`, `${prov}/${id}`);
+            if (prov === 'openai-compatible') keysToTry.push(`openai:${id}`, `openai/${id}`);
+            for (const k of keysToTry){
+              const m = pickCaseInsensitive(modelsObj, k);
+              if (m) merged = mergeHeadersCaseInsensitive(merged, m);
+            }
+          }
+        }
+
+        return { ...modelIn, headers: merged };
+      } catch { return modelIn; }
+    }
+
+    if (model) model = applyHeaderRulesToModel(model);
+  } catch {}
 
   // Create tool-daemon client and proxy tools. We always register a proxy 'bash'
   // tool, but activation is controlled by execPolicy via setActiveToolsByName.
@@ -575,7 +675,7 @@ export async function createArcanaSession(opts={}){
   arcanaSkills = filterDisabledSkillsForConfig(arcanaSkills, cfg);
   let skillTools = []; let skillToolMap = new Map();
   try {
-    const res = await loadSkillTools(arcanaSkills);
+    const res = await loadSkillTools(arcanaSkills, { agentHomeRoot });
     skillTools = res.tools || [];
     skillToolMap = res.skillToolNamesBySkill || new Map();
   } catch {}
@@ -681,7 +781,7 @@ export async function createArcanaSession(opts={}){
             arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
             arcanaSkills = filterDisabledSkillsForConfig(arcanaSkills, cfg);
             try {
-              const res = await loadSkillTools(arcanaSkills);
+              const res = await loadSkillTools(arcanaSkills, { agentHomeRoot });
               skillTools = res.tools || [];
               skillToolMap = res.skillToolNamesBySkill || new Map();
             } catch {}
@@ -819,6 +919,19 @@ export async function createArcanaSession(opts={}){
   });
 
   createdSession = created && created.session ? created.session : null;
+  // Disable pi-agent-core's built-in auto-compaction and auto-retry.
+  // Arcana handles all context compression and retry logic at the gateway layer
+  // to avoid race conditions between the two systems.
+  try {
+    if (createdSession && typeof createdSession.setAutoCompactionEnabled === 'function'){
+      createdSession.setAutoCompactionEnabled(false);
+    }
+  } catch {}
+  try {
+    if (createdSession && typeof createdSession.setAutoRetryEnabled === 'function'){
+      createdSession.setAutoRetryEnabled(false);
+    }
+  } catch {}
 
   // Optionally capture the last LLM request context and provider payload
   // for gateway-v2 failure logs. This wraps the underlying pi-agent-core
@@ -860,35 +973,68 @@ export async function createArcanaSession(opts={}){
 	// Apply per-agent provider API key (runtime override) so pi-ai does not rely on process.env.
 	try {
 		const modelProvider = model && model.provider ? String(model.provider).trim() : '';
+		const modelProviderLower = modelProvider.toLowerCase();
 		const cfgProvider = providerName ? String(providerName).trim() : '';
 		const cfgProviderLower = cfgProvider.toLowerCase();
-		const prov = cfgProvider || modelProvider || '';
-		let key = providerKey;
-		// Prefer secrets bound for the configured provider name, falling back to the
-		// resolved model provider when no explicit provider is configured.
-		if (!key) {
+
+		function agentSecretName(aid, prov){
 			try {
-				if (cfgProvider) {
-					key = await secrets.getProviderApiKey(cfgProvider);
-				} else if (prov) {
-					key = await secrets.getProviderApiKey(prov);
-				}
-			} catch {
-				key = providerKey;
-			}
+				const a = String(aid || '').trim();
+				const p = String(prov || '').trim().toLowerCase();
+				if (!a || !p) return '';
+				return `agents/${a}/providers/${p}/api_key`;
+			} catch { return ''; }
 		}
+
+		async function resolveProviderKey(prov){
+			const p = String(prov || '').trim();
+			if (!p) return '';
+			// Prefer per-agent namespaced secret
+			try {
+				const name = agentSecretName(agentId, p);
+				if (name) {
+					const v = await secrets.getText(name);
+					if (v) return v;
+				}
+			} catch {}
+			// Fallback to standard provider secret: providers/<provider>/api_key
+			try {
+				const v = await secrets.getProviderApiKey(p);
+				if (v) return v;
+			} catch {}
+			return '';
+		}
+
+		// Prefer Secrets bindings over legacy inline config keys.
+		let key = '';
+		try {
+			if (cfgProvider) key = await resolveProviderKey(cfgProvider);
+		} catch {}
+		try {
+			if (!key && modelProvider && modelProviderLower && modelProviderLower !== cfgProviderLower) {
+				key = await resolveProviderKey(modelProvider);
+			}
+		} catch {}
+
+		// Fallback: legacy inline config key (cfg.key).
+		if (!key) key = providerKey;
+
 		const authStorage = created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage;
 		if (key && authStorage && typeof authStorage.setRuntimeApiKey === 'function') {
-			// When cfg.provider is "openai-compatible" but the resolved model is
-			// backed by the "openai" provider in pi-ai, fetch the key using the
-			// configured provider name but apply it to the real provider id so
-			// authentication succeeds.
-			if (cfgProviderLower === 'openai-compatible' && modelProvider === 'openai') {
+			// When cfg.provider is "openai-compatible" but the resolved model is backed
+			// by the "openai" provider in pi-ai, apply the key to both ids.
+			if (cfgProviderLower === 'openai-compatible' && modelProviderLower === 'openai') {
 				authStorage.setRuntimeApiKey('openai', key);
-				// Also register under the configured alias for completeness.
 				authStorage.setRuntimeApiKey('openai-compatible', key);
-			} else if (prov) {
-				authStorage.setRuntimeApiKey(prov, key);
+			} else {
+				// Prefer applying to the resolved model provider. Also register under the
+				// configured provider id when they differ (harmless and improves compatibility).
+				if (modelProvider) authStorage.setRuntimeApiKey(modelProvider, key);
+				if (cfgProvider && cfgProviderLower && cfgProviderLower !== modelProviderLower) {
+					authStorage.setRuntimeApiKey(cfgProvider, key);
+				} else if (!modelProvider && cfgProvider) {
+					authStorage.setRuntimeApiKey(cfgProvider, key);
+				}
 			}
 		}
 	} catch {}

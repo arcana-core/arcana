@@ -6,6 +6,7 @@
 import { existsSync, statSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createIsolatedSkillExecutor } from './tool-sandbox/isolated-skill-executor.js';
 
 function expandHomePath(p){
   try{
@@ -50,7 +51,26 @@ function listToolNamesForSkill(skillDir){
   }
 }
 
-export async function loadSkillTools(skills){
+
+function findToolSafety(skill, toolName){
+  try {
+    const list = Array.isArray(skill && skill.tools) ? skill.tools : [];
+    const name = String(toolName || '').trim();
+    if (!name) return {};
+    const match = list.find((t)=> t && String(t.name||'').trim() == name);
+    if (!match) return {};
+    return {
+      allowNetwork: match.allowNetwork,
+      allowWrite: match.allowWrite,
+      allowedHosts: match.allowedHosts,
+      allowedWritePaths: match.allowedWritePaths,
+      allowedReadPaths: match.allowedReadPaths,
+    };
+  } catch {
+    return {};
+  }
+}
+export async function loadSkillTools(skills, opts = {}){
   const toolsOut = [];
   const mapSkillToTools = new Map(); // skillName -> toolNames[]
   const errors = [];
@@ -84,8 +104,15 @@ export async function loadSkillTools(skills){
           const fn = (mod && mod.default && typeof mod.default === 'function') ? mod.default : null;
           if (!fn) { errors.push({ skill: s.name, tool: name, error: 'no_default_factory' }); continue; }
           const def = await Promise.resolve(fn());
-          if (!def || !def.name || typeof def.execute !== 'function') { errors.push({ skill: s.name, tool: name, error: 'invalid_definition' }); continue; }
-          toolsOut.push(def);
+          if (!def || !def.name || typeof def.execute !== 'function') { errors.push({ skill: s.name, tool: name, error: 'invalid_definition' }); continue; }          const safety = findToolSafety(s, def.name);
+          const isolatedExec = createIsolatedSkillExecutor({
+            toolEntry: entry,
+            toolName: def.name,
+            skillSafety: safety,
+            agentHomeRoot: opts.agentHomeRoot,
+          });
+
+          toolsOut.push({ ...def, execute: isolatedExec, __arcanaExecution: 'isolated' });
           toolNames.push(def.name);
         } catch (e) {
           errors.push({ skill: s.name, tool: name, error: (e && e.message) ? e.message : String(e) });

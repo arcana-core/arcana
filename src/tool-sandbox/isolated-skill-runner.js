@@ -18,6 +18,126 @@
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { createSafeOps } from '../tools/safe-ops.js';
+import { createSecretsContext } from '../secrets/context.js';
+
+
+function serializeHeaders(h){
+  try {
+    if (!h) return undefined;
+    if (Array.isArray(h)) return h;
+    if (typeof Headers !== 'undefined' && h instanceof Headers){
+      const out = [];
+      for (const [k,v] of h.entries()) out.push([k,v]);
+      return out;
+    }
+    if (typeof h === 'object'){
+      const out = [];
+      for (const [k,v] of Object.entries(h)) out.push([k, String(v)]);
+      return out;
+    }
+  } catch {}
+  return undefined;
+}
+
+function serializeBody(b){
+  if (b == null) return undefined;
+  if (typeof b === 'string') return b;
+  // Buffer/Uint8Array/ArrayBuffer are structured-cloneable over IPC
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(b)) return b;
+  if (b instanceof Uint8Array) return b;
+  if (b instanceof ArrayBuffer) return new Uint8Array(b);
+  // Don't support streaming bodies in the broker v0
+  throw new Error('unsupported_body');
+}
+
+function createHttpBrokerFetch(){
+  if (!process.send || typeof process.send !== 'function'){
+    return null;
+  }
+  let nextId = 1;
+  const pending = new Map();
+
+  const onMessage = (msg)=>{
+    try {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type !== 'safeops_http_response') return;
+      const id = msg.id;
+      const p = pending.get(id);
+      if (!p) return;
+      pending.delete(id);
+      if (msg.error){
+        const e = new Error(String(msg.error.message || 'http_error'));
+        try { e.code = msg.error.code; } catch {}
+        p.reject(e);
+        return;
+      }
+      const headers = Array.isArray(msg.headers) ? msg.headers : undefined;
+      const body = msg.body !== undefined ? msg.body : undefined;
+      // Build a real Response so downstream code can call res.text()/arrayBuffer()/etc.
+      const res = new Response(body, { status: msg.status || 200, headers });
+      p.resolve(res);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  try { process.on('message', onMessage); } catch {}
+
+  const brokerFetch = (u, init = {})=>{
+    const id = nextId++;
+    return new Promise((resolve, reject)=>{
+      pending.set(id, { resolve, reject });
+      const payload = {
+        type: 'safeops_http_fetch',
+        id,
+        url: String(u),
+        init: {
+          method: init.method,
+          headers: serializeHeaders(init.headers),
+          body: undefined,
+          redirect: init.redirect,
+          timeout: init.timeout,
+        }
+      };
+      try {
+        if (init.body !== undefined) payload.init.body = serializeBody(init.body);
+      } catch (e) {
+        pending.delete(id);
+        reject(e);
+        return;
+      }
+
+      const sig = init.signal;
+      const onAbort = ()=>{
+        try {
+          if (process.send) process.send({ type: 'safeops_http_cancel', id });
+        } catch {}
+      };
+      try {
+        if (sig && typeof sig.addEventListener === 'function') sig.addEventListener('abort', onAbort, { once: true });
+        if (sig && sig.aborted) onAbort();
+      } catch {}
+
+      try {
+        process.send(payload);
+      } catch (e) {
+        pending.delete(id);
+        reject(e);
+      }
+    });
+  };
+
+  return brokerFetch;
+}
+
+function disableDirectNetworkBestEffort(){
+  // Not a security boundary by itself; just prevents accidental direct net usage.
+  try {
+    if (typeof globalThis.fetch === 'function'){
+      globalThis.fetch = async ()=>{ throw new Error('direct_network_disabled_use_safeOps'); };
+    }
+  } catch {}
+}
 
 function redirectConsoleToStderr(){
   try {
@@ -74,6 +194,7 @@ function buildAbortSignal(){
 
 async function main(){
   redirectConsoleToStderr();
+  disableDirectNetworkBestEffort();
 
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let lineRead = false;
@@ -99,6 +220,10 @@ async function main(){
     const ctx = payload && typeof payload.ctx === 'object' && payload.ctx !== null ? payload.ctx : {};
     const safety = payload && typeof payload.safety === 'object' && payload.safety !== null ? payload.safety : {};
 
+    const agentHomeRoot = payload && payload.agentHomeRoot
+      ? String(payload.agentHomeRoot)
+      : (ctx && (ctx.agentHomeRoot || ctx.agentDir || ctx.agentHome) ? String(ctx.agentHomeRoot || ctx.agentDir || ctx.agentHome) : '');
+
     if (!toolEntry){
       send({ type: 'error', error: { message: 'missing_tool_entry' } });
       try { process.exit(1); } catch {}
@@ -110,7 +235,7 @@ async function main(){
       const url = toolEntry.startsWith('file:') ? toolEntry : pathToFileURL(toolEntry).href;
       mod = await import(url);
     } catch (e) {
-      send({ type: 'error', error: { message: 'import_failed', details: String(e && e.message ? e.message : e) } });
+      send({ type: 'error', error: { message: 'import_failed', details: String(e && e.stack ? e.stack : (e && e.message ? e.message : e)) } });
       try { process.exit(1); } catch {}
       return;
     }
@@ -137,14 +262,21 @@ async function main(){
       return;
     }
 
+    const brokerFetch = createHttpBrokerFetch();
+
     const safeOps = createSafeOps({
       allowNetwork: safety && safety.allowNetwork !== undefined ? !!safety.allowNetwork : true,
       allowWrite: safety && safety.allowWrite !== undefined ? !!safety.allowWrite : true,
       allowedHosts: Array.isArray(safety && safety.allowedHosts) ? safety.allowedHosts : undefined,
       allowedWritePaths: Array.isArray(safety && safety.allowedWritePaths) ? safety.allowedWritePaths : undefined,
+      // Strong net isolation: the child process must not open sockets directly.
+      // All HTTP(S) goes through the parent broker, which enforces allowedHosts.
+      fetchImpl: brokerFetch || (async ()=>{ throw new Error('http_broker_unavailable'); }),
     });
 
-    const ctxWithSafeOps = { ...(ctx || {}), safeOps };
+    const secrets = createSecretsContext({ agentHomeRoot });
+
+    const ctxWithSafeOps = { ...(ctx || {}), safeOps, secrets, agentHomeRoot };
 
     const { signal } = buildAbortSignal();
 

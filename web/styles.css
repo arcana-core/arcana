@@ -210,6 +210,9 @@ body{background:radial-gradient(circle at top,#f8f9ff 0%,#e7ebf6 40%,#dde3f2 100
 .tools-card.selected{border-color:#3b82f6;box-shadow:0 0 0 1px rgba(59,130,246,.35),0 6px 16px rgba(15,23,42,.16);background:#f5f7ff}
 .tools-card-header{display:flex;align-items:center;gap:6px}
 .tools-card-header-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px;margin-left:4px}
+.tools-card-header-right .tools-card-badges{order:2}
+.tools-card-header-right .tools-card-abort{order:1}
+.tools-card-header-right .tools-card-abort{margin-bottom:2px}
 .tools-card-name{font-size:13px;font-weight:600;color:#111827;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tools-card-status{font-size:11px;font-weight:500;color:#6b7280;text-transform:uppercase;letter-spacing:.08em}
 .tools-card-badges{display:flex;gap:4px;align-items:center;justify-content:flex-end}

@@ -1,17 +1,17 @@
 .DS_Store
-
+arcana.config.json
 node_modules/
 artifacts/
 .arcana/
 .cache/
 .tmp/
-.tmp_openclaw/
 tmp-*/
+.tmp*/
+.cache/
 tmp-pw-*/
 
 *.log
 *.tmp
 *.swp
 dist/
-whiteboard/data/boards/
-whiteboard/data/control_token
+whiteboard/

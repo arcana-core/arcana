@@ -1,6 +1,6 @@
 import { promises as fsp } from 'node:fs';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, readdirSync } from 'node:fs';
-import { dirname, extname, join, resolve as resolvePath } from 'node:path';
+import { dirname, extname, join, resolve as resolvePath, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
@@ -28,6 +28,7 @@ import { createPolicyEngine } from './runtime/policy.js';
 import { createEngine } from './runtime/engine.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../arcana-home.js';
 import { runChatMessage, abortChat, clearChatContext } from './chat-runtime.js';
+import { requestCompactionAbort } from '../context-manager.js';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed } from '../workspace-guard.js';
 import { loadArcanaConfig, loadAgentConfig } from '../config.js';
 import { loadArcanaSkills } from '../skills.js';
@@ -39,7 +40,7 @@ import {
 } from '../sessions-store.js';
 import { runDoctor } from '../doctor.js';
 import { createSupportBundle } from '../support-bundle.js';
-import { WELL_KNOWN_SECRETS, secrets } from '../secrets/index.js';
+import { WELL_KNOWN_SECRETS, providerApiKeyName, agentProviderApiKeyName, secrets } from '../secrets/index.js';
 import { readToolOutputBundle } from '../tool-output-store.js';
 
 
@@ -49,6 +50,7 @@ const WEB_ROOT = resolvePath(__dirname, "..", "..", "web");
 const PKG_ROOT = resolvePath(__dirname, "..", "..");
 const REPO_ROOT = dirname(PKG_ROOT);
 let apiToken = "";
+
 
 const DEFAULT_AGENT_ID = 'default';
 
@@ -734,11 +736,17 @@ export async function startGatewayV2({ port } = {}) {
           }
         } catch {}
 
-        // First try to abort an interactive chat session (Gateway chat runtime)
-        let chatResult = null;
+        // Attempt to abort any in-progress history compaction for this session.
+        // The compaction routine will broadcast a history_compact_end with aborted:true.
+        let compactionAborted = false;
         try {
-          chatResult = await abortChat({ agentId, sessionKey, sessionId });
+          const cr = requestCompactionAbort({ agentId, sessionId });
+          if (cr && cr.ok !== false){ compactionAborted = true; }
         } catch {}
+
+        // Also try to abort an interactive chat session (Gateway chat runtime)
+        let chatResult = null;
+        try { chatResult = await abortChat({ agentId, sessionKey, sessionId }); } catch {}
         if (chatResult && chatResult.ok){
           sendJson(res, 200, { ok: true, reason: null });
           return;
@@ -751,7 +759,8 @@ export async function startGatewayV2({ port } = {}) {
             eventBus.emit('event', { type: 'abort_done', agentId, sessionKey, sessionId: sessionId || null });
           }
         } catch {}
-        sendJson(res, 200, { ok: result && result.ok !== false, reason: result && result.reason ? result.reason : null });
+        const ok = (result && result.ok !== false) || compactionAborted || (chatResult && chatResult.ok);
+        sendJson(res, 200, { ok, reason: result && result.reason ? result.reason : null });
         return;
       }
 
@@ -1310,7 +1319,22 @@ export async function startGatewayV2({ port } = {}) {
       if (method === 'GET' && u.pathname === '/api/config'){
         try {
           const cfg = loadArcanaConfig();
-          const out = sanitizeConfig(cfg || {});
+          const out = sanitizeConfig(cfg || {}) || {};
+
+          // Best-effort: reflect whether a provider key exists in the Secrets vault.
+          // (UI should not rely on plaintext `key` in config.json.)
+          try {
+            const prov = String(out.provider || '').trim().toLowerCase();
+            if (prov) {
+              const name = providerApiKeyName(prov);
+              if (name) {
+                const { bindings } = await secrets.listNames('');
+                const b = bindings && bindings[name];
+                if (b && b.hasGlobal) out.has_key = true;
+              }
+            }
+          } catch {}
+
           sendJson(res, 200, out || {});
         } catch {
           sendJson(res, 200, {});
@@ -1347,8 +1371,49 @@ export async function startGatewayV2({ port } = {}) {
           applyStringConfigField(nextCfg, body, 'model', { allowDeleteOnEmpty: true });
           applyStringConfigField(nextCfg, body, 'base_url', { allowDeleteOnEmpty: true });
 
-          // key: keep existing behavior (only set when non-empty; never delete on empty).
-          applyStringConfigField(nextCfg, body, 'key', { allowDeleteOnEmpty: false });
+          // API key: store in Secrets (encrypted) instead of config.json
+          try {
+            const hasKeyField = Object.prototype.hasOwnProperty.call(body, 'key');
+            const keyRaw = hasKeyField ? String(body.key || '').trim() : '';
+            if (keyRaw) {
+              const prov = String(body.provider || nextCfg.provider || '').trim().toLowerCase();
+              if (!prov) {
+                sendJson(res, 400, { error: 'provider_required_for_key', message: 'provider is required to store API key in Secrets' });
+                return;
+              }
+              const name = providerApiKeyName(prov);
+              if (!name) {
+                sendJson(res, 400, { error: 'invalid_provider', message: 'Unsupported provider for Secrets key storage' });
+                return;
+              }
+              try {
+                await secrets.setText(name, keyRaw, 'global', '');
+                // Remove legacy inline key fields so they never get written back.
+                try { delete nextCfg.key; delete nextCfg.api_key; delete nextCfg.apiKey; } catch {}
+              } catch (e) {
+                const code = e && e.code;
+                if (code === 'VAULT_UNINITIALIZED') { sendJson(res, 409, { error: 'vault_uninitialized' }); return; }
+                if (code === 'VAULT_LOCKED') { sendJson(res, 423, { error: 'vault_locked' }); return; }
+                sendJson(res, 400, { error: 'secrets_set_failed', message: e && e.message ? String(e.message) : String(e || '') });
+                return;
+              }
+            }
+          } catch {}
+
+          // Never persist plaintext API keys in config.json when a Secrets binding exists.
+          try {
+            const prov = String(nextCfg.provider || '').trim().toLowerCase();
+            if (prov) {
+              const name = providerApiKeyName(prov);
+              if (name) {
+                const { bindings } = await secrets.listNames('');
+                const b = bindings && bindings[name];
+                if (b && b.hasGlobal) {
+                  try { delete nextCfg.key; delete nextCfg.api_key; delete nextCfg.apiKey; } catch {}
+                }
+              }
+            }
+          } catch {}
 
           // Optional history compression settings (non-secret)
           try {
@@ -1419,6 +1484,22 @@ export async function startGatewayV2({ port } = {}) {
           const cfgPath = join(agentHomeDir, 'config.json');
           if (!mergedCfg.path) mergedCfg.path = cfgPath;
           const out = sanitizeConfig(mergedCfg) || { provider: '', base_url: '', model: '', path: cfgPath, has_key: false };
+
+          // Best-effort: reflect whether an API key exists in Secrets for the resolved provider.
+          try {
+            const prov = String(out.provider || '').trim().toLowerCase();
+            if (prov) {
+              const nameAgent = agentProviderApiKeyName(agentId, prov);
+              const nameGlobal = providerApiKeyName(prov);
+              const { bindings } = await secrets.listNames(agentHomeDir);
+              const bAgent = nameAgent ? (bindings && bindings[nameAgent]) : null;
+              const bGlobal = nameGlobal ? (bindings && bindings[nameGlobal]) : null;
+              if ((bAgent && bAgent.hasAgent) || (bGlobal && (bGlobal.hasAgent || bGlobal.hasGlobal))) {
+                out.has_key = true;
+              }
+            }
+          } catch {}
+
           sendJson(res, 200, out);
         } catch {
           sendJson(res, 200, {});
@@ -1467,8 +1548,49 @@ export async function startGatewayV2({ port } = {}) {
               applyStringConfigField(nextCfg, body, 'model', { allowDeleteOnEmpty: true });
               applyStringConfigField(nextCfg, body, 'base_url', { allowDeleteOnEmpty: true });
 
-              // key: keep existing behavior (only set when non-empty; never delete on empty).
-              applyStringConfigField(nextCfg, body, 'key', { allowDeleteOnEmpty: false });
+              // API key: store in Secrets (encrypted) instead of config.json
+              try {
+                const hasKeyField = Object.prototype.hasOwnProperty.call(body, 'key');
+                const keyRaw = hasKeyField ? String(body.key || '').trim() : '';
+                if (keyRaw) {
+                  const prov = String(body.provider || nextCfg.provider || '').trim().toLowerCase();
+                  if (!prov) {
+                    sendJson(res, 400, { error: 'provider_required_for_key', message: 'provider is required to store API key in Secrets' });
+                    return;
+                  }
+                  const name = agentProviderApiKeyName(agentId, prov);
+                  if (!name) {
+                    sendJson(res, 400, { error: 'invalid_provider', message: 'Unsupported provider for Secrets key storage' });
+                    return;
+                  }
+                  try {
+                    await secrets.setText(name, keyRaw, 'agent', agentHomeDir);
+                    // Remove legacy inline key fields so they never get written back.
+                    try { delete nextCfg.key; delete nextCfg.api_key; delete nextCfg.apiKey; } catch {}
+                  } catch (e) {
+                    const code = e && e.code;
+                    if (code === 'VAULT_UNINITIALIZED') { sendJson(res, 409, { error: 'vault_uninitialized' }); return; }
+                    if (code === 'VAULT_LOCKED') { sendJson(res, 423, { error: 'vault_locked' }); return; }
+                    sendJson(res, 400, { error: 'secrets_set_failed', message: e && e.message ? String(e.message) : String(e || '') });
+                    return;
+                  }
+                }
+              } catch {}
+
+              // Never persist plaintext API keys in config.json when a Secrets binding exists.
+              try {
+                const prov = String(nextCfg.provider || '').trim().toLowerCase();
+                if (prov) {
+                  const name = agentProviderApiKeyName(agentId, prov);
+                  if (name) {
+                    const { bindings } = await secrets.listNames(agentHomeDir);
+                    const b = bindings && bindings[name];
+                    if (b && b.hasAgent) {
+                      try { delete nextCfg.key; delete nextCfg.api_key; delete nextCfg.apiKey; } catch {}
+                    }
+                  }
+                }
+              } catch {}
 
               // Optional history compression settings (non-secret)
               try {

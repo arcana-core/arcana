@@ -71,8 +71,12 @@ function readSkillToolsFromFrontmatter(skillFile){
         name: String(t.name),
         label: t.label ? String(t.label) : undefined,
         description: t.description ? String(t.description) : undefined,
+        // Optional sandbox tightening for isolated execution
+        allowNetwork: (t.allowNetwork === false) ? false : (t.allowNetwork === true ? true : undefined),
+        allowWrite: (t.allowWrite === false) ? false : (t.allowWrite === true ? true : undefined),
         allowedHosts: Array.isArray(t.allowedHosts) ? t.allowedHosts.map(String) : undefined,
         allowedWritePaths: Array.isArray(t.allowedWritePaths) ? t.allowedWritePaths.map(String) : undefined,
+        allowedReadPaths: Array.isArray(t.allowedReadPaths) ? t.allowedReadPaths.map(String) : undefined,
       });
     }
     return out;

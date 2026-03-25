@@ -89,6 +89,7 @@ Arcana treats each agent as an isolated unit along four axes:
     - Package skills (shared): `skills/` in this repo (or `<pkgRoot>/skills` in general).
     - Agent skills (preferred): `$ARCANA_HOME/agents/<agentId>/skills` and `$ARCANA_HOME/agents/<agentId>/.agents/skills`.
     - Workspace‑local skills (legacy/back‑compat): `<workspaceRoot>/skills`, `<workspaceRoot>/.agents/skills`.
+  - **Tool execution:** tools provided by user-authored skills are executed in an **isolated sandbox by default** (one Node child process per call). The tool-daemon is reserved for long-lived, stateful hosts like Playwright web tools and `bash`.
   - Skill discovery runs with `cwd = agentHomeRoot` and merges package + agent + workspace layers, de‑duplicating by skill name.
 
 ## Services Per Agent

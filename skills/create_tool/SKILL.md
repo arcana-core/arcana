@@ -1,13 +1,13 @@
 ---
 name: create_tool
-description: "在 <skill>/tools/<tool> 下生成受约束的 in-process 工具。默认属于当前 Agent 的 $ARCANA_HOME/agents/<agentId>/skills；仅在显式使用 --shared-skill 时写入项目 ./skills。工具可见性通过 Skill frontmatter 声明。"
+description: "在 <skill>/tools/<tool> 下生成受约束的工具（默认 isolated 沙箱执行）。默认属于当前 Agent 的 $ARCANA_HOME/agents/<agentId>/skills；仅在显式使用 --shared-skill 时写入项目 ./skills。工具可见性通过 Skill frontmatter 声明。"
 ---
 
 # Create Tool（Skill 归属 + SafeOps）
 
 本 Skill 的脚手架用于在“某个 Skill 名下”生成工具代码（工具与 Skill 一一归属），满足以下约束：
 - 可见性：工具只在该 Skill 被激活或当轮被提及时对模型可见（门控由插件控制）。
-- 执行安全：通过 SafeOps 受限接口执行（默认允许 http/https；写入仅限工作区；可按 Skill frontmatter 白名单收紧）。
+- 执行安全：默认 isolated 子进程沙箱执行；通过 ctx.safeOps 提供受限 FS/HTTP（默认允许 http/https；写入仅限工作区；可按 Skill frontmatter 白名单收紧）。
 - 物理位置：`<skill>/tools/<tool>/`（默认位于 Agent Home 的 `$ARCANA_HOME/agents/<agentId>/skills/<skill>/tools/<tool>/`；如使用 `--shared-skill`，则位于工作区 `./skills/<skill>/tools/<tool>/`）。
 - 不生成全局插件/不注册全局工具。
 

@@ -42,4 +42,19 @@ export function providerApiKeyName(provider){
   return `providers/${p}/api_key`;
 }
 
-export default { WELL_KNOWN_SECRETS, providerApiKeyName };
+/**
+ * Map an agentId + provider id to a namespaced logical secret name.
+ *
+ * This is used by the Web UI config editor to store per-agent provider keys
+ * without writing plaintext keys into config.json.
+ *
+ * Example: agents/default/providers/anthropic/api_key
+ */
+export function agentProviderApiKeyName(agentId, provider){
+  const aid = String(agentId || '').trim();
+  const p = String(provider || '').trim().toLowerCase();
+  if (!aid || !p) return '';
+  return `agents/${aid}/providers/${p}/api_key`;
+}
+
+export default { WELL_KNOWN_SECRETS, providerApiKeyName, agentProviderApiKeyName };

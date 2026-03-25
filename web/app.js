@@ -1805,9 +1805,27 @@ function renderToolsPanel(sessionId){
         ctxBadge.textContent = 'CTX ' + formatCompactNumber(ctxForCard);
         badgeRow.appendChild(ctxBadge);
       }
-      if (badgeRow.childNodes.length){
-        headerRight.appendChild(badgeRow);
+      // Abort button for History Compression while running
+      if (a.toolName === 'History Compression' && a.status === 'running'){
+        const abortBtn = document.createElement('button');
+        abortBtn.className = 'btn btn-xs btn-outline btn-danger tools-card-abort';
+        abortBtn.textContent = 'Abort';
+        abortBtn.addEventListener('click', async (ev)=>{
+          try{ ev.stopPropagation && ev.stopPropagation(); } catch {}
+          try{
+            const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+            // Prefer the sessionKey persisted on the action (from history_compact_start)
+            const sessionKey = (a && typeof a.sessionKey === 'string' && a.sessionKey) ? a.sessionKey : getGatewayV2SessionKeyForCurrent();
+            const sessionId = sid; // details panel is bound to this sid
+            const token = getStoredApiToken();
+            const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+            await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey, sessionId }) });
+          } catch {}
+        });
+        headerRight.appendChild(abortBtn);
       }
+
+      if (badgeRow.childNodes.length){ headerRight.appendChild(badgeRow); }
 
       header.appendChild(pill);
       header.appendChild(nameEl);
@@ -2473,10 +2491,33 @@ async function saveGlobalConfigUI(){
     payload.history_compression_threshold_tokens = historyCompressionThreshold;
     payload.history_compression_keep_user_turns = historyCompressionKeep;
 
-    const key = (qs('cfg-key-global')||{}).value || '';
-    if (key) payload.key = key;
     const token = getStoredApiToken();
     const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+
+    const key = (qs('cfg-key-global')||{}).value || '';
+    if (key){
+      const prov = String(payload.provider || '').trim().toLowerCase();
+      if (!prov){ appendLog('[config] 保存全局 API Key 需要先选择 Provider'); return; }
+      const name = 'providers/' + prov + '/api_key';
+      try {
+        const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+        const rKey = await fetch('/api/secrets/import', { method:'POST', headers, body: JSON.stringify({ agentId, name, scope:'global', value: key }) });
+        if (rKey.status === 409 || rKey.status === 423){
+          appendLog('[config] 密钥箱未就绪，请先初始化/解锁后再保存 API Key');
+          try { openSecrets([name], { autoCloseOnUnlock:true }).catch(()=>{}) } catch {}
+          return;
+        }
+        if (!rKey.ok){
+          let j2 = {};
+          try { j2 = await rKey.json(); } catch { j2 = {}; }
+          appendLog('[config] 保存 API Key 到密钥箱失败: ' + (j2.error || j2.message || ('HTTP ' + rKey.status)));
+          return;
+        }
+      } catch (e) {
+        appendLog('[config] 保存 API Key 到密钥箱失败');
+        return;
+      }
+    }
     const r = await fetch('/api/config', { method:'POST', headers, body: JSON.stringify(payload) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 保存全局配置失败'); return; }
@@ -2497,6 +2538,9 @@ async function saveAgentConfigUI(){
       model: (qs('cfg-model-agent')||{}).value || '',
       base_url: (qs('cfg-base-url-agent')||{}).value || '',
     };
+
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
 
     const aEnabledEl = qs('cfg-compress-enabled-agent');
     if (aEnabledEl && typeof aEnabledEl.checked !== 'undefined'){
@@ -2526,9 +2570,28 @@ async function saveAgentConfigUI(){
     }
 
     const key = (qs('cfg-key-agent')||{}).value || '';
-    if (key) payload.key = key;
-    const token = getStoredApiToken();
-    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+    if (key){
+      const prov = String(payload.provider || '').trim().toLowerCase();
+      if (!prov){ appendLog('[config] 保存 Agent API Key 需要先选择 Provider'); return; }
+      const name = 'agents/' + aid + '/providers/' + prov + '/api_key';
+      try {
+        const rKey = await fetch('/api/secrets/import', { method:'POST', headers, body: JSON.stringify({ agentId: aid, name, scope:'agent', value: key }) });
+        if (rKey.status === 409 || rKey.status === 423){
+          appendLog('[config] 密钥箱未就绪，请先初始化/解锁后再保存 API Key');
+          try { openSecrets([name], { autoCloseOnUnlock:true }).catch(()=>{}) } catch {}
+          return;
+        }
+        if (!rKey.ok){
+          let j2 = {};
+          try { j2 = await rKey.json(); } catch { j2 = {}; }
+          appendLog('[config] 保存 API Key 到密钥箱失败: ' + (j2.error || j2.message || ('HTTP ' + rKey.status)));
+          return;
+        }
+      } catch (e) {
+        appendLog('[config] 保存 API Key 到密钥箱失败');
+        return;
+      }
+    }
     const r = await fetch('/api/agent-config', { method:'POST', headers, body: JSON.stringify(payload) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 保存 Agent 配置失败'); return; }
@@ -2557,8 +2620,6 @@ async function saveSkillsConfigUI(){
     } catch {}
 
     const body = { agentId: aid, disabled };
-    const token = getStoredApiToken();
-    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
     const r = await fetch('/api/skills', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
     try { j = await r.json(); } catch { j = null; }
@@ -2575,8 +2636,6 @@ async function clearAgentConfigUI(){
   try{
     const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
     const body = { agentId: aid, clear: true };
-    const token = getStoredApiToken();
-    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
     const r = await fetch('/api/agent-config', { method:'POST', headers, body: JSON.stringify(body) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[config] 清除 Agent 配置失败'); return; }
@@ -2605,8 +2664,6 @@ async function createSupportBundleUI(){
   try{
     appendLog('[support] 创建中...');
     const sid = getCurrentSessionId();
-    const token = getStoredApiToken();
-    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
     const r = await fetch('/api/support-bundle', { method:'POST', headers, body: JSON.stringify({ sessionId: sid }) });
     const j = await r.json();
     if (!r.ok || !j.ok){ appendLog('[support] 失败'); return; }
@@ -3475,8 +3532,6 @@ async function sendWithGatewayV2(){
     const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
     const sessionId = (typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || '';
     const body = { agentId, sessionKey, sessionId, text, policy };
-    const token = getStoredApiToken();
-    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
     const r = await fetch('/v2/turn', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
     try { j = await r.json(); } catch {}
@@ -4105,6 +4160,123 @@ function handleArcanaEvent(data){
         return;
       }
 
+      // History compression lifecycle -> render as a pseudo tool card
+      if (data.type === 'history_compact_start'){
+        const sid2 = data.sessionId || sid;
+        try {
+          const panel = getToolPanel(sid2);
+          // Build args summary
+          let parts = [];
+          if (typeof data.keepRecentMessages === 'number') parts.push('keepRecentMessages=' + data.keepRecentMessages);
+          if (typeof data.keepRecentUserTurns === 'number') parts.push('keepUserTurns=' + data.keepRecentUserTurns);
+          if (typeof data.reason === 'string' && data.reason) parts.push('reason=' + data.reason);
+          const argsSummary = parts.join(', ');
+          const now = new Date().toLocaleTimeString();
+          const snap = ensureLiveForSession(sid2);
+          // Ensure there is an open turn and use its index for the pseudo tool
+          const ti = ensureTurnOpenForSession(sid2, snap);
+          const id = 'history_compact:' + Date.now();
+          const action = {
+            id,
+            toolName: 'History Compression',
+            category: 'think',
+            status: 'running',
+            argsSummary,
+            argsFull: argsSummary,
+            startedAt: now,
+            endedAt: '',
+            sessionId: sid2,
+            turnIndex: ti,
+            ctxTokens: undefined,
+            tokTokens: undefined,
+            log: '',
+            canAbort: true,
+            kind: 'history_compact',
+            // Persist gateway sessionKey for precise abort routing
+            sessionKey: typeof data.sessionKey === 'string' ? data.sessionKey : '',
+          };
+          panel.actions.set(id, action);
+          panel.order.push(id);
+          panel.selectedId = id;
+          try{ scheduleSaveToolPanel(sid2); } catch {}
+          if (sid2 === getCurrentSessionId()){
+            if (activeLogTab === 'tools'){ try { renderToolsPanel(sid2); } catch {} }
+          }
+        } catch {}
+        logTools(sid2, 'history compression start');
+        return;
+      }
+
+      if (data.type === 'history_compact_end'){
+        const sid2 = data.sessionId || sid;
+        try {
+          const panel = getToolPanel(sid2);
+          // Find last running History Compression action
+          let target = null;
+          if (panel && Array.isArray(panel.order)){
+            for (let i = panel.order.length - 1; i >= 0; i--){
+              const id = panel.order[i];
+              const a = panel.actions.get(id);
+              if (!a) continue;
+              if ((a.kind === 'history_compact' || a.toolName === 'History Compression') && a.status === 'running'){
+                target = a; break;
+              }
+            }
+          }
+          const now = new Date().toLocaleTimeString();
+          const compacted = !!data.compacted;
+          const aborted = !!data.aborted;
+          const timedOut = !!data.timedOut;
+          const status = compacted ? 'done' : 'error';
+          if (!target){
+            // Create a minimal card if start was missed
+            const ti = getTurnIndexForEvent(sid2, ensureLiveForSession(sid2));
+            const id = 'history_compact:' + Date.now();
+            target = {
+              id,
+              toolName: 'History Compression',
+              category: 'think',
+              status,
+              argsSummary: '',
+              argsFull: '',
+              startedAt: now,
+              endedAt: now,
+              sessionId: sid2,
+              turnIndex: ti,
+              log: '',
+              canAbort: false,
+              kind: 'history_compact',
+            };
+            panel.actions.set(id, target);
+            panel.order.push(id);
+          } else {
+            target.status = status;
+            target.endedAt = now;
+            target.canAbort = false;
+          }
+          // If error and we have flags, mark selected to draw attention
+          if (!compacted){
+            panel.selectedId = target.id;
+          }
+          if (!compacted){
+            const lines = [];
+            if (aborted) lines.push('aborted');
+            if (timedOut) lines.push('timed out');
+            const line = lines.length ? ('history compression ' + lines.join(' & ')) : 'history compression failed';
+            target.log = target.log ? (target.log + '\n' + line) : line;
+          } else {
+            target.log = target.log ? (target.log + '\n' + 'history compression complete') : 'history compression complete';
+          }
+          try{ scheduleSaveToolPanel(sid2); } catch {}
+          if (sid2 === getCurrentSessionId()){
+            if (activeLogTab === 'tools'){ try { renderToolsPanel(sid2); } catch {} }
+          }
+        } catch {}
+        const msg = data.compacted ? 'history compression end: ok' : ('history compression end: ' + (data.aborted ? 'aborted' : (data.timedOut ? 'timeout' : 'error')));
+        logTools(sid2, msg);
+        return;
+      }
+
 
       // New events: steer enqueued / abort done
       if (data.type === 'steer_enqueued') { logMain(sid, 'steer enqueued: ' + (data.text||'')); return }
@@ -4255,7 +4427,7 @@ function handleArcanaEvent(data){
                 toolTokens: curTool,
                 llmTokens: nextLlm,
               });
-              const ctxForTools = (typeof data.contextTokens === 'number' && data.contextTokens >= 0) ? (Number(data.contextTokens) || 0) : null;
+              const ctxForTools = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens > 0) ? (Number(data.lastCallContextTokens) || 0) : null;
               if (ctxForTools !== null && panel.actions && typeof panel.actions.forEach === 'function'){
                 panel.actions.forEach((action)=>{
                   if (!action) return;

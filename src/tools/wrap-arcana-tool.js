@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { createSafeOps } from './safe-ops.js';
 import { getContext } from '../event-bus.js';
-import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
+import { parseFrontmatter } from '../util/frontmatter.js';
 
 function readSkillToolOverrides(skillDir, toolName){
   try{

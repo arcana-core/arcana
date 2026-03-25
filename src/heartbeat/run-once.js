@@ -424,6 +424,7 @@ export async function runHeartbeatOnce({ agentId, sessionId, sessionKey, reason,
         const { session } = await createArcanaSession({
           workspaceRoot: effectiveWorkspaceRoot,
           agentHomeRoot,
+          agentId: effectiveAgentId,
           sessionId: backingSessionId,
           bootstrapContextMode: 'heartbeat_light',
         });

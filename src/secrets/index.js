@@ -1,10 +1,11 @@
-import { WELL_KNOWN_SECRETS, providerApiKeyName } from './well-known.js';
+import { WELL_KNOWN_SECRETS, providerApiKeyName, agentProviderApiKeyName } from './well-known.js';
 import { createSecretsContext } from './context.js';
 import store from './store.js';
 
 export {
   WELL_KNOWN_SECRETS,
   providerApiKeyName,
+  agentProviderApiKeyName,
   createSecretsContext,
   store as secrets,
 };
@@ -12,6 +13,7 @@ export {
 const api = {
   WELL_KNOWN_SECRETS,
   providerApiKeyName,
+  agentProviderApiKeyName,
   createSecretsContext,
   secrets: store,
 };
