@@ -1667,7 +1667,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     return { ok: false, mode: 'turn', error: 'completion_error: ' + errCore, text: lastAssistantText || out, logPath };
   }
 
-  if (!finalText && !sawAssistantText){
+  if (!finalText && !sawAssistantText && toolCalls === 0 && assistantBlockTypes.size === 0){
     try {
       const lp = buildChatLogPath(agentId, sessionKey, sessionId);
       const headerLines = [
@@ -1703,7 +1703,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       warning = 'empty_completion';
       try {
         const msg = 'empty_completion' + (logPath ? ' (log: ' + logPath + ')' : '');
-        emit({ type: 'error', sessionId, agentId, message: msg });
+        emit({ type: 'warning', sessionId, agentId, code: 'empty_completion', message: msg });
       } catch {}
     } catch {}
   }
