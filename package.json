@@ -29,5 +29,8 @@
     "ws": "^8.18.0",
     "zod": "^3.25.76"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  }
 }
