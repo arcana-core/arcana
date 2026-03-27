@@ -138,12 +138,19 @@ export function resolveModelFromConfig(cfg){
 export function inferProviderFromEnv(){
   const p = (process.env.ARCANA_PROVIDER||"").trim().toLowerCase();
   if (p) return p;
-  // Avoid inferring provider from secret env vars like *_API_KEY.
-  // Only use non-secret hints such as base URLs.
+  // Prefer explicit base URLs when present.
   if (process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE) return "openai";
   if (process.env.ANTHROPIC_BASE_URL) return "anthropic";
   if (process.env.GOOGLE_API_BASE) return "google";
   if (process.env.OPENROUTER_BASE_URL) return "openrouter";
+  // Infer from presence of standard API key env vars (presence check only; do not read values)
+  try { if (Object.prototype.hasOwnProperty.call(process.env, 'OPENAI_API_KEY')) return 'openai'; } catch {}
+  try { if (Object.prototype.hasOwnProperty.call(process.env, 'ANTHROPIC_API_KEY')) return 'anthropic'; } catch {}
+  try {
+    if (Object.prototype.hasOwnProperty.call(process.env, 'GOOGLE_API_KEY') || Object.prototype.hasOwnProperty.call(process.env, 'GEMINI_API_KEY')) return 'google';
+  } catch {}
+  try { if (Object.prototype.hasOwnProperty.call(process.env, 'OPENROUTER_API_KEY')) return 'openrouter'; } catch {}
+  try { if (Object.prototype.hasOwnProperty.call(process.env, 'XAI_API_KEY')) return 'xai'; } catch {}
   return "";
 }
 
