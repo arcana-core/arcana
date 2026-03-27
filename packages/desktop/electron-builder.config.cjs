@@ -1,9 +1,10 @@
-// Minimal electron-builder configuration for Arcana desktop DMG builds
+// Minimal electron-builder configuration for Arcana desktop DMG + MSI builds
 
 const enableCodeSign = process.env.ARCANA_CODESIGN === '1';
 
 const macConfig = {
   target: 'dmg',
+  artifactName: '${productName}-${version}-${os}-${arch}.${ext}',
   hardenedRuntime: true,
   gatekeeperAssess: false,
   entitlements: 'entitlements.mac.plist',
@@ -29,6 +30,10 @@ const config = {
     '!node_modules/**',
   ],
   mac: macConfig,
+  win: {
+    target: 'msi',
+    artifactName: '${productName}-${version}-${os}-${arch}.${ext}',
+  },
   extraResources: [
     { from: '../../server', to: 'server' },
     { from: '../../src', to: 'src' },

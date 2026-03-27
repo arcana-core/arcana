@@ -20,3 +20,7 @@ Storage isolation: the app sets a persistent Electron partition for its `Browser
 - Override: set env var `ARCANA_ELECTRON_PARTITION` to a trimmed, non-empty value before launch (e.g., `ARCANA_ELECTRON_PARTITION=persist:arcana-dev npm run dev`).
 
 Note: Auto-update and installers are not included in this phase.
+
+Releases
+- Official desktop builds are provided for macOS (DMG) and Windows (MSI).
+- Linux desktop installers are not provided at this time.

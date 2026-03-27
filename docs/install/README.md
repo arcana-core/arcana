@@ -1,7 +1,7 @@
 Install & Quickstart
 
 Prereqs
-- Node.js 18+ (LTS recommended)
+- Node.js 22+ (LTS recommended)
 - npm 9+
 - Optional: provider API key via Arcana secrets (e.g., bind providers/openai/api_key in the Secrets UI Secrets section; the value is stored encrypted in the internal vault).
 

@@ -10,7 +10,8 @@
     "dist": "electron-builder -c electron-builder.config.cjs",
     "dist:mac": "electron-builder --mac dmg -c electron-builder.config.cjs",
     "dist:mac:signed": "ARCANA_CODESIGN=1 electron-builder --mac dmg -c electron-builder.config.cjs",
-    "dist:mac:unsigned": "ARCANA_CODESIGN=0 electron-builder --mac dmg -c electron-builder.config.cjs"
+    "dist:mac:unsigned": "ARCANA_CODESIGN=0 electron-builder --mac dmg -c electron-builder.config.cjs",
+    "dist:win": "electron-builder --win msi -c electron-builder.config.cjs"
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.54.0",
@@ -26,5 +27,8 @@
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3",
     "@electron/notarize": "latest"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
