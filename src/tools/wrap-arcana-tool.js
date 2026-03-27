@@ -7,9 +7,22 @@
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
+import { initTheme } from '@mariozechner/pi-coding-agent';
 import { createSafeOps } from './safe-ops.js';
 import { getContext } from '../event-bus.js';
 import { parseFrontmatter } from '../util/frontmatter.js';
+
+// pi-coding-agent has a global theme Proxy that some renderers touch even in headless
+// mode. When Arcana is embedded (not started via pi CLI), the theme may be
+// uninitialized and throw: "Theme not initialized. Call initTheme() first."
+let __piThemeInitialized = false;
+function ensurePiThemeInitialized(){
+  if (__piThemeInitialized) return;
+  __piThemeInitialized = true;
+  try { initTheme(undefined, false); } catch {}
+}
+
+ensurePiThemeInitialized();
 
 function readSkillToolOverrides(skillDir, toolName){
   try{
@@ -52,11 +65,13 @@ export function wrapArcanaTool(factory, opts={}){
     label: ov.label || base.label,
     description: ov.description || base.description,
     async execute(callId, args, signal, onUpdate, ctx){
-      const safeOps = createSafeOps(mergedSafety);
       // Merge AsyncLocalStorage context with provided ctx; explicit ctx wins.
       const alsCtx = (typeof getContext === 'function' ? (getContext() || null) : null);
       const mergedCtx = { ...(alsCtx || {}), ...(ctx || {}) };
-      // Provide SafeOps to tool via ctx.safeOps
+      // Always create SafeOps from the merged safety config. This ensures
+      // per-tool constraints (allowedHosts, allowedWritePaths, etc.) from
+      // SKILL.md frontmatter are enforced consistently.
+      const safeOps = createSafeOps(mergedSafety);
       const ctxWithOps = { ...mergedCtx, safeOps };
       return base.execute(callId, args, signal, onUpdate, ctxWithOps);
     }

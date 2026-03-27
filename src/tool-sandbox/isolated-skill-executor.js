@@ -149,6 +149,11 @@ function buildFsReadArgs({ allowedReadPaths, toolEntryDir, workspaceRoot, agentH
   try { readPaths.push(resolve(root, 'src')); } catch {}
   try { readPaths.push(resolve(root, 'node_modules')); } catch {}
 
+  // In Electron (Arcana Desktop), process.resourcesPath is set. Some native deps (e.g. koffi) probe it with fs.existsSync().
+  // Under Node --experimental-permission, probing a non-allowed path throws instead of returning false.
+  // Allow read of resourcesPath so such probes don't crash tool startup.
+  try { if (process.resourcesPath) readPaths.push(process.resourcesPath); } catch {}
+
   // Allow reading Arcana home for secrets/memory access via the secrets store.
   try {
     const home = resolveArcanaHome();

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -17,50 +17,60 @@
           <div id="agents-list"></div>
         </div>
         <div id="sidebar" class="sidebar" style="width:240px">
-          <div style="padding:8px"><button id="new-session" class="btn btn-secondary btn-sm">新会话</button></div>
+          <div style="padding:8px"><button id="new-session" class="btn btn-secondary btn-sm" data-i18n="ui.newSession">新会话</button></div>
           <div id="session-list"></div>
         </div>
       </div>
       <div class="wechat">
     <header class="chat-header">
       <div class="title">Arcana</div>
-      <button id="clear-context" title="清理内部上下文（保留对话历史）" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;padding:4px;opacity:0.5;transition:opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>
+      <button id="clear-context" data-i18n-title="ui.clearContextTitle" title="清理内部上下文（保留对话历史）" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;padding:4px;opacity:0.5;transition:opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.5'"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg></button>
     </header>
     <main id="messages" class="chat-body">
       <div class="msg other">
         <img class="avatar" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><circle cx='32' cy='32' r='32' fill='%23e5e5e5'/><text x='50%' y='55%' dominant-baseline='middle' text-anchor='middle' fill='%23999' font-size='28'>A</text></svg>" alt="bot" />
-        <div class="bubble">欢迎使用 Arcana，对我说点什么吧～</div>
+        <div class="bubble" data-i18n="ui.welcome">欢迎使用 Arcana，对我说点什么吧～</div>
       </div>
     </main>
     <footer class="composer">
-      <button class="icon" title="更多">＋</button>
-      <textarea id="input" rows="1" placeholder="发送消息"></textarea>
+      <button class="icon" title="更多" data-i18n-title="ui.more">＋</button>
+      <textarea id="input" rows="1" placeholder="发送消息" data-i18n-placeholder="ui.inputPlaceholder"></textarea>
       <button
         id="stop"
         class="btn btn-outline btn-secondary btn-stop"
         type="button"
         aria-label="停止"
         title="停止"
+        data-i18n-title="ui.stop"
       >
         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <rect x="7" y="7" width="10" height="10" rx="1"></rect>
         </svg>
       </button>
-      <button id="send" class="btn btn-primary">发送</button>
+      <button id="send" class="btn btn-primary" data-i18n="ui.send">发送</button>
     </footer>
       <div id="more-panel" style="position:absolute;left:8px;right:8px;bottom:66px;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);padding:10px;display:none;">
-        <div style="font-weight:600;margin-bottom:6px;">高级选项</div>
+        <div style="font-weight:600;margin-bottom:6px;" data-i18n="ui.advanced.header">高级选项</div>
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#444;">
           <input id="fullshell" type="checkbox" />
-          允许本次会话完全开放命令行
+          <span data-i18n="ui.advanced.fullshell">允许本次会话完全开放命令行</span>
         </label>
-        <div style="color:#a00;font-size:12px;margin-top:6px;">高风险：仅在受信环境、确有需要时临时开启。关闭后恢复受限模式。</div>
+        <div style="color:#a00;font-size:12px;margin-top:6px;" data-i18n="ui.advanced.fullshellWarning">高风险：仅在受信环境、确有需要时临时开启。关闭后恢复受限模式。</div>
         <hr style="margin:10px 0;border:none;border-top:1px dashed #eee;" />
-        <div style="font-weight:600;margin-bottom:6px;">设置 / 诊断</div>
+        <div style="font-weight:600;margin-bottom:6px;" data-i18n="ui.advanced.settingsHeader">设置 / 诊断</div>
+
+        <!-- UI Language selector -->
+        <div style="display:flex;align-items:center;gap:8px;margin:6px 0;">
+          <div style="min-width:90px" data-i18n="ui.language">界面语言</div>
+          <select id="ui-lang">
+            <option value="en" data-i18n="ui.language.en">English</option>
+            <option value="zh-CN" data-i18n="ui.language.zh">简体中文</option>
+          </select>
+        </div>
 
         <div class="cfg-scope-tabs" aria-label="配置作用域">
-          <button id="cfg-scope-tab-global" class="cfg-scope-tab active" type="button" data-scope="global">全局默认</button>
-          <button id="cfg-scope-tab-agent" class="cfg-scope-tab" type="button" data-scope="agent">当前 Agent</button>
+          <button id="cfg-scope-tab-global" class="cfg-scope-tab active" type="button" data-scope="global" data-i18n="ui.advanced.scope.global">全局默认</button>
+          <button id="cfg-scope-tab-agent" class="cfg-scope-tab" type="button" data-scope="agent" data-i18n="ui.advanced.scope.agent">当前 Agent</button>
         </div>
 
         <div class="cfg-scope-panels">
@@ -247,6 +257,7 @@
       </div>
     </div>
   </div>
+  <script src='i18n.js'></script>
   <script src='app.js'></script>
 </body>
 </html>

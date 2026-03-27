@@ -1,4 +1,4 @@
-import { createAgentSession, DefaultResourceLoader, createReadTool, createGrepTool, createFindTool, createLsTool } from '@mariozechner/pi-coding-agent';
+import { createAgentSession, DefaultResourceLoader, createReadTool, createGrepTool, createFindTool, createLsTool, initTheme } from '@mariozechner/pi-coding-agent';
 import { getModel } from '@mariozechner/pi-ai';
 import { loadArcanaPlugins } from './plugin-loader.js';
 import { startServicesOnce } from './services/manager.js';
@@ -28,6 +28,17 @@ import * as globPkg from 'glob';
 import { createSecretsContext } from './secrets/index.js';
 
 const globSync = (...args) => (globPkg.globSync ?? globPkg.sync)(...args);
+
+// pi-coding-agent exports a global `theme` Proxy used by multiple renderers (including
+// some headless/export utilities). In headless Arcana environments (gateway/whiteboard),
+// pi's CLI entrypoint is not used, so the theme would otherwise remain uninitialized
+// and throw: "Theme not initialized. Call initTheme() first."
+let __piThemeInitialized = false;
+function ensurePiThemeInitialized(){
+  if (__piThemeInitialized) return;
+  __piThemeInitialized = true;
+  try { initTheme(undefined, false); } catch {}
+}
 
 function arcanaPkgRoot(){
   const here = fileURLToPath(new URL('.', import.meta.url)); // arcana/src/
@@ -141,6 +152,9 @@ export async function createArcanaSession(opts={}){
   // per-agent overrides take precedence and we don't leak global provider
   // base URLs into inference for other providers.
   applyProviderEnv(cfg);
+
+  // Ensure pi theme is initialized even in headless environments (gateway, tests).
+  ensurePiThemeInitialized();
 
   const secrets = createSecretsContext({ agentHomeRoot });
 
@@ -833,7 +847,10 @@ export async function createArcanaSession(opts={}){
             }
           } catch {}
           try {
-            emit({ type: 'skills_refresh', reason: 'watch' });
+            const visibleSkillNames = (Array.isArray(arcanaSkills) ? arcanaSkills : [])
+              .map((s) => s && s.name)
+              .filter(Boolean);
+            emit({ type: 'skills_refresh', reason: 'watch', skills: visibleSkillNames, agentId });
           } catch {}
         })().catch(() => {});
       }
@@ -919,12 +936,16 @@ export async function createArcanaSession(opts={}){
   });
 
   createdSession = created && created.session ? created.session : null;
-  // Disable pi-agent-core's built-in auto-compaction and auto-retry.
-  // Arcana handles all context compression and retry logic at the gateway layer
-  // to avoid race conditions between the two systems.
+  // Enable pi-agent-core's built-in auto-compaction so that context (including
+  // accumulated image base64 data from tool results) is automatically summarized
+  // and trimmed when approaching the token limit.  This prevents the request
+  // payload from growing unbounded and triggering proxy/gateway body-size errors.
+  //
+  // Auto-retry remains DISABLED — Arcana handles all retry logic at the gateway
+  // layer (with prelude rebuilding, overflow compaction, back-off, etc.).
   try {
     if (createdSession && typeof createdSession.setAutoCompactionEnabled === 'function'){
-      createdSession.setAutoCompactionEnabled(false);
+      createdSession.setAutoCompactionEnabled(true);
     }
   } catch {}
   try {

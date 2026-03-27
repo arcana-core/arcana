@@ -130,6 +130,7 @@ export class ChannelRuntime {
     this.onLocalReply = typeof opts.onLocalReply === "function" ? opts.onLocalReply : async () => {};
     this.onExecuteTurn = typeof opts.onExecuteTurn === "function" ? opts.onExecuteTurn : null;
     this.onExecuteSteer = typeof opts.onExecuteSteer === "function" ? opts.onExecuteSteer : async () => {};
+    this.onExecuteAbort = typeof opts.onExecuteAbort === "function" ? opts.onExecuteAbort : async () => {};
     this.log = typeof opts.log === "function" ? opts.log : () => {};
 
     if (!this.onExecuteTurn) throw new Error("ChannelRuntime requires opts.onExecuteTurn(msg, prompt, batch)");
@@ -238,9 +239,38 @@ export class ChannelRuntime {
       return { action: "dedupe" };
     }
 
-    // Slash commands
+    const st = this._state(m0.sessionId);
+
+    // Slash commands (builtin /hey + custom)
     const cmd = parseSlashCommand(m0.text);
-    if (cmd) {
+    let skipSteerForThisMessage = false;
+    if (cmd && cmd.cmd === "hey") {
+      // Force-abort current in-flight run (if any), then process this message as a normal turn
+      if (st.draining) {
+        try { await this.onExecuteAbort(m0, cmd); } catch (err) {
+          this.log("abort_failed", { sessionId: m0.sessionId, err: err?.message || String(err) });
+        }
+      }
+
+      // Strip only the '/hey' token from the first line; preserve the rest of that line + subsequent lines
+      const lines = String(m0.text || "").split(/\r?\n/);
+      if (lines.length > 0) {
+        lines[0] = String(lines[0] || "").replace(/^\/(?:hey)\b\s*/i, "");
+      }
+      m0.text = cleanText(lines.join("\n"));
+
+      // If the remaining message is empty after stripping, do nothing further
+      if (!m0.text) return { action: "empty" };
+
+      // Continue as a normal queued/off turn (NOT steer). If in-flight, drop any queued followups and keep only this.
+      if (st.draining) {
+        st.queue = [];
+        st.steerTarget = null; // clear any prior steer target so reply goes to this message
+      }
+      skipSteerForThisMessage = true;
+
+      // Fall through to directive stripping + normal handling below.
+    } else if (cmd) {
       const handler = this.commands.get(cmd.cmd);
       if (handler) {
         await handler(m0, cmd);
@@ -252,7 +282,7 @@ export class ChannelRuntime {
     m0.text = stripLeadingDirectiveLines(m0.text, this.directiveNames);
     if (!m0.text) return { action: "empty" };
 
-    const st = this._state(m0.sessionId);
+    // state already resolved above
 
     // Mention gating: buffer non-triggering group messages.
     if (m0.isGroup && this.requireMention && !m0.mentionMe) {
@@ -260,8 +290,8 @@ export class ChannelRuntime {
       return { action: "buffered" };
     }
 
-    // Steer: only when in-flight
-    if (this.queueMode === "steer" && st.draining && this.looksUrgentForSteer(m0.text)) {
+    // Steer: in steer mode, any message during in-flight is treated as steer (except /hey handled above)
+    if (this.queueMode === "steer" && st.draining && !skipSteerForThisMessage) {
       st.steerTarget = m0;
       try { await this.onExecuteSteer(m0); } catch (err) {
         this.log("steer_failed", { sessionId: m0.sessionId, err: err?.message || String(err) });

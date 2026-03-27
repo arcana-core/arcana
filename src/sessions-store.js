@@ -129,7 +129,7 @@ function saveSessionInternal(obj, normAgentId, opts){
 }
 
 export function createSession({ title, workspace, agentId } = {}){
-  const t = String(title || '新会话').trim();
+  const t = String(title == null ? '' : title).trim();
   const normAgentId = normalizeAgentId(agentId);
   const stamp = nowIso().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '');
   const agentSegment = normAgentId.slice(0, 40);
@@ -161,9 +161,10 @@ export function listSessions(agentId){
       const raw = JSON.parse(readFileSync(p, 'utf-8'));
       const createdAt = raw.createdAt || new Date(st.ctimeMs).toISOString();
       const updatedAt = raw.updatedAt || new Date(st.mtimeMs).toISOString();
+      const titleRaw = (raw && typeof raw.title === 'string') ? String(raw.title).trim() : '';
       out.push({
         id: raw.id || name.replace(/\.json$/, ''),
-        title: raw.title || '新会话',
+        title: titleRaw,
         workspace: raw.workspace || '',
         agentId: normalizeAgentId(raw.agentId || normAgentId),
         createdAt,
@@ -215,7 +216,7 @@ export function appendMessage(sessionId, { role, text, agentId } = {}){
     const existing = loadSession(id, { agentId: normAgentId });
     const obj = existing || {
       id,
-      title: '新会话',
+      title: '',
       workspace: undefined,
       agentId: normAgentId,
       createdAt: nowIso(),
@@ -231,9 +232,10 @@ export function appendMessage(sessionId, { role, text, agentId } = {}){
 
     if (hadNoMessages && String(roleStr || '').toLowerCase() === 'user'){
       const currentTitle = String(obj.title || '').trim();
-      if (!currentTitle || currentTitle === '新会话'){
+      const isLegacyUntitled = (currentTitle === '新会话' || currentTitle === 'New session');
+      if (!currentTitle || isLegacyUntitled){
         const autoTitle = deriveSessionTitleFromText(textStr);
-      if (autoTitle) obj.title = autoTitle;
+        if (autoTitle) obj.title = autoTitle;
       }
     }
     // appendMessage should always bump updatedAt
@@ -254,7 +256,7 @@ export function upsertLastMessage(sessionId, { role, text, agentId } = {}){
     const existing = loadSession(id, { agentId: normAgentId });
     const obj = existing || {
       id,
-      title: '新会话',
+      title: '',
       workspace: undefined,
       agentId: normAgentId,
       createdAt: nowIso(),

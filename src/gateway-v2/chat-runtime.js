@@ -25,10 +25,42 @@ import {
 import { buildErrorStack } from '../util/error.js';
 import { nowMs, ensureDir } from './util.js';
 import { persistToolMetaToDisk, persistToolResultToDisk, scheduleAppendToolStream } from '../tool-output-store.js';
+import { thinkingStart, appendThinkingDelta, thinkingEnd } from '../thinking-output-store.js';
 import { mergeStreamingText } from '../streaming-text.js';
 
 // Long-lived chat sessions keyed by agentId|sessionId|policy|workspaceRoot
 const chatSessions = new Map();
+
+// Invalidate cached chat sessions so provider changes take effect immediately.
+// If `agentId` is provided, only sessions for that agent are evicted; otherwise all.
+export async function invalidateChatSessions({ agentId: rawAgentId } = {}){
+  let removed = 0;
+  try {
+    const target = String(rawAgentId == null ? '' : rawAgentId).trim();
+    const matchAll = !target;
+    const normalizedTarget = matchAll ? '' : normalizeAgentId(target);
+
+    const keysToDelete = [];
+    for (const [key, rec] of chatSessions.entries()){
+      try {
+        const recAgentId = rec && rec.agentId ? String(rec.agentId) : '';
+        if (!matchAll && recAgentId !== normalizedTarget) continue;
+        try { rec.toolHost && rec.toolHost.cancelActiveCall && rec.toolHost.cancelActiveCall(); } catch {}
+        try {
+          if (rec.session && typeof rec.session.abort === 'function'){
+            const p = rec.session.abort();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+          }
+        } catch {}
+        keysToDelete.push(key);
+      } catch {}
+    }
+    for (const k of keysToDelete){
+      try { if (chatSessions.delete(k)) removed += 1; } catch {}
+    }
+  } catch {}
+  return { ok: true, removed };
+}
 
 const DEFAULT_AGENT_ID = 'default';
 
@@ -809,11 +841,21 @@ function attachChatEventBridge(record, sessionId){
       const t = ev.type ? String(ev.type) : '';
 
       if (t === 'turn_start'){
+        // Maintain a stable, per-session turnIndex counter in-memory during the
+        // gateway process lifetime. This enables THINK/LLM cards to align with
+        // persisted thinking text and tool actions.
+        const key = String(sessionId || 'default');
+        if (!sess.__turnIndexBySession) sess.__turnIndexBySession = new Map();
+        const cur = sess.__turnIndexBySession.get(key);
+        const next = (typeof cur === 'number' && cur >= 0) ? (cur + 1) : 0;
+        sess.__turnIndexBySession.set(key, next);
         try { emit({ type: 'turn_start', sessionId, agentId }); } catch {}
         return;
       }
 
       if (t === 'turn_end'){
+        const key = String(sessionId || 'default');
+        const idx = (sess.__turnIndexBySession && sess.__turnIndexBySession.get) ? sess.__turnIndexBySession.get(key) : undefined;
         try { emit({ type: 'turn_end', sessionId, agentId }); } catch {}
         return;
       }
@@ -932,6 +974,24 @@ function attachChatEventBridge(record, sessionId){
       }
 
       if (t === 'thinking_start' || t === 'thinking_delta' || t === 'thinking_end'){
+        // Optionally persist full thinking text to disk for later fetch.
+        const persist = String(process.env.ARCANA_PERSIST_THINKING || '').trim();
+        const on = !!persist && !/^0|false|no|off|null|undefined$/i.test(persist);
+        if (on){
+          const key = String(sessionId || 'default');
+          const idx = (sess.__turnIndexBySession && sess.__turnIndexBySession.get) ? sess.__turnIndexBySession.get(key) : 0;
+          if (t === 'thinking_start'){
+            try { thinkingStart({ agentId, sessionId, turnIndex: (typeof idx === 'number' && idx >= 0) ? idx : 0 }); } catch {}
+          } else if (t === 'thinking_delta'){
+            try {
+              const src = (Object.prototype.hasOwnProperty.call(ev, 'delta')) ? ev.delta : (Object.prototype.hasOwnProperty.call(ev, 'text') ? ev.text : ev);
+              const text = (typeof src === 'string') ? src : (src != null ? JSON.stringify(src) : '');
+              appendThinkingDelta({ agentId, sessionId, turnIndex: (typeof idx === 'number' && idx >= 0) ? idx : 0, text });
+            } catch {}
+          } else if (t === 'thinking_end'){
+            try { thinkingEnd({ agentId, sessionId, turnIndex: (typeof idx === 'number' && idx >= 0) ? idx : 0 }); } catch {}
+          }
+        }
         try { emit(base); } catch {}
         return;
       }
@@ -1254,8 +1314,13 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     });
     _resetIdleTimer(); // start idle timer
     try {
+      // If the agent starts streaming between the earlier isSteer check and this call,
+      // pass a safe fallback so we queue instead of throwing. 'followUp' is ignored
+      // when not streaming, and avoids HTTP 500 "Agent is already processing" races.
+      const promptOpts = { expandPromptTemplates: true };
+      try { if (sess && sess.isStreaming) Object.assign(promptOpts, { streamingBehavior: 'followUp' }); } catch {}
       await Promise.race([
-        runWithContext(ctx, () => sess.prompt(payloadMsg)),
+        runWithContext(ctx, () => sess.prompt(payloadMsg, promptOpts)),
         _idlePromise,
       ]);
     } catch (e) {
@@ -1927,4 +1992,4 @@ export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessio
   return { ok: cleared };
 }
 
-export default { runChatMessage, abortChat, clearChatContext };
+export default { runChatMessage, abortChat, clearChatContext, invalidateChatSessions };

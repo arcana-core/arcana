@@ -46,6 +46,21 @@ const gatewayV2Pending = new Map();
 let __apiTokenPromptedOnce = false;
 let __apiTokenHydratedOnce = false;
 
+// Safe translation helper: prefer global t(key) when available.
+// Falls back to the provided literal (or key) when missing.
+function tr(key, fallback){
+  try{
+    const k = String(key || '');
+    const fb = (typeof fallback === 'undefined') ? k : fallback;
+    if (typeof t !== 'function') return fb;
+    const v = t(k);
+    if (!v || v === k) return fb;
+    return v;
+  } catch {
+    return (typeof fallback === 'undefined') ? String(key || '') : fallback;
+  }
+}
+
 // Gateway v2 runner auto-start dedupe cache
 let __v2RunnerLastKey = '';
 let __v2RunnerInFlight = null;
@@ -370,7 +385,8 @@ try{
           __apiTokenPromptedOnce = true;
           let entered = '';
           try{
-            entered = window.prompt('请输入 Arcana API Token，用于访问 /api 和 /v2 接口：', '');
+                        const msg = tr('ui.apiTokenPrompt', '请输入 Arcana API Token，用于访问 /api 和 /v2 接口：');
+            entered = window.prompt(msg, '');
           } catch {}
           if (entered){
             setStoredApiToken(entered);
@@ -401,7 +417,8 @@ function warnStorageQuota(){
   try{
     if (__arcana_storageQuotaWarned) return;
     __arcana_storageQuotaWarned = true;
-    alert('本地存储空间已满。请删除不需要的会话来释放空间。');
+    alert(tr('ui.storageQuotaAlert', '本地存储空间已满。请删除不需要的会话来释放空间。'));
+
   } catch {}
 }
 
@@ -1072,10 +1089,10 @@ function loadMainLogsFromStorage(){
           }
         }
       } catch {}
-      if (!loadedFromIdb){
-        loadMainLogsFromLocalStorage(true);
-      }
-    })();
+  if (!loadedFromIdb){
+    loadMainLogsFromLocalStorage(true);
+  }
+})();
   } catch {}
 }
 
@@ -1122,10 +1139,10 @@ function loadToolPanelsFromStorage(){
           }
         }
       } catch {}
-      if (!loadedFromIdb){
-        loadToolPanelsFromLocalStorage(true);
-      }
-    })();
+  if (!loadedFromIdb){
+    loadToolPanelsFromLocalStorage(true);
+  }
+})();
   } catch {}
 }
 
@@ -1946,12 +1963,17 @@ async function pickWorkspace(){
       overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;z-index:10000;';
       const dialog = document.createElement('div');
       dialog.style.cssText = 'width:520px;max-width:90vw;background:#fff;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.2);padding:16px;';
-      dialog.innerHTML = '<div style="font-weight:600;margin-bottom:8px">选择工作区</div>' +
-        '<div style="font-size:13px;color:#666;margin-bottom:8px">建议使用桌面应用获取系统级文件夹选择器。当前在浏览器环境下，仅支持手动输入工作区绝对路径。</div>' +
-        '<input id="ws-input" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="/绝对/路径" />' +
+      const wsTitle = tr('ui.workspacePicker.title', '选择工作区');
+      const wsDesc = tr('ui.workspacePicker.description', '建议使用桌面应用获取系统级文件夹选择器。当前在浏览器环境下，仅支持手动输入工作区绝对路径。');
+      const wsPlaceholder = tr('ui.workspacePicker.placeholder', '/绝对/路径');
+      const wsCancel = tr('ui.workspacePicker.cancel', '取消');
+      const wsOk = tr('ui.workspacePicker.ok', '确定');
+      dialog.innerHTML = '<div style="font-weight:600;margin-bottom:8px">' + wsTitle + '</div>' +
+        '<div style="font-size:13px;color:#666;margin-bottom:8px">' + wsDesc + '</div>' +
+        '<input id="ws-input" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="' + wsPlaceholder + '" />' +
         '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
-        '  <button id="ws-cancel" class="btn btn-secondary btn-sm">取消</button>' +
-        '  <button id="ws-ok" class="btn btn-primary btn-sm">确定</button>' +
+        '  <button id="ws-cancel" class="btn btn-secondary btn-sm">' + wsCancel + '</button>' +
+        '  <button id="ws-ok" class="btn btn-primary btn-sm">' + wsOk + '</button>' +
         '</div>';
       overlay.appendChild(dialog);
       document.body.appendChild(overlay);
@@ -2105,7 +2127,13 @@ function setTyping(bubble, on){
   if (!bubble) return;
   if (on){
     bubble.classList.add('typing');
-    bubble.innerHTML = '正在思考 <span class=dots><span class=dot></span><span class=dot></span><span class=dot></span></span>';
+    let thinking = '';
+    try {
+      // Use i18n string if available
+      thinking = (typeof t === 'function') ? t('ui.thinking') : '';
+    } catch {}
+    if (!thinking || thinking === 'ui.thinking') thinking = '正在思考';
+    bubble.innerHTML = thinking + ' <span class=dots><span class=dot></span><span class=dot></span><span class=dot></span></span>';
   } else {
     bubble.classList.remove('typing');
   }
@@ -2136,6 +2164,29 @@ try {
 } catch {}
 
 function qs(id){ return document.getElementById(id); }
+// Initialize language selector once DOM helpers are ready
+try { initLangSelector(); } catch {}
+
+// Language selector wiring
+function initLangSelector(){
+  try{
+    const sel = qs('ui-lang');
+    if (!sel) return;
+    // Initial value from current locale if available
+    try{ if (window.arcanaI18n && window.arcanaI18n.locale) sel.value = window.arcanaI18n.locale; } catch {}
+    sel.addEventListener('change', ()=>{
+      try{
+        const next = sel.value;
+        if (window.arcanaI18n && typeof window.arcanaI18n.setLocale === 'function'){
+          window.arcanaI18n.setLocale(next);
+        }
+        try{ document.documentElement.lang = next; } catch {}
+        try{ requestRefreshList(); } catch {}
+        try{ if (activeAssistant && activeAssistant.classList && activeAssistant.classList.contains('typing')) setTyping(activeAssistant, true); } catch {}
+      } catch {}
+    });
+  } catch {}
+}
 
 // --- Full Shell (policy=open) persistence + UI ---
 // Storage keys
@@ -2318,6 +2369,79 @@ function parseHistoryCompressionNumber(raw, fallback){
   return out;
 }
 
+async function reloadSkillsConfigUI(){
+  try{
+    const skillsWrap = qs('skills-config');
+    if (!skillsWrap) return;
+    try{
+      skillsWrap.textContent = tr('ui.loading', '加载中...');
+      const skillsStatus = qs('skills-status'); if (skillsStatus) skillsStatus.textContent = '';
+      const aidSkills = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+      const urlSkills = '/api/skills?agentId=' + encodeURIComponent(aidSkills);
+      const tokenS = getStoredApiToken();
+      const headersS = tokenS ? { 'authorization':'Bearer ' + tokenS } : undefined;
+      const rS = await fetch(urlSkills, headersS ? { headers: headersS } : undefined);
+      let jS = null;
+      try { jS = await rS.json(); } catch { jS = null; }
+      const skillsArr = jS && Array.isArray(jS.skills) ? jS.skills : [];
+      const disabledArr = jS && Array.isArray(jS.disabled) ? jS.disabled : [];
+      const disabledSet = new Set();
+      for (const raw of disabledArr){
+        if (typeof raw !== 'string') continue;
+        const n = raw.trim();
+        if (n) disabledSet.add(n);
+      }
+      skillsWrap.innerHTML = '';
+      if (!skillsArr.length){
+        const empty = document.createElement('div');
+        empty.textContent = tr('skills.noneFound', '未发现技能');
+        empty.style.color = '#666';
+        skillsWrap.appendChild(empty);
+      } else {
+        for (const s of skillsArr){
+          const name = String(s && s.name || '').trim(); if (!name) continue;
+          const row = document.createElement('label');
+          row.style.display = 'flex';
+          row.style.alignItems = 'center';
+          row.style.gap = '6px';
+          row.style.marginBottom = '2px';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.dataset.skillName = name;
+          cb.checked = !disabledSet.has(name);
+          const span = document.createElement('span');
+          span.textContent = name;
+          row.appendChild(cb);
+          row.appendChild(span);
+          skillsWrap.appendChild(row);
+        }
+      }
+    } catch {
+      skillsWrap.innerHTML = '';
+      const err = document.createElement('div');
+      err.textContent = tr('skills.loadFailed', '技能列表加载失败');
+      err.style.color = '#a00';
+      skillsWrap.appendChild(err);
+    }
+  } catch {}
+}
+
+let skillsConfigReloadTimer = null;
+function scheduleReloadSkillsConfigUI(){
+  try{
+    const panel = document.querySelector('#more-panel');
+    if (!panel) return;
+    const display = (panel.style && typeof panel.style.display === 'string') ? panel.style.display : '';
+    if (display === 'none') return;
+    if (skillsConfigReloadTimer){
+      try { clearTimeout(skillsConfigReloadTimer); } catch {}
+    }
+    skillsConfigReloadTimer = setTimeout(()=>{
+      try{ reloadSkillsConfigUI(); } catch {}
+    }, 150);
+  } catch {}
+}
+
 async function loadConfigUI(){
   try{
     // Global default config
@@ -2328,12 +2452,12 @@ async function loadConfigUI(){
       const r = await fetch('/api/config', headers ? { headers } : undefined);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       globalCfg = await r.json();
-    }catch(e){ appendLog('[config] 读取全局配置失败'); globalCfg = {}; }
+    }catch(e){ appendLog('[config] ' + tr('config.load.globalFailed', '读取全局配置失败')); globalCfg = {}; }
 
     if (qs('cfg-provider-global')) qs('cfg-provider-global').value = globalCfg.provider || '';
     if (qs('cfg-model-global')) qs('cfg-model-global').value = globalCfg.model || '';
     if (qs('cfg-base-url-global')) qs('cfg-base-url-global').value = globalCfg.base_url || '';
-    if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? '已设置' : '未设置';
+        if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? tr('config.keySet', '已设置') : tr('config.keyUnset', '未设置');
 
     const globalEnabledRaw = (globalCfg && Object.prototype.hasOwnProperty.call(globalCfg, 'history_compression_enabled'))
       ? globalCfg.history_compression_enabled
@@ -2370,7 +2494,7 @@ async function loadConfigUI(){
       // Update per-agent model label cache
       try { __setCachedModelLabel(aid, agentCfg); } catch {}
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = agentCfg.base_url || '';
-      if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? '已设置' : '未设置';
+            if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? tr('config.keySet', '已设置') : tr('config.keyUnset', '未设置');
 
       let agentCompressEnabled = globalCompressEnabled;
       try{
@@ -2396,76 +2520,21 @@ async function loadConfigUI(){
       const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!agentCompressEnabled;
       const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(agentCompressThreshold);
       const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(agentCompressKeep);
-      // Load skills for current agent
-      try{
-        const skillsWrap = qs('skills-config'); if (skillsWrap) skillsWrap.textContent = '加载中...';
-        const skillsStatus = qs('skills-status'); if (skillsStatus) skillsStatus.textContent = '';
-        const aidSkills = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-        const urlSkills = '/api/skills?agentId=' + encodeURIComponent(aidSkills);
-        const tokenS = getStoredApiToken();
-        const headersS = tokenS ? { 'authorization':'Bearer ' + tokenS } : undefined;
-        const rS = await fetch(urlSkills, headersS ? { headers: headersS } : undefined);
-        let jS = null;
-        try { jS = await rS.json(); } catch { jS = null; }
-        const skillsArr = jS && Array.isArray(jS.skills) ? jS.skills : [];
-        const disabledArr = jS && Array.isArray(jS.disabled) ? jS.disabled : [];
-        const disabledSet = new Set();
-        for (const raw of disabledArr){
-          if (typeof raw !== 'string') continue;
-          const n = raw.trim();
-          if (n) disabledSet.add(n);
-        }
-        if (skillsWrap){
-          skillsWrap.innerHTML = '';
-          if (!skillsArr.length){
-            const empty = document.createElement('div');
-            empty.textContent = '未发现技能';
-            empty.style.color = '#666';
-            skillsWrap.appendChild(empty);
-          } else {
-            for (const s of skillsArr){
-              const name = String(s && s.name || '').trim(); if (!name) continue;
-              const row = document.createElement('label');
-              row.style.display = 'flex';
-              row.style.alignItems = 'center';
-              row.style.gap = '6px';
-              row.style.marginBottom = '2px';
-              const cb = document.createElement('input');
-              cb.type = 'checkbox';
-              cb.dataset.skillName = name;
-              cb.checked = !disabledSet.has(name);
-              const span = document.createElement('span');
-              span.textContent = name;
-              row.appendChild(cb);
-              row.appendChild(span);
-              skillsWrap.appendChild(row);
-            }
-          }
-        }
-      } catch {
-        const skillsWrap = qs('skills-config');
-        if (skillsWrap){
-          skillsWrap.innerHTML = '';
-          const err = document.createElement('div');
-          err.textContent = '技能列表加载失败';
-          err.style.color = '#a00';
-          skillsWrap.appendChild(err);
-        }
-      }
+      await reloadSkillsConfigUI();
     }catch(e){
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = '';
       if (qs('cfg-model-agent')) qs('cfg-model-agent').value = '';
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = '';
-      if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = '未设置';
+            if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = tr('config.keyUnset', '未设置');
       const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!globalCompressEnabled;
       const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(globalCompressThreshold);
       const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(globalCompressKeep);
-      appendLog('[config] 读取 Agent 配置失败');
+      appendLog('[config] ' + tr('config.load.agentFailed', '读取 Agent 配置失败'));
     }
     try{ updateEffectiveConfigSummary(); }catch{}
     // Best-effort: refresh live info model label immediately
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
-  }catch(e){ appendLog('[config] 读取失败'); }
+  }catch(e){ appendLog('[config] ' + tr('config.load.failed', '读取失败')); }
 }
 
 async function saveGlobalConfigUI(){
@@ -2938,7 +3007,7 @@ async function _fetchJsonExpectOk(url, opts, label){
 }
 
 async function listSessions(agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const url = '/api/sessions?agentId=' + encodeURIComponent(id); const j = await _fetchJsonExpectOk(url, undefined, 'list'); return Array.isArray(j && j.sessions) ? j.sessions : [] }
-async function createSession(title, workspace, agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const payload = { title: title||'新会话', agentId: id }; if (workspace){ payload.workspace = String(workspace||''); } return await _fetchJsonExpectOk('/api/sessions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'create') }
+async function createSession(title, workspace, agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const payload = { agentId: id }; const t0 = String(title || '').trim(); if (t0){ payload.title = t0; } if (workspace){ payload.workspace = String(workspace||''); } return await _fetchJsonExpectOk('/api/sessions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'create') }
 async function deleteSession(id, agentId){ if (!id) return { ok:false }; const aid = String(agentId || DEFAULT_AGENT_ID); const url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid); return await _fetchJsonExpectOk(url, { method:'DELETE' }, 'delete') }
 async function listAgents(){ const j = await _fetchJsonExpectOk('/api/agents', undefined, 'agents'); return Array.isArray(j && j.agents) ? j.agents : [] }
 async function loadSession(id, agentId){
@@ -3025,7 +3094,7 @@ async function setCurrentAgent(id){
   }
 
   try {
-    const created = await createSession('新会话', '', currentAgentId);
+    const created = await createSession('', '', currentAgentId);
     await openSession(created.id);
   } catch (e) {
     appendLog('[sessions] 创建新会话失败: ' + (((e && e.message) || e)));
@@ -3093,7 +3162,7 @@ async function loadAgents(){
         box.innerHTML = '';
         const err = document.createElement('div');
         err.className = 'agent-empty';
-        err.textContent = '加载 Agent 列表失败，请检查 Arcana API Token 或服务器设置。';
+                err.textContent = tr('agents.listLoadFailed', '加载 Agent 列表失败，请检查 Arcana API Token 或服务器设置。');
         box.appendChild(err);
       }
     } catch {}
@@ -3110,7 +3179,7 @@ function renderSessionList(items){
   const background = [];
   for (const it of list){
     if (!it) continue;
-    const titleRaw = it.title || '';
+    const titleRaw = (it && typeof it.title === 'string') ? it.title : '';
     const t = String(titleRaw || '');
     const isCronRun = t.slice(0, 10) === '[cron-run]';
     const isCronAgentTurn = t.startsWith('Cron Agent Turn #');
@@ -3121,6 +3190,7 @@ function renderSessionList(items){
     }
   }
 
+  function displaySessionTitle(raw){ try{ const s = String(raw || '').trim(); if (!s || s === '新会话' || s === 'New session'){ return (typeof t === 'function') ? t('session.untitled') : 'Untitled session'; } return s; } catch{ return (typeof t === 'function') ? t('session.untitled') : 'Untitled session'; } }
   function renderOne(it, extraClass){
     const div = document.createElement('div');
     const baseCls = (it.id===currentId) ? 'sess-item active' : 'sess-item';
@@ -3130,17 +3200,17 @@ function renderSessionList(items){
     const unreadDot = unread ? '<span class=sess-unread-dot></span>' : '';
     const running = !!typing.get(it.id);
     const runningSpinner = running ? '<span class=sess-running-spinner></span>' : '';
-    const title = (it.title||'新会话');
+    const title = displaySessionTitle(it.title);
     const metaTime = it.updatedAt ? ('<span class=meta>' + new Date(it.updatedAt).toLocaleString() + '</span>') : '';
     const metaWs = it.workspace ? ('<span class=meta ws>' + it.workspace + '</span>') : '';
     const prefix = unread ? unreadDot : (running ? runningSpinner : '');
     div.innerHTML = '<div class=sess-row>' + prefix + '<span class="sess-title">' + title + '</span></div>' + metaTime + metaWs;
     const del = document.createElement('button');
-    del.className = 'del'; del.textContent = '×'; del.title = '删除会话';
+    del.className = 'del'; del.textContent = '×'; del.title = tr('sessions.deleteTitle', '删除会话');
     del.addEventListener('click', async (ev)=>{
       try{
         ev.stopPropagation && ev.stopPropagation(); ev.preventDefault && ev.preventDefault();
-        const ok = confirm('确定删除该会话？此操作不可恢复。'); if (!ok) return;
+        const ok = confirm(tr('sessions.deleteConfirm', '确定删除该会话？此操作不可恢复。')); if (!ok) return;
         const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
         const resp = await deleteSession(it.id, aid);
         if (!resp || resp.ok !== true){ appendLog('[sessions] delete failed: server rejected'); return }
@@ -3219,11 +3289,11 @@ function renderSessionList(items){
             } else {
               let obj;
               if (hasAgents && currentAgentId){
-                obj = await createSession('新会话', '', currentAgentId);
+                obj = await createSession('', '', currentAgentId);
               } else {
                 const ws = await pickWorkspace() || '';
                 if (!ws){ appendLog('[sessions] 未选择工作区'); return; }
-                obj = await createSession('新会话', ws);
+                obj = await createSession('', ws);
               }
               await openSession(obj.id);
             }
@@ -3433,7 +3503,7 @@ function requestRefreshList(){
 async function ensureSession(){
   if (currentId) return currentId;
   if (hasAgents && currentAgentId){
-    const created = await createSession('新会话', '', currentAgentId);
+    const created = await createSession('', '', currentAgentId);
     setCurrent(created.id);
     // If the user toggled before a session existed, persist pending now
     try{ persistPendingFullshellFor(created.id, currentAgentId || DEFAULT_AGENT_ID); } catch {}
@@ -3443,7 +3513,7 @@ async function ensureSession(){
   }
   const ws = await pickWorkspace();
   if (!ws){ appendLog('[sessions] 未选择工作区'); throw new Error('workspace_required') }
-  const created = await createSession('新会话', ws);
+  const created = await createSession('', ws);
   setCurrent(created.id);
   // Persist pending fullshell for this newly created session
   try{ persistPendingFullshellFor(created.id, DEFAULT_AGENT_ID); } catch {}
@@ -3619,7 +3689,7 @@ try {
 try {
   const clearCtxBtn = document.querySelector('#clear-context');
   if (clearCtxBtn) clearCtxBtn.addEventListener('click', async ()=>{
-    if (!confirm('清理 Agent 内部上下文？\n\n这将清除当前会话中 Agent 的工具调用记忆，\n但保留对话历史（prelude）。\n\n适用于话题转换、上下文过大等情况。')) return;
+        if (!confirm(tr('ui.clearContextConfirm', '清理 Agent 内部上下文？\\n\\n这将清除当前会话中 Agent 的工具调用记忆，\\n但保留对话历史（prelude）。\\n\\n适用于话题转换、上下文过大等情况。'))) return;
     try{
       await ensureTransportReady();
       const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
@@ -3871,38 +3941,61 @@ async function fetchSelectedToolOutput(){
     const action = panel.actions.get(panel.selectedId);
     if (!action) return;
     const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-    const params = new URLSearchParams();
-    params.set('agentId', aid);
-    params.set('sessionId', sid);
-    params.set('toolCallId', action.id);
-    params.set('tailBytes', '200000');
-    const url = '/api/tool-output?' + params.toString();
+    // THINK/LLM virtual cards fetch persisted thinking text by turnIndex
+    const isThinkCard = (String(action.toolName||'').toLowerCase() === 'llm' && String(action.category||'') === 'think');
+    let url = '';
+    if (isThinkCard){
+      let turnIdx = (typeof action.turnIndex === 'number' && !Number.isNaN(action.turnIndex)) ? action.turnIndex : null;
+      // Fallback: derive from virtual id pattern v:llm:<idx>
+      if (turnIdx === null){
+        try{
+          const m = /^v:llm:(\d+)$/.exec(String(action.id||''));
+          if (m) turnIdx = Number(m[1]);
+        } catch {}
+      }
+      if (turnIdx === null) turnIdx = 0;
+      const params = new URLSearchParams();
+      params.set('agentId', aid);
+      params.set('sessionId', sid);
+      params.set('turnIndex', String(turnIdx));
+      url = '/api/thinking-output?' + params.toString();
+    } else {
+      const params = new URLSearchParams();
+      params.set('agentId', aid);
+      params.set('sessionId', sid);
+      params.set('toolCallId', action.id);
+      params.set('tailBytes', '200000');
+      url = '/api/tool-output?' + params.toString();
+    }
     const r = await fetch(url);
     const bodyEl = document.getElementById('tools-details-body');
     if (!r.ok){
-      if (bodyEl) bodyEl.textContent = 'Failed to fetch tool output: HTTP ' + r.status;
+      if (bodyEl) bodyEl.textContent = (isThinkCard ? 'Failed to fetch thinking: HTTP ' : 'Failed to fetch tool output: HTTP ') + r.status;
       return;
     }
     let j = null;
     try { j = await r.json(); } catch {
-      if (bodyEl) bodyEl.textContent = 'Failed to parse tool output response.';
+      if (bodyEl) bodyEl.textContent = isThinkCard ? 'Failed to parse thinking response.' : 'Failed to parse tool output response.';
       return;
     }
     if (!j || j.ok !== true){
-      if (bodyEl) bodyEl.textContent = 'Tool output not available.';
+      if (bodyEl) bodyEl.textContent = isThinkCard ? 'Thinking not available.' : 'Tool output not available.';
       return;
     }
-    const parts = [];
-    if (j.meta){
-      try{ parts.push('Meta:\n' + JSON.stringify(j.meta, null, 2)); } catch{}
+    let text = '';
+    if (isThinkCard){
+      const meta = j.meta || {};
+      const head = (meta && (meta.startedAt || meta.endedAt)) ? ('Thinking meta:\n' + JSON.stringify(meta, null, 2) + '\n\n') : '';
+      const body = String(j.thinking || '');
+      const tailNote = j.truncated ? '\n\n[note] cached tail only (truncated)' : '';
+      text = head + (body || '(empty)') + tailNote;
+    } else {
+      const parts = [];
+      if (j.meta){ try{ parts.push('Meta:\n' + JSON.stringify(j.meta, null, 2)); } catch{} }
+      if (j.result){ try{ parts.push('Result:\n' + JSON.stringify(j.result, null, 2)); } catch{} }
+      if (typeof j.streamTail === 'string' && j.streamTail){ parts.push('Stream tail:\n' + j.streamTail); }
+      text = parts.length ? parts.join('\n\n') : 'No cached output.';
     }
-    if (j.result){
-      try{ parts.push('Result:\n' + JSON.stringify(j.result, null, 2)); } catch{}
-    }
-    if (typeof j.streamTail === 'string' && j.streamTail){
-      parts.push('Stream tail:\n' + j.streamTail);
-    }
-    const text = parts.length ? parts.join('\n\n') : 'No cached output.';
     if (bodyEl){
       const atBottom = (bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight) <= 16;
       const prevScrollTop = bodyEl.scrollTop;
@@ -3911,7 +4004,7 @@ async function fetchSelectedToolOutput(){
     }
   } catch(e){
     const bodyEl = document.getElementById('tools-details-body');
-    if (bodyEl) bodyEl.textContent = 'Error fetching tool output: ' + (((e && e.message) || e));
+    if (bodyEl) bodyEl.textContent = 'Error fetching ' + (action && String(action.category||'')==='think' ? 'thinking' : 'tool output') + ': ' + (((e && e.message) || e));
   }
 }
 
@@ -4138,6 +4231,7 @@ function handleArcanaEvent(data){
           }
           if (currentId){ renderLiveInfoFor(currentId); }
         } catch {}
+        try { scheduleReloadSkillsConfigUI(); } catch {}
         return;
       }
             if (data.type === 'tool_execution_update'){
@@ -4356,7 +4450,11 @@ function handleArcanaEvent(data){
         return;
       }
 
-      if (data.type === 'skills_refresh'){ try { LI.skillsHint = '技能已刷新'; } catch {} return }
+      if (data.type === 'skills_refresh'){
+        try { LI.skillsHint = '技能已刷新'; } catch {}
+        try { scheduleReloadSkillsConfigUI(); } catch {}
+        return;
+      }
       // Per-LLM-call usage: update the current Turn's LLM card with single-call tokens
       if (data.type === 'llm_call_usage'){
         try {
@@ -4689,10 +4787,10 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
     try{
       let obj;
       if (hasAgents && currentAgentId){
-        obj = await createSession('新会话', '', currentAgentId);
+        obj = await createSession('', '', currentAgentId);
       } else {
         const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
-        obj = await createSession('新会话', ws);
+        obj = await createSession('', ws);
       }
       await openSession(obj.id);
     } catch(e){ appendLog('[sessions] new session failed: ' + (((e && e.message) || e))); }
@@ -4704,10 +4802,10 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
       try{
         let obj;
         if (hasAgents && currentAgentId){
-          obj = await createSession('新会话', '', currentAgentId);
+          obj = await createSession('', '', currentAgentId);
         } else {
           const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
-          obj = await createSession('新会话', ws);
+          obj = await createSession('', ws);
         }
         await openSession(obj.id);
       } catch(e){ appendLog('[sessions] new session failed: ' + (((e && e.message) || e))); }
@@ -4859,7 +4957,8 @@ async function openSecrets(requestedNames, opts){
   const agentId = currentAgentId || DEFAULT_AGENT_ID;
 
   async function render(){
-    dialog.innerHTML = '<div style="font-size:12px;color:#666;">加载中…</div>';
+    const loadingText = tr('ui.loading', '加载中…');
+    dialog.innerHTML = '<div style="font-size:12px;color:#666;">' + loadingText + '</div>';
 
     let data;
     try {

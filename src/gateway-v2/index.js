@@ -27,7 +27,7 @@ import { createOutbox } from './runtime/outbox.js';
 import { createPolicyEngine } from './runtime/policy.js';
 import { createEngine } from './runtime/engine.js';
 import { arcanaHomePath, ensureArcanaHomeDir } from '../arcana-home.js';
-import { runChatMessage, abortChat, clearChatContext } from './chat-runtime.js';
+import { runChatMessage, abortChat, clearChatContext, invalidateChatSessions } from './chat-runtime.js';
 import { requestCompactionAbort } from '../context-manager.js';
 import { resolveWorkspaceRoot, ensureReadAllowed, ensureWriteAllowed } from '../workspace-guard.js';
 import { loadArcanaConfig, loadAgentConfig } from '../config.js';
@@ -42,6 +42,7 @@ import { runDoctor } from '../doctor.js';
 import { createSupportBundle } from '../support-bundle.js';
 import { WELL_KNOWN_SECRETS, providerApiKeyName, agentProviderApiKeyName, secrets } from '../secrets/index.js';
 import { readToolOutputBundle } from '../tool-output-store.js';
+import { readThinkingBundle } from '../thinking-output-store.js';
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1055,7 +1056,7 @@ export async function startGatewayV2({ port } = {}) {
       if (method === 'POST' && u.pathname === '/api/sessions'){
         try {
           const body = await readBodyJson(req).catch(() => ({}));
-          const title = String(body && body.title ? body.title : '新会话').trim();
+          const title = String(body && body.title != null ? body.title : '').trim();
           let agentId = '';
           try {
             if (body && Object.prototype.hasOwnProperty.call(body, 'agentId') && body.agentId != null){
@@ -1154,6 +1155,8 @@ export async function startGatewayV2({ port } = {}) {
             }
           }
           try { eventBus.emit('event', { type: 'secrets_refresh' }); } catch {}
+          // Invalidate sessions for this agent after deletes to ensure new keys apply.
+          try { await invalidateChatSessions({ agentId }); } catch {}
           sendJson(res, 200, { ok: true });
         } catch (e) {
           sendJson(res, 400, { error: 'secrets_update_failed', message: e && e.message ? String(e.message) : String(e || '') });
@@ -1211,6 +1214,11 @@ export async function startGatewayV2({ port } = {}) {
             return;
           }
           try { eventBus.emit('event', { type: 'secrets_refresh' }); } catch {}
+          // Invalidate sessions depending on scope: global => all, agent => only for that agent.
+          try {
+            if (scope === 'global') await invalidateChatSessions();
+            else await invalidateChatSessions({ agentId });
+          } catch {}
           sendJson(res, 200, { ok: true, name, scope });
         } catch (e) {
           sendJson(res, 400, { error: 'secrets_import_failed', message: e && e.message ? String(e.message) : String(e || '') });
@@ -1303,6 +1311,8 @@ export async function startGatewayV2({ port } = {}) {
           }
           try { secrets.lock(); } catch {}
           try { eventBus.emit('event', { type: 'secrets_refresh' }); } catch {}
+          // Global reset impacts all agents; invalidate all chat sessions.
+          try { await invalidateChatSessions(); } catch {}
           sendJson(res, 200, { ok: true, deleted });
         } catch (e) {
           try { secrets.lock(); } catch {}
@@ -1454,6 +1464,9 @@ export async function startGatewayV2({ port } = {}) {
           } catch {}
 
           await fsp.writeFile(pathCfg, JSON.stringify(nextCfg, null, 2), 'utf-8');
+
+          // Invalidate all chat sessions after global config/provider key updates.
+          try { await invalidateChatSessions(); } catch {}
 
           // Refresh cached server_info so the UI sees updated model/base_url.
           try {
@@ -1633,6 +1646,9 @@ export async function startGatewayV2({ port } = {}) {
               await fsp.writeFile(cfgPath, JSON.stringify(nextCfg, null, 2), 'utf-8');
             }
           }
+
+          // Invalidate chat sessions for this agent so provider/key changes apply immediately.
+          try { await invalidateChatSessions({ agentId }); } catch {}
 
           // Refresh cached server_info after agent config changes.
           try {
@@ -1916,6 +1932,40 @@ export async function startGatewayV2({ port } = {}) {
             console.error('[arcana:gateway-v2] /api/tool-output error', e && e.stack ? e.stack : e);
           } catch {}
           sendJson(res, 500, { ok: false, error: 'tool_output_failed' });
+        }
+        return;
+      }
+
+      if (method === 'GET' && u.pathname === '/api/thinking-output'){
+        try {
+          const agentIdParam = String(u.searchParams.get('agentId') || '').trim();
+          const sidRaw = String(u.searchParams.get('sessionId') || '').trim();
+          const skRaw = String(u.searchParams.get('sessionKey') || '').trim();
+          let sessionId = sidRaw;
+          if (!sessionId && skRaw){
+            try {
+              const resolvedId = await getSessionIdForKey({ agentId: DEFAULT_AGENT_ID, sessionKey: skRaw });
+              if (resolvedId) sessionId = String(resolvedId || '').trim();
+            } catch {}
+          }
+          const idxRaw = u.searchParams.get('turnIndex');
+          const agentId = agentIdParam || DEFAULT_AGENT_ID;
+          const idxNum = Number(idxRaw);
+          const turnIndex = (Number.isFinite(idxNum) && idxNum >= 0) ? Math.floor(idxNum) : NaN;
+          if (!sessionId || Number.isNaN(turnIndex)){
+            sendJson(res, 400, { ok: false, error: 'missing_params' });
+            return;
+          }
+
+          const bundle = readThinkingBundle({ agentId, sessionId, turnIndex });
+          if (!bundle || (!bundle.meta && !bundle.thinking)){
+            sendJson(res, 404, { ok: false, error: 'not_found' });
+            return;
+          }
+          sendJson(res, 200, { ok: true, meta: bundle.meta || null, thinking: bundle.thinking || '', truncated: !!bundle.truncated });
+        } catch (e) {
+          try { console.error('[arcana:gateway-v2] /api/thinking-output error', e && e.stack ? e.stack : e); } catch {}
+          sendJson(res, 500, { ok: false, error: 'thinking_output_failed' });
         }
         return;
       }
