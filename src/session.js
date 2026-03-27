@@ -615,6 +615,30 @@ export async function createArcanaSession(opts={}){
     if (model) model = applyHeaderRulesToModel(model);
   } catch {}
 
+  // If no model is selected after config/env and header rules, throw a structured error
+  if (!model) {
+    try {
+      const provider = (cfg && cfg.provider) ? String(cfg.provider).trim() : (inferProviderFromEnv() || '');
+      const cfgPath = (cfg && cfg.path) ? String(cfg.path) : ((agentCfg && agentCfg.path) ? String(agentCfg.path) : ((globalCfg && globalCfg.path) ? String(globalCfg.path) : ''));
+      const hint = 'No model selected. Set ARCANA_MODEL or define a "model" in arcana.config.json or agents/' + (agentId || 'default') + '/config.json. Also ensure provider and API key env vars are set (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY/GEMINI_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY).';
+      const err = new Error(hint);
+      err.code = 'ARCANA_NO_MODEL_SELECTED';
+      err.status = 400;
+      err.details = {
+        agentId,
+        agentHomeRoot,
+        workspaceRoot: workspaceRootNormalized || workspaceRoot,
+        configPath: cfgPath,
+        provider,
+        model: model || null,
+      };
+      throw err;
+    } catch (e) {
+      // Re-throw if building the structured error failed for any reason
+      throw e;
+    }
+  }
+
   // Create tool-daemon client and proxy tools. We always register a proxy 'bash'
   // tool, but activation is controlled by execPolicy via setActiveToolsByName.
   const toolDaemon = new ToolDaemonClient({ workspaceRoot });

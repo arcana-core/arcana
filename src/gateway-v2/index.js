@@ -784,6 +784,8 @@ export async function startGatewayV2({ port } = {}) {
         const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, text, policy, title: 'Arcana Web', sync: false });
         if (!chat || chat.ok === false){
           const errMsg = chat && chat.error ? String(chat.error) : 'turn_failed';
+          const status = chat && typeof chat.status === 'number' ? chat.status : 500;
+          const message = chat && typeof chat.message === 'string' ? chat.message : undefined;
           try {
             const ev = {
               type: 'error',
@@ -793,7 +795,9 @@ export async function startGatewayV2({ port } = {}) {
             };
             eventBus.emit('event', ev);
           } catch {}
-          sendJson(res, 500, { ok: false, error: errMsg });
+          const body = { ok: false, error: errMsg };
+          if (message) body.message = message;
+          sendJson(res, status, body);
           return;
         }
         sendJson(res, 200, { ok: true, sessionId: chat.sessionId, mode: chat.mode || 'turn' });
@@ -818,6 +822,7 @@ export async function startGatewayV2({ port } = {}) {
         } catch {}
         const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, text, policy, title: 'Arcana Web', sync: true });
         if (!chat || chat.ok === false){
+          const status = chat && typeof chat.status === 'number' ? chat.status : 500;
           const respBody = {
             ok: false,
             error: chat && chat.error ? chat.error : 'turn_failed',
@@ -830,7 +835,10 @@ export async function startGatewayV2({ port } = {}) {
           if (chat && Object.prototype.hasOwnProperty.call(chat, 'logPath') && chat.logPath){
             respBody.logPath = chat.logPath;
           }
-          sendJson(res, 500, respBody);
+          if (chat && typeof chat.message === 'string'){
+            respBody.message = chat.message;
+          }
+          sendJson(res, status, respBody);
           return;
         }
         const respBody = { ok: true, sessionId: chat.sessionId, text: chat.text || '', mode: chat.mode || 'turn' };
