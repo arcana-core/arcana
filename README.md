@@ -4,20 +4,22 @@
 
 # Arcana
 
-An open-source agent harness for building, running, and observing multi-agent systems.
+**Open-source AI agent platform. Give your agents real skills — and watch everything they do.**
 
-Arcana is not a chatbot or a personal assistant — it's the runtime you use to **build** them. It provides agent isolation, tool execution with full observability, a sandboxed skill system, and a multi-session control plane. You bring the model; Arcana handles everything else.
+Arcana is a runtime for building AI agents that actually do things: manage social media, edit videos, automate workflows, interact with live streams. You define agents with personas, memories, and modular skills. Arcana handles execution, isolation, and observability.
+
+Not a chatbot wrapper. Not another LangChain. A platform where agents work for you — transparently.
 
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#quick-start">Quick Start</a> ·
   <a href="#why-arcana">Why Arcana</a> ·
-  <a href="#core-concepts">Core Concepts</a> ·
-  <a href="#documentation">Docs</a> ·
-  <a href="#contributing">Contributing</a>
+  <a href="#the-skill-system">Skills</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#docs">Docs</a>
 </p>
 
-<!-- TODO: add screenshot of Web UI here -->
+<!-- TODO: hero screenshot of Web UI -->
 
 ## Install
 
@@ -25,12 +27,12 @@ Arcana is not a chatbot or a personal assistant — it's the runtime you use to 
 
 ### Option A: Desktop App
 
-Download the latest release for your platform:
+| Platform | Download |
+|----------|----------|
+| macOS (Apple Silicon & Intel) | [Arcana.dmg](https://github.com/ArcanaAgent/Arcana/releases) |
+| Windows | [Arcana.msi](https://github.com/ArcanaAgent/Arcana/releases) |
 
-- **macOS**: [Arcana.dmg](https://github.com/ArcanaAgent/Arcana/releases) (Apple Silicon & Intel)
-- **Windows**: [Arcana.msi](https://github.com/ArcanaAgent/Arcana/releases)
-
-Open the app → configure your model provider in Settings → start using.
+Open the app → add your model API key in Settings → start using.
 
 ### Option B: From Source
 
@@ -38,108 +40,124 @@ Open the app → configure your model provider in Settings → start using.
 git clone https://github.com/ArcanaAgent/Arcana.git
 cd arcana
 npm install
-
-# Optional: install browsers for web tools
-npx playwright install
-
-# Start the gateway (serves the Web UI on port 8787)
 npm run gateway
 ```
 
-Open http://localhost:8787 in your browser, configure a model provider in Secrets, and you're ready.
+Open http://localhost:8787, add a model provider API key in Secrets, done.
 
-### Option C: Build Desktop App From Source
+### Option C: Build Desktop App
 
 ```bash
 cd packages/desktop
 npm install
-npm run dist:mac    # or dist:win for Windows
+npm run dist:mac    # or dist:win
 ```
 
 ## Quick Start
 
-1. Start Arcana: `npm run gateway` (or open the desktop app)
+1. Start Arcana (desktop app or `npm run gateway`)
 2. Open http://localhost:8787
-3. Go to Secrets and add your model provider API key (e.g. `providers/openai/api_key`)
+3. Add your model API key in Secrets (OpenAI, Anthropic, DeepSeek, etc.)
 4. Start chatting — every tool call is visible in the UI
 
-That's it. No CLI wizards, no config files, no daemon installs.
+No CLI wizards. No config files. No daemon installs.
 
-<!-- TODO: add screenshot of chat + tool call trace here -->
+<!-- TODO: screenshot of chat with visible tool calls -->
 
 ## Why Arcana
 
 ### 🔍 Full Observability
 
-Every tool call, every prompt, every agent decision is visible and traceable. Real-time event stream over WebSocket. Structured JSONL audit logs. You always know exactly what your agent did and why.
+Every tool call, every prompt, every agent decision — visible and traceable in real time. WebSocket event stream. Structured JSONL audit logs. You always know exactly what your agent did and why.
 
-<!-- TODO: add screenshot of event stream / trace view here -->
+This is Arcana's core design principle: **agents should never be black boxes.**
+
+<!-- TODO: screenshot of event stream / tool call trace -->
 
 ### 🔒 Sandboxed by Default
 
-Tools run in **isolated child processes** with explicit permission boundaries. Skills must declare network access and file system scope in their frontmatter. No default bash access. No ambient permissions.
+No ambient permissions. Every skill declares exactly what it can access:
 
 ```yaml
-# Example skill frontmatter — explicit permission declaration
 arcana:
   tools:
     - name: fetch_data
-      allowNetwork: true
-      allowedHosts: ["api.example.com:443"]
-      allowWrite: false
+      allowedHosts: ["api.example.com:443"]    # only these domains
+      allowedWritePaths: ["artifacts/output"]   # only these folders
 ```
+
+- **No bash by default** — agents can't run arbitrary shell commands
+- **No ambient network** — tools only reach declared hosts
+- **Isolated execution** — each tool call runs in its own child process
+- **File system scoped** — read/write limited to declared paths
 
 ### 🧩 Multi-Agent, Multi-Session
 
-Run multiple agents concurrently, each with its own:
+Run multiple agents concurrently, each with isolated:
 
-- **Workspace** — isolated file system root, enforced by workspace guard
-- **Memory** — per-agent long-term memory and daily notes
-- **Skills** — layered skill discovery (agent → workspace → package)
-- **Sessions** — independent conversation history per `(agentId, sessionKey)`
-- **Services** — per-agent background processes (bridges, listeners, queues)
+- **Workspace** — separate file system root per agent
+- **Memory** — persistent long-term memory and daily notes
+- **Skills** — layered discovery (agent → workspace → package)
+- **Sessions** — independent conversations per `(agentId, sessionKey)`
+- **Services** — managed background processes per agent
 
-<!-- TODO: add screenshot of multi-agent session management here -->
+<!-- TODO: screenshot of multi-agent session list -->
 
-### 🛠️ Extensible Skill System
+### 🛠️ The Skill System
 
-Build custom tools as simple JS modules. Drop them into a skill folder, declare permissions, and they're available to your agent:
+Skills are modular capabilities you give to your agents. A skill is a folder:
 
 ```
 my-skill/
-  SKILL.md          # Description + tool declarations
+  SKILL.md          # Description + permission declarations
   tools/
     my_tool/
-      tool.js       # export default factory → { name, description, parameters, execute }
+      tool.js       # export default factory → { name, parameters, execute }
 ```
 
-Skills support hot-reload. Agent-scoped skills override shared ones. The execution sandbox is the default — no `--dangerously-skip-permissions` needed.
+**How skills work:**
+- Drop a skill folder into `skills/` — Arcana discovers it automatically
+- Skills declare permissions in frontmatter — network hosts, file paths, nothing implicit
+- Tools run in isolated child processes — sandboxed by default, hot-reloadable
+- Skills layer: agent-scoped overrides workspace-scoped overrides package-scoped
 
-### ⚡ Built-in Primitives
+**What you can build with skills:**
+- Social media automation (posting, scheduling, reply management)
+- Video compositing and editing pipelines
+- Live streaming overlays and interaction bots
+- Messaging integrations (Feishu, Slack, WeChat, Discord)
+- Document generation and publishing workflows
+- Anything that can be described as an API call or file operation
+
+Tools get a sandboxed context:
+- `ctx.safeOps.fs` — guarded file operations (workspace-scoped)
+- `ctx.safeOps.http` — guarded HTTP (allowlist-scoped)
+- `ctx.secrets` — encrypted credential access (no env vars)
+
+### ⚡ Built-in Agent Primitives
 
 | Primitive | What it does |
 |-----------|-------------|
-| **Cron** | Schedule agent tasks, recurring or one-shot |
+| **Cron** | Schedule agent tasks — recurring or one-shot |
 | **Subagents** | Spawn, steer, and manage child agents |
 | **Memory** | Persistent, searchable long-term memory with daily notes |
 | **Heartbeat** | Wake agents on schedule for background work |
 | **Services** | Managed background processes with lifecycle hooks |
 | **MCP** | Model Context Protocol support for tool interop |
 
-## Core Concepts
+## Architecture
 
 ```
                     ┌─────────────────────────────┐
   Web UI / Desktop  │         Gateway (v2)         │
   Channel bridges ──│  HTTP + WebSocket + Plugins  │
-  CLI / API         │         :8787                │
+  API               │         :8787                │
                     └──────────────┬───────────────┘
                                    │
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                     ▼
         ┌──────────┐        ┌──────────┐         ┌──────────┐
         │ Agent A   │        │ Agent B   │         │ Agent C   │
-        │ home/     │        │ home/     │         │ home/     │
         │ workspace │        │ workspace │         │ workspace │
         │ sessions  │        │ sessions  │         │ sessions  │
         │ memory    │        │ memory    │         │ memory    │
@@ -148,52 +166,51 @@ Skills support hot-reload. Agent-scoped skills override shared ones. The executi
         └──────────┘        └──────────┘         └──────────┘
 ```
 
-- **Gateway** — single HTTP + WebSocket control plane. Manages agents, sessions, events, scheduling, and tool execution.
-- **Agent** — an isolated unit with its own home directory, workspace root, persona files, memory, skills, and services.
-- **Session** — a conversation context scoped to `(agentId, sessionKey)`. Agents can run multiple sessions concurrently.
-- **Skill** — a folder containing `SKILL.md` + tools. Skills are layered: agent-scoped overrides workspace-scoped overrides package-scoped.
-- **Tool** — a JS module executed in an isolated sandbox per call. Permissions are declared, not assumed.
+- **Gateway** — HTTP + WebSocket control plane. Manages agents, sessions, events, and tool execution.
+- **Agent** — isolated unit with its own home, workspace, persona, memory, skills, and services.
+- **Session** — conversation context scoped to `(agentId, sessionKey)`. Multiple sessions run concurrently.
+- **Skill** — folder with `SKILL.md` + tools. Layered: agent → workspace → package.
+- **Tool** — JS module executed in isolated sandbox. Permissions declared, not assumed.
 
-## Security Model
+### Security Model
 
-Arcana follows a principle of **least privilege by default**:
-
-| Layer | Default | Override |
-|-------|---------|----------|
-| Tool execution | Isolated child process | Opt-in to tool-daemon for stateful tools |
-| File system | Read/write within declared paths only | `allowedWritePaths` / `allowedReadPaths` in frontmatter |
-| Network | Blocked | `allowNetwork: true` + `allowedHosts` in frontmatter |
-| Bash | Not available by default | Provided via tool-daemon, not default |
-| Workspace | Guarded by workspace-guard.js | Per-agent `workspaceRoot` in agent.json |
-| Memory | Agent-scoped, no cross-agent access | Enforced by agent-guard.js |
+| Layer | Default | Configurable |
+|-------|---------|-------------|
+| Tool execution | Isolated child process | Opt-in tool-daemon for stateful tools |
+| File system | Scoped to declared paths | `allowedWritePaths` / `allowedReadPaths` |
+| Network | Blocked | `allowedHosts` allowlist |
+| Bash | Not available | Via tool-daemon, not default |
+| Workspace | Isolated per agent | `workspaceRoot` in agent.json |
+| Memory | Agent-scoped, no cross-access | Enforced by agent-guard |
 
 ## Roadmap
 
-- [ ] Low-stability network resilience (auto-retry, connection recovery, offline queue)
-- [ ] Plugin marketplace for community skills
+- [ ] Skill marketplace — discover and install community skills
+- [ ] Low-stability network resilience (auto-retry, offline queue)
 - [ ] Linux desktop builds
+- [ ] More channel integrations (Discord, Slack, Telegram)
 
-## Documentation
+## Docs
 
-| Topic | Path |
+| Topic | Link |
 |-------|------|
-| Install & quickstart | [`docs/install/README.md`](docs/install/README.md) |
-| Skills & custom tools | [`docs/skills/README.md`](docs/skills/README.md) |
+| Install & quickstart | [`docs/install/`](docs/install/README.md) |
+| Skills & custom tools | [`docs/skills/`](docs/skills/README.md) |
 | Multi-agent architecture | [`docs/multi-agent.md`](docs/multi-agent.md) |
 | Gateway protocol (v2) | [`docs/arcana-gateway-protocol.md`](docs/arcana-gateway-protocol.md) |
 | Plugin API | [`docs/arcana-plugin-api.md`](docs/arcana-plugin-api.md) |
 | Cron & scheduled jobs | [`docs/cron.md`](docs/cron.md) |
 | Heartbeat & background | [`docs/heartbeat.md`](docs/heartbeat.md) |
 | Channel runtime | [`docs/channel-runtime.md`](docs/channel-runtime.md) |
-| Troubleshooting | [`docs/troubleshooting/README.md`](docs/troubleshooting/README.md) |
+| Troubleshooting | [`docs/troubleshooting/`](docs/troubleshooting/README.md) |
 
 ## Contributing
 
-Bug reports, feature requests, and patches are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup and pull request workflow.
+Bug reports, feature requests, and PRs are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Security
 
-If you believe you have found a security issue, please do not open a public GitHub issue. Follow the process in [`SECURITY.md`](SECURITY.md) to report it via GitHub Security Advisories.
+Found a vulnerability? Don't open a public issue. Report via [GitHub Security Advisories](https://github.com/ArcanaAgent/Arcana/security/advisories).
 
 ## License
 
