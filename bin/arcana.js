@@ -7,7 +7,6 @@ import { createArcanaSession } from '../src/session.js';
 import { runDoctor, printDoctor } from '../src/doctor.js';
 import { createSupportBundle } from '../src/support-bundle.js';
 import { webCLI } from '../src/cli-web.js';
-import { wechatCLI } from '../src/cli-wechat.js';
 import { runDueOnce, serveLoop, runJobById } from '../src/cron/runner.js';
 import { listJobSummaries as cronList, listRuns as cronListRuns } from '../src/cron/store.js';
 import { startHeartbeatRunner } from '../src/heartbeat/runner.js';
@@ -27,11 +26,6 @@ Usage:
   arcana web extract                        # extract readable text from current page
   arcana web search <query> [--engine <e>]  # search via browser (engine: auto|duckduckgo|bing|baidu)
   arcana web serve [--port <n>]             # start lightweight web UI
-  arcana wechat token [--force]             # fetch/cache Official Account access_token
-  arcana wechat upload-cover <file>         # upload permanent image, print thumb_media_id
-  arcana wechat draft --title ... --content-file <html> --thumb-media-id <id> [--author ... --digest ...]
-  arcana wechat publish --media-id <id> [--wait] [--timeout-sec n]
-  arcana wechat publish-file --title ... --content-file <html> --thumb-media-id <id> [--wait]
   arcana cron once                      # run due jobs once and exit
   arcana cron serve                     # run scheduler loop (Ctrl+C to stop)
   arcana cron run <id>                  # run a specific job now
@@ -165,7 +159,6 @@ async function main(){
   if (cmd === 'doctor') return doctor(argv);
   if (cmd === 'support-bundle') return supportBundle(argv);
   if (cmd === 'web') return webCLI({ args: argv });
-  if (cmd === 'wechat') return wechatCLI({ args: argv });
   if (cmd === 'cron') return cronCLI({ args: argv });
   if (cmd === 'heartbeat') return heartbeatCLI({ args: argv });
   if (cmd === 'livestream') return livestreamCLI({ args: argv });
