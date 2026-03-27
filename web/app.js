@@ -48,18 +48,18 @@ let __apiTokenHydratedOnce = false;
 
 // Safe translation helper: prefer global t(key) when available.
 // Falls back to the provided literal (or key) when missing.
-function tr(key, fallback){
+function tt(key){
   try{
     const k = String(key || '');
-    const fb = (typeof fallback === 'undefined') ? k : fallback;
-    if (typeof t !== 'function') return fb;
+    if (typeof t !== 'function') return k;
     const v = t(k);
-    if (!v || v === k) return fb;
+    if (!v || v === k) return k;
     return v;
   } catch {
-    return (typeof fallback === 'undefined') ? String(key || '') : fallback;
+    return String(key || '');
   }
 }
+
 
 // Gateway v2 runner auto-start dedupe cache
 let __v2RunnerLastKey = '';
@@ -385,7 +385,7 @@ try{
           __apiTokenPromptedOnce = true;
           let entered = '';
           try{
-                        const msg = tr('ui.apiTokenPrompt', '请输入 Arcana API Token，用于访问 /api 和 /v2 接口：');
+                        const msg = tt('ui.apiTokenPrompt');
             entered = window.prompt(msg, '');
           } catch {}
           if (entered){
@@ -417,7 +417,7 @@ function warnStorageQuota(){
   try{
     if (__arcana_storageQuotaWarned) return;
     __arcana_storageQuotaWarned = true;
-    alert(tr('ui.storageQuotaAlert', '本地存储空间已满。请删除不需要的会话来释放空间。'));
+    alert(tt('ui.storageQuotaAlert'));
 
   } catch {}
 }
@@ -1963,11 +1963,11 @@ async function pickWorkspace(){
       overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;z-index:10000;';
       const dialog = document.createElement('div');
       dialog.style.cssText = 'width:520px;max-width:90vw;background:#fff;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.2);padding:16px;';
-      const wsTitle = tr('ui.workspacePicker.title', '选择工作区');
-      const wsDesc = tr('ui.workspacePicker.description', '建议使用桌面应用获取系统级文件夹选择器。当前在浏览器环境下，仅支持手动输入工作区绝对路径。');
-      const wsPlaceholder = tr('ui.workspacePicker.placeholder', '/绝对/路径');
-      const wsCancel = tr('ui.workspacePicker.cancel', '取消');
-      const wsOk = tr('ui.workspacePicker.ok', '确定');
+      const wsTitle = tt('ui.workspacePicker.title');
+      const wsDesc = tt('ui.workspacePicker.description');
+      const wsPlaceholder = tt('ui.workspacePicker.placeholder');
+      const wsCancel = tt('ui.workspacePicker.cancel');
+      const wsOk = tt('ui.workspacePicker.ok');
       dialog.innerHTML = '<div style="font-weight:600;margin-bottom:8px">' + wsTitle + '</div>' +
         '<div style="font-size:13px;color:#666;margin-bottom:8px">' + wsDesc + '</div>' +
         '<input id="ws-input" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #ddd;border-radius:6px" placeholder="' + wsPlaceholder + '" />' +
@@ -2132,7 +2132,7 @@ function setTyping(bubble, on){
       // Use i18n string if available
       thinking = (typeof t === 'function') ? t('ui.thinking') : '';
     } catch {}
-    if (!thinking || thinking === 'ui.thinking') thinking = '正在思考';
+    if (!thinking || thinking === 'ui.thinking') thinking = tt('ui.thinking');
     bubble.innerHTML = thinking + ' <span class=dots><span class=dot></span><span class=dot></span><span class=dot></span></span>';
   } else {
     bubble.classList.remove('typing');
@@ -2374,7 +2374,7 @@ async function reloadSkillsConfigUI(){
     const skillsWrap = qs('skills-config');
     if (!skillsWrap) return;
     try{
-      skillsWrap.textContent = tr('ui.loading', '加载中...');
+      skillsWrap.textContent = tt('ui.loading');
       const skillsStatus = qs('skills-status'); if (skillsStatus) skillsStatus.textContent = '';
       const aidSkills = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
       const urlSkills = '/api/skills?agentId=' + encodeURIComponent(aidSkills);
@@ -2394,7 +2394,7 @@ async function reloadSkillsConfigUI(){
       skillsWrap.innerHTML = '';
       if (!skillsArr.length){
         const empty = document.createElement('div');
-        empty.textContent = tr('skills.noneFound', '未发现技能');
+        empty.textContent = tt('skills.noneFound');
         empty.style.color = '#666';
         skillsWrap.appendChild(empty);
       } else {
@@ -2419,7 +2419,7 @@ async function reloadSkillsConfigUI(){
     } catch {
       skillsWrap.innerHTML = '';
       const err = document.createElement('div');
-      err.textContent = tr('skills.loadFailed', '技能列表加载失败');
+      err.textContent = tt('skills.loadFailed');
       err.style.color = '#a00';
       skillsWrap.appendChild(err);
     }
@@ -2452,12 +2452,12 @@ async function loadConfigUI(){
       const r = await fetch('/api/config', headers ? { headers } : undefined);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       globalCfg = await r.json();
-    }catch(e){ appendLog('[config] ' + tr('config.load.globalFailed', '读取全局配置失败')); globalCfg = {}; }
+    }catch(e){ appendLog('[config] ' + tt('config.load.globalFailed')); globalCfg = {}; }
 
     if (qs('cfg-provider-global')) qs('cfg-provider-global').value = globalCfg.provider || '';
     if (qs('cfg-model-global')) qs('cfg-model-global').value = globalCfg.model || '';
     if (qs('cfg-base-url-global')) qs('cfg-base-url-global').value = globalCfg.base_url || '';
-        if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? tr('config.keySet', '已设置') : tr('config.keyUnset', '未设置');
+        if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? tt('config.keySet') : tt('config.keyUnset');
 
     const globalEnabledRaw = (globalCfg && Object.prototype.hasOwnProperty.call(globalCfg, 'history_compression_enabled'))
       ? globalCfg.history_compression_enabled
@@ -2494,7 +2494,7 @@ async function loadConfigUI(){
       // Update per-agent model label cache
       try { __setCachedModelLabel(aid, agentCfg); } catch {}
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = agentCfg.base_url || '';
-            if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? tr('config.keySet', '已设置') : tr('config.keyUnset', '未设置');
+            if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? tt('config.keySet') : tt('config.keyUnset');
 
       let agentCompressEnabled = globalCompressEnabled;
       try{
@@ -2525,16 +2525,16 @@ async function loadConfigUI(){
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = '';
       if (qs('cfg-model-agent')) qs('cfg-model-agent').value = '';
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = '';
-            if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = tr('config.keyUnset', '未设置');
+            if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = tt('config.keyUnset');
       const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!globalCompressEnabled;
       const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(globalCompressThreshold);
       const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(globalCompressKeep);
-      appendLog('[config] ' + tr('config.load.agentFailed', '读取 Agent 配置失败'));
+      appendLog('[config] ' + tt('config.load.agentFailed'));
     }
     try{ updateEffectiveConfigSummary(); }catch{}
     // Best-effort: refresh live info model label immediately
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
-  }catch(e){ appendLog('[config] ' + tr('config.load.failed', '读取失败')); }
+  }catch(e){ appendLog('[config] ' + tt('config.load.failed')); }
 }
 
 async function saveGlobalConfigUI(){
@@ -2566,36 +2566,36 @@ async function saveGlobalConfigUI(){
     const key = (qs('cfg-key-global')||{}).value || '';
     if (key){
       const prov = String(payload.provider || '').trim().toLowerCase();
-      if (!prov){ appendLog('[config] 保存全局 API Key 需要先选择 Provider'); return; }
+      if (!prov){ appendLog('[config] ' + tt('config.save.globalKeyNeedsProvider'));  return; }
       const name = 'providers/' + prov + '/api_key';
       try {
         const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
         const rKey = await fetch('/api/secrets/import', { method:'POST', headers, body: JSON.stringify({ agentId, name, scope:'global', value: key }) });
         if (rKey.status === 409 || rKey.status === 423){
-          appendLog('[config] 密钥箱未就绪，请先初始化/解锁后再保存 API Key');
+          appendLog('[config] ' + tt('config.save.secretsNotReady')); 
           try { openSecrets([name], { autoCloseOnUnlock:true }).catch(()=>{}) } catch {}
           return;
         }
         if (!rKey.ok){
           let j2 = {};
           try { j2 = await rKey.json(); } catch { j2 = {}; }
-          appendLog('[config] 保存 API Key 到密钥箱失败: ' + (j2.error || j2.message || ('HTTP ' + rKey.status)));
+          appendLog('[config] ' + tt('config.save.importKeyFailedPrefix') + (j2.error || j2.message || ('HTTP ' + rKey.status)));
           return;
         }
       } catch (e) {
-        appendLog('[config] 保存 API Key 到密钥箱失败');
+        appendLog('[config] ' + tt('config.save.importKeyFailed'));
         return;
       }
     }
     const r = await fetch('/api/config', { method:'POST', headers, body: JSON.stringify(payload) });
     const j = await r.json();
-    if (!r.ok || !j.ok){ appendLog('[config] 保存全局配置失败'); return; }
+    if (!r.ok || !j.ok){ appendLog('[config] ' + tt('config.save.globalFailed')); return; }
     if (qs('cfg-key-global')) qs('cfg-key-global').value = '';
     await loadConfigUI();
     try{ updateEffectiveConfigSummary(); }catch{}
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
-    appendLog('[config] 已保存全局配置');
-  }catch(e){ appendLog('[config] 保存全局配置失败'); }
+    appendLog('[config] ' + tt('config.save.globalOk'));
+  }catch(e){ appendLog('[config] ' + tt('config.save.globalFailed')); }
 }
 
 async function saveAgentConfigUI(){
@@ -2641,35 +2641,35 @@ async function saveAgentConfigUI(){
     const key = (qs('cfg-key-agent')||{}).value || '';
     if (key){
       const prov = String(payload.provider || '').trim().toLowerCase();
-      if (!prov){ appendLog('[config] 保存 Agent API Key 需要先选择 Provider'); return; }
+      if (!prov){ appendLog('[config] ' + tt('config.save.agentKeyNeedsProvider')); return; }
       const name = 'agents/' + aid + '/providers/' + prov + '/api_key';
       try {
         const rKey = await fetch('/api/secrets/import', { method:'POST', headers, body: JSON.stringify({ agentId: aid, name, scope:'agent', value: key }) });
         if (rKey.status === 409 || rKey.status === 423){
-          appendLog('[config] 密钥箱未就绪，请先初始化/解锁后再保存 API Key');
+          appendLog('[config] ' + tt('config.save.secretsNotReady')); 
           try { openSecrets([name], { autoCloseOnUnlock:true }).catch(()=>{}) } catch {}
           return;
         }
         if (!rKey.ok){
           let j2 = {};
           try { j2 = await rKey.json(); } catch { j2 = {}; }
-          appendLog('[config] 保存 API Key 到密钥箱失败: ' + (j2.error || j2.message || ('HTTP ' + rKey.status)));
+          appendLog('[config] ' + tt('config.save.importKeyFailedPrefix') + (j2.error || j2.message || ('HTTP ' + rKey.status)));
           return;
         }
       } catch (e) {
-        appendLog('[config] 保存 API Key 到密钥箱失败');
+        appendLog('[config] ' + tt('config.save.importKeyFailed'));
         return;
       }
     }
     const r = await fetch('/api/agent-config', { method:'POST', headers, body: JSON.stringify(payload) });
     const j = await r.json();
-    if (!r.ok || !j.ok){ appendLog('[config] 保存 Agent 配置失败'); return; }
+    if (!r.ok || !j.ok){ appendLog('[config] ' + tt('config.save.agentFailed')); return; }
     if (qs('cfg-key-agent')) qs('cfg-key-agent').value = '';
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     await loadConfigUI();
     try{ updateEffectiveConfigSummary(); }catch{}
-    appendLog('[config] 已保存 Agent 配置');
-  }catch(e){ appendLog('[config] 保存 Agent 配置失败'); }
+    appendLog('[config] ' + tt('config.save.agentOk'));
+  }catch(e){ appendLog('[config] ' + tt('config.save.agentFailed')); }
 }
 
 async function saveSkillsConfigUI(){
@@ -2694,11 +2694,11 @@ async function saveSkillsConfigUI(){
     try { j = await r.json(); } catch { j = null; }
     const ok = r && r.ok && j && j.ok !== false;
     const statusEl = qs('skills-status');
-    if (statusEl){ statusEl.textContent = ok ? '已保存' : '保存失败'; }
-    if (!ok){ appendLog('[skills] 保存技能配置失败'); return; }
+    if (statusEl){ statusEl.textContent = ok ? tt('skills.save.statusOk') : tt('skills.save.statusFailed'); }
+    if (!ok){ appendLog('[skills] ' + tt('skills.save.failed')); return; }
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
-    appendLog('[skills] 已保存技能配置');
-  } catch(e){ appendLog('[skills] 保存技能配置失败'); }
+    appendLog('[skills] ' + tt('skills.save.ok'));
+  } catch(e){ appendLog('[skills] ' + tt('skills.save.failed')); }
 }
 
 async function clearAgentConfigUI(){
@@ -2707,36 +2707,35 @@ async function clearAgentConfigUI(){
     const body = { agentId: aid, clear: true };
     const r = await fetch('/api/agent-config', { method:'POST', headers, body: JSON.stringify(body) });
     const j = await r.json();
-    if (!r.ok || !j.ok){ appendLog('[config] 清除 Agent 配置失败'); return; }
+    if (!r.ok || !j.ok){ appendLog('[config] ' + tt('config.clear.agentFailed')); return; }
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
     if (qs('cfg-key-agent')) qs('cfg-key-agent').value = '';
     await loadConfigUI();
-    appendLog('[config] 已清除 Agent 配置');
-  }catch(e){ appendLog('[config] 清除 Agent 配置失败'); }
+    appendLog('[config] ' + tt('config.clear.agentOk'));
+  }catch(e){ appendLog('[config] ' + tt('config.clear.agentFailed')); }
 }
 
 async function runDoctorUI(){
   try{
-    appendLog('[doctor] 正在运行...');
+    appendLog('[doctor] ' + tt('doctor.running'));
     const sid = getCurrentSessionId();
     const url = sid ? ('/api/doctor?sessionId=' + encodeURIComponent(sid)) : '/api/doctor';
     const token = getStoredApiToken();
     const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
     const r = await fetch(url, headers ? { headers } : undefined);
     const j = await r.json();
-    appendLog('[doctor] 结果: ok ' + (j.summary?.ok||0) + ' warn ' + (j.summary?.warn||0) + ' fail ' + (j.summary?.fail||0));
-    ;(j.checks||[]).forEach(c=>{ appendLog(' - [' + c.status + '] ' + c.title + (c.details && c.details.model ? (': '+c.details.model) : '')); });
-  }catch(e){ appendLog('[doctor] 失败'); }
+    appendLog('[doctor] ' + tt('doctor.summaryPrefix') + (j.summary?.ok||0) + tt('doctor.warnLabel') + (j.summary?.warn||0) + tt('doctor.failLabel') + (j.summary?.fail||0)); (j.checks||[]).forEach(c=>{ appendLog(' - [' + c.status + '] ' + c.title + (c.details && c.details.model ? (': '+c.details.model) : '')); });
+  }catch(e){ appendLog('[doctor] ' + tt('doctor.failed')); }
 }
 
 async function createSupportBundleUI(){
   try{
-    appendLog('[support] 创建中...');
+    appendLog('[support] ' + tt('support.creating'));
     const sid = getCurrentSessionId();
     const r = await fetch('/api/support-bundle', { method:'POST', headers, body: JSON.stringify({ sessionId: sid }) });
     const j = await r.json();
-    if (!r.ok || !j.ok){ appendLog('[support] 失败'); return; }
-    appendLog('[support] 完成: ' + (j.tarPath || j.dir));
+    if (!r.ok || !j.ok){ appendLog('[support] ' + tt('support.failed')); return; }
+    appendLog('[support] ' + tt('support.donePrefix') + (j.tarPath || j.dir));
     const linkWrap = qs('support-link');
     if (linkWrap){
       linkWrap.innerHTML = '';
@@ -2744,7 +2743,7 @@ async function createSupportBundleUI(){
         const tarPath = String(j.tarPath || '');
         const url = '/api/local-file?path=' + encodeURIComponent(tarPath) + (sid ? ('&sessionId=' + encodeURIComponent(sid)) : '');
         const a = document.createElement('a');
-        a.textContent = '下载支持包 (tar.gz)';
+        a.textContent = tt('support.downloadTar');
 
         const tokenForDownload = getStoredApiToken();
         if (tokenForDownload){
@@ -2760,7 +2759,7 @@ async function createSupportBundleUI(){
               const headersDl = { 'authorization':'Bearer ' + tokenNow };
               const res = await fetch(url, { headers: headersDl });
               if (!res || !res.ok){
-                try{ appendLog('[support] 下载失败 HTTP ' + (res ? res.status : '?')); } catch {}
+                try{ appendLog('[support] ' + tt('support.downloadFailedHttpPrefix') + (res ? res.status : '?')); } catch {}
                 return;
               }
               const blob = await res.blob();
@@ -2781,7 +2780,7 @@ async function createSupportBundleUI(){
                 try{ URL.revokeObjectURL(blobUrl); } catch {}
               }, 0);
             } catch(e){
-              try{ appendLog('[support] 下载失败'); } catch {}
+              try{ appendLog('[support] ' + tt('support.downloadFailed')); } catch {}
             }
           });
         } else {
@@ -2791,7 +2790,7 @@ async function createSupportBundleUI(){
         linkWrap.appendChild(a);
       }
     }
-  }catch(e){ appendLog('[support] 失败'); }
+  }catch(e){ appendLog('[support] ' + tt('support.failed')); }
 }
 
 // Wire config buttons
@@ -3162,7 +3161,7 @@ async function loadAgents(){
         box.innerHTML = '';
         const err = document.createElement('div');
         err.className = 'agent-empty';
-                err.textContent = tr('agents.listLoadFailed', '加载 Agent 列表失败，请检查 Arcana API Token 或服务器设置。');
+                err.textContent = tt('agents.listLoadFailed');
         box.appendChild(err);
       }
     } catch {}
@@ -3206,11 +3205,11 @@ function renderSessionList(items){
     const prefix = unread ? unreadDot : (running ? runningSpinner : '');
     div.innerHTML = '<div class=sess-row>' + prefix + '<span class="sess-title">' + title + '</span></div>' + metaTime + metaWs;
     const del = document.createElement('button');
-    del.className = 'del'; del.textContent = '×'; del.title = tr('sessions.deleteTitle', '删除会话');
+    del.className = 'del'; del.textContent = '×'; del.title = tt('sessions.deleteTitle');
     del.addEventListener('click', async (ev)=>{
       try{
         ev.stopPropagation && ev.stopPropagation(); ev.preventDefault && ev.preventDefault();
-        const ok = confirm(tr('sessions.deleteConfirm', '确定删除该会话？此操作不可恢复。')); if (!ok) return;
+        const ok = confirm(tt('sessions.deleteConfirm')); if (!ok) return;
         const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
         const resp = await deleteSession(it.id, aid);
         if (!resp || resp.ok !== true){ appendLog('[sessions] delete failed: server rejected'); return }
@@ -3292,7 +3291,7 @@ function renderSessionList(items){
                 obj = await createSession('', '', currentAgentId);
               } else {
                 const ws = await pickWorkspace() || '';
-                if (!ws){ appendLog('[sessions] 未选择工作区'); return; }
+                if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); return; }
                 obj = await createSession('', ws);
               }
               await openSession(obj.id);
@@ -3512,7 +3511,7 @@ async function ensureSession(){
     return currentId;
   }
   const ws = await pickWorkspace();
-  if (!ws){ appendLog('[sessions] 未选择工作区'); throw new Error('workspace_required') }
+  if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); throw new Error('workspace_required') }
   const created = await createSession('', ws);
   setCurrent(created.id);
   // Persist pending fullshell for this newly created session
@@ -3565,13 +3564,13 @@ async function sendWithSession(){
       try{ logMain(sidAtSend, text.startsWith('[error]') ? text : ('[error] ' + text)); } catch{}
       return;
     }
-    if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = (j && j.text) || '[无响应]'; }
+    if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = (j && j.text) || tt('chat.noResponse'); }
     if (getCurrentSessionId() === sidAtSend || currentId === sidAtSend){
       await openSession(sidAtSend);
     } else {
     requestRefreshList();
     }
-  } catch(e) { if (activeAssistant) activeAssistant.textContent = '[错误] ' + (((e && e.message) || e)); }
+  } catch(e) { if (activeAssistant) activeAssistant.textContent = tt('chat.errorPrefix') + (((e && e.message) || e)); }
   finally { messages.scrollTop = messages.scrollHeight; }
 }
 
@@ -3689,7 +3688,7 @@ try {
 try {
   const clearCtxBtn = document.querySelector('#clear-context');
   if (clearCtxBtn) clearCtxBtn.addEventListener('click', async ()=>{
-        if (!confirm(tr('ui.clearContextConfirm', '清理 Agent 内部上下文？\\n\\n这将清除当前会话中 Agent 的工具调用记忆，\\n但保留对话历史（prelude）。\\n\\n适用于话题转换、上下文过大等情况。'))) return;
+        if (!confirm(tt('ui.clearContextConfirm'))) return;
     try{
       await ensureTransportReady();
       const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
@@ -3913,7 +3912,7 @@ function updateToolStreamToggleLabel(){
   try{
     const btn = document.getElementById('toggle-tool-stream');
     if (!btn) return;
-    const label = toolStreamEnabled ? '实时工具输出: 开' : '实时工具输出: 关';
+    const label = toolStreamEnabled ? tt('toolStream.onLabel') : tt('toolStream.offLabel');
     btn.textContent = label;
   } catch{}
 }
@@ -4451,7 +4450,7 @@ function handleArcanaEvent(data){
       }
 
       if (data.type === 'skills_refresh'){
-        try { LI.skillsHint = '技能已刷新'; } catch {}
+        try { LI.skillsHint = tt('skills.refreshed'); } catch {}
         try { scheduleReloadSkillsConfigUI(); } catch {}
         return;
       }
@@ -4789,7 +4788,7 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
       if (hasAgents && currentAgentId){
         obj = await createSession('', '', currentAgentId);
       } else {
-        const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
+        const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); return }
         obj = await createSession('', ws);
       }
       await openSession(obj.id);
@@ -4804,7 +4803,7 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
         if (hasAgents && currentAgentId){
           obj = await createSession('', '', currentAgentId);
         } else {
-          const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] 未选择工作区'); return }
+          const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); return }
           obj = await createSession('', ws);
         }
         await openSession(obj.id);
@@ -4957,7 +4956,7 @@ async function openSecrets(requestedNames, opts){
   const agentId = currentAgentId || DEFAULT_AGENT_ID;
 
   async function render(){
-    const loadingText = tr('ui.loading', '加载中…');
+    const loadingText = tt('ui.loading');
     dialog.innerHTML = '<div style="font-size:12px;color:#666;">' + loadingText + '</div>';
 
     let data;
@@ -4978,61 +4977,61 @@ async function openSecrets(requestedNames, opts){
     const locked = !!globalMeta.locked;
 
     let html = '<div style="display:flex;align-items:center;gap:8px;">' +
-      '<div style="font-weight:600;font-size:15px;">🔐 密钥箱（Secrets）</div>' +
+      '<div style="font-weight:600;font-size:15px;">' + tt('secrets.title') + '</div>' +
       '<div id="sec-status" style="font-size:12px;color:#666;"></div>' +
       '<div style="margin-left:auto;"><button id="sec-close-top" class="btn btn-ghost btn-icon" type="button">×</button></div>' +
       '</div>';
 
     if (!initialized) {
       html += '<div style="margin-top:12px;background:#fff7e0;border-radius:8px;padding:12px;">' +
-        '<div style="font-size:13px;font-weight:600;color:#b58900;margin-bottom:8px;">⚠ 密钥箱尚未初始化</div>' +
-        '<div style="font-size:12px;color:#666;margin-bottom:8px;">首次使用需要设置口令。口令用于加密所有密钥，请牢记。</div>' +
+        '<div style="font-size:13px;font-weight:600;color:#b58900;margin-bottom:8px;">' + tt('secrets.notInitialized.title') + '</div>' +
+        '<div style="font-size:12px;color:#666;margin-bottom:8px;">' + tt('secrets.notInitialized.desc') + '</div>' +
         '<div style="display:flex;gap:8px;align-items:center;">' +
         '  <input id="sec-pass" type="password" placeholder="设置密钥箱口令" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px;" />' +
-        '  <button id="sec-init" class="btn btn-primary btn-sm">初始化密钥箱</button>' +
+        '  <button id="sec-init" class="btn btn-primary btn-sm">' + tt('secrets.initButton') + '</button>' +
         '</div>' +
         '</div>';
     } else if (locked) {
       html += '<div style="margin-top:12px;background:#f0f4ff;border-radius:8px;padding:12px;">' +
-        '<div style="font-size:13px;font-weight:600;color:#2d7ff9;margin-bottom:8px;">🔒 密钥箱已锁定</div>' +
-        '<div style="font-size:12px;color:#666;margin-bottom:8px;">输入口令解锁后才能查看或管理密钥。</div>' +
+        '<div style="font-size:13px;font-weight:600;color:#2d7ff9;margin-bottom:8px;">' + tt('secrets.locked.title') + '</div>' +
+        '<div style="font-size:12px;color:#666;margin-bottom:8px;">' + tt('secrets.locked.desc') + '</div>' +
         '<div style="display:flex;gap:8px;align-items:center;">' +
         '  <input id="sec-pass" type="password" placeholder="输入密钥箱口令" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px;" />' +
-        '  <button id="sec-unlock" class="btn btn-primary btn-sm">解锁</button>' +
-        '  <button id="sec-reset-locked" class="btn btn-danger btn-sm">重置密钥箱</button>' +
+        '  <button id="sec-unlock" class="btn btn-primary btn-sm">' + tt('secrets.unlockButton') + '</button>' +
+        '  <button id="sec-reset-locked" class="btn btn-danger btn-sm">' + tt('secrets.resetButton') + '</button>' +
         '</div>' +
         '</div>';
     } else {
       const names = Object.keys(bindings).sort();
-      const statusText = '已解锁 · ' + names.length + ' 个密钥';
+      const statusText = tt('secrets.unlockedStatusPrefix') + names.length + tt('secrets.unlockedStatusSuffix');
 
       html += '<div style="margin-top:12px;">' +
         '<div style="font-size:12px;color:#27ae60;margin-bottom:8px;">🔓 ' + statusText + '</div>';
       html += '<div style="margin:8px 0 12px 0;text-align:right;">' +
-        '<button id="sec-reset" class="btn btn-danger btn-sm">重置密钥箱</button>' +
+        '<button id="sec-reset" class="btn btn-danger btn-sm">' + tt('secrets.resetButton') + '</button>' +
       '</div>';
 
       if (names.length > 0) {
-        html += '<div style="font-size:12px;font-weight:600;color:#333;margin-bottom:4px;">已保存的密钥</div>';
+        html += '<div style="font-size:12px;font-weight:600;color:#333;margin-bottom:4px;">' + tt('secrets.savedTitle') + '</div>';
         html += '<div style="max-height:200px;overflow-y:auto;border:1px solid #e7e7e7;border-radius:6px;">';
         for (const n of names) {
           const b = bindings[n];
-          const scopeLabel = b.hasAgent ? '代理' : (b.hasGlobal ? '全局' : '');
+          const scopeLabel = b.hasAgent ? tt('secrets.scope.agent') : (b.hasGlobal ? tt('secrets.scope.global') : '');
           const scopeColor = b.hasAgent ? '#8e44ad' : '#2d7ff9';
           html += '<div class="sec-row" data-name="' + n + '" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid #f0f0f0;font-size:12px;">' +
             '<span style="flex:1;font-family:monospace;color:#333;">' + n + '</span>' +
             '<span style="font-size:11px;color:' + scopeColor + ';background:' + scopeColor + '20;padding:1px 6px;border-radius:4px;">' + scopeLabel + '</span>' +
-            '<label style="display:flex;align-items:center;gap:3px;cursor:pointer;color:#999;"><input type="checkbox" class="sec-del-check" data-name="' + n + '" data-scope="' + (b.hasAgent ? 'agent' : 'global') + '" /><span style="font-size:11px;">删除</span></label>' +
+            '<label style="display:flex;align-items:center;gap:3px;cursor:pointer;color:#999;"><input type="checkbox" class="sec-del-check" data-name="' + n + '" data-scope="' + (b.hasAgent ? 'agent' : 'global') + '" /><span style="font-size:11px;">' + tt('secrets.deleteLabel') + '</span></label>' +
             '</div>';
         }
         html += '</div>';
-        html += '<div style="margin-top:6px;text-align:right;"><button id="sec-batch-delete" class="btn btn-danger btn-xs">删除选中</button></div>';
+        html += '<div style="margin-top:6px;text-align:right;"><button id="sec-batch-delete" class="btn btn-danger btn-xs">' + tt('secrets.batchDelete') + '</button></div>';
       } else {
-        html += '<div style="font-size:12px;color:#999;margin-bottom:8px;">暂无密钥，请在下方添加。</div>';
+        html += '<div style="font-size:12px;color:#999;margin-bottom:8px;">' + tt('secrets.empty') + '</div>';
       }
 
       html += '<div style="margin-top:12px;border-top:1px solid #e7e7e7;padding-top:12px;">' +
-        '<div style="font-size:12px;font-weight:600;color:#333;margin-bottom:6px;">添加密钥</div>' +
+        '<div style="font-size:12px;font-weight:600;color:#333;margin-bottom:6px;">' + tt('secrets.addTitle') + '</div>' +
         '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">' +
         '  <input id="sec-add-name" list="sec-well-known" placeholder="密钥名称（如 services/aliyun/dashscope_api_key）" style="flex:1;min-width:200px;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:12px;font-family:monospace;" />' +
         '  <datalist id="sec-well-known">';
@@ -5042,10 +5041,10 @@ async function openSecrets(requestedNames, opts){
       html += '</datalist>' +
         '  <input id="sec-add-value" type="password" placeholder="密钥值" style="flex:1;min-width:150px;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:12px;" />' +
         '  <select id="sec-add-scope" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:12px;">' +
-        '    <option value="global">全局</option>' +
-        '    <option value="agent">代理</option>' +
+        '    <option value="global">' + tt('secrets.add.scope.global') + '</option>' +
+        '    <option value="agent">' + tt('secrets.add.scope.agent') + '</option>' +
         '  </select>' +
-        '  <button id="sec-add-btn" class="btn btn-primary btn-sm">添加</button>' +
+        '  <button id="sec-add-btn" class="btn btn-primary btn-sm">' + tt('secrets.add.button') + '</button>' +
         '</div>' +
         '</div>';
 
@@ -5053,7 +5052,7 @@ async function openSecrets(requestedNames, opts){
     }
 
     html += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">' +
-      '<button id="sec-close-bottom" class="btn btn-secondary btn-sm">关闭</button>' +
+      '<button id="sec-close-bottom" class="btn btn-secondary btn-sm">' + tt('secrets.closeButton') + '</button>' +
       '</div>';
 
     dialog.innerHTML = html;
@@ -5067,9 +5066,9 @@ async function openSecrets(requestedNames, opts){
     if (initBtn) {
       initBtn.addEventListener('click', async () => {
         const pass = String((dialog.querySelector('#sec-pass') || {}).value || '').trim();
-        if (!pass) { appendLog('[secrets] 请输入口令'); return; }
+        if (!pass) { appendLog('[secrets] ' + tt('secrets.enterPassword')); return; }
         initBtn.disabled = true;
-        initBtn.textContent = '初始化中…';
+        initBtn.textContent = tt('secrets.initializing');
         try {
           const r = await fetch('/api/secrets/init', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: pass }) });
           const j = await r.json();
@@ -5078,13 +5077,13 @@ async function openSecrets(requestedNames, opts){
             if (j && j.error) parts.push(String(j.error));
             if (j && j.message) parts.push(String(j.message));
             if (j && j.code) parts.push(String(j.code));
-            const msg = parts.length ? parts.join(' · ') : '未知错误';
-            appendLog('[secrets] 初始化失败: ' + msg);
-            initBtn.disabled = false; initBtn.textContent = '初始化密钥箱'; return;
+            const msg = parts.length ? parts.join(' · ') : tt('secrets.unknownError');
+            appendLog('[secrets] ' + tt('secrets.initFailedPrefix') + msg);
+            initBtn.disabled = false; initBtn.textContent = tt('secrets.initButton'); return;
           }
-          appendLog('[secrets] 密钥箱初始化成功');
+          appendLog('[secrets] ' + tt('secrets.initSuccess'));
           await render();
-        } catch (e) { appendLog('[secrets] 初始化失败: ' + e); initBtn.disabled = false; initBtn.textContent = '初始化密钥箱'; }
+        } catch (e) { appendLog('[secrets] 初始化失败: ' + e); initBtn.disabled = false; initBtn.textContent = tt('secrets.initButton'); }
       });
     }
 
@@ -5093,22 +5092,22 @@ async function openSecrets(requestedNames, opts){
     if (unlockBtn) {
       unlockBtn.addEventListener('click', async () => {
         const pass = String((dialog.querySelector('#sec-pass') || {}).value || '').trim();
-        if (!pass) { appendLog('[secrets] 请输入口令'); return; }
+        if (!pass) { appendLog('[secrets] ' + tt('secrets.enterPassword')); return; }
         unlockBtn.disabled = true;
-        unlockBtn.textContent = '解锁中…';
+        unlockBtn.textContent = tt('secrets.unlocking');
         try {
           const r = await fetch('/api/secrets/unlock', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: pass }) });
           const j = await r.json();
-          if (r.status === 403) { appendLog('[secrets] 口令不正确'); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
-          if (r.status === 409) { appendLog('[secrets] 密钥箱未初始化'); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
-          if (!r.ok) { appendLog('[secrets] 解锁失败: ' + (j.error || j.message || '未知错误')); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; return; }
-          appendLog('[secrets] 已解锁');
+          if (r.status === 403) { appendLog('[secrets] ' + tt('secrets.passwordIncorrect')); unlockBtn.disabled = false; unlockBtn.textContent = tt('secrets.unlockButton'); return; }
+          if (r.status === 409) { appendLog('[secrets] ' + tt('secrets.notInitialized')); unlockBtn.disabled = false; unlockBtn.textContent = tt('secrets.unlockButton'); return; }
+          if (!r.ok) { appendLog('[secrets] ' + tt('secrets.unlockFailedPrefix') + (j.error || j.message || tt('secrets.unknownError'))); unlockBtn.disabled = false; unlockBtn.textContent = tt('secrets.unlockButton'); return; }
+          appendLog('[secrets] ' + tt('secrets.unlocked'));
           if (openOpts && openOpts.autoCloseOnUnlock){
             try { close(); } catch {}
             return;
           }
           await render();
-        } catch (e) { appendLog('[secrets] 解锁失败: ' + e); unlockBtn.disabled = false; unlockBtn.textContent = '解锁'; }
+        } catch (e) { appendLog('[secrets] ' + tt('secrets.unlockFailedPrefix') + e); unlockBtn.disabled = false; unlockBtn.textContent = tt('secrets.unlockButton'); }
       });
     }
 
@@ -5117,16 +5116,23 @@ async function openSecrets(requestedNames, opts){
     const resetBtn2 = dialog.querySelector('#sec-reset-locked');
     const onReset = async () => {
       try {
-        const step1 = prompt('危险操作：将永久删除所有密钥并清空记忆的口令。\n请输入大写 RESET 以确认:');
-        if (!step1 || step1.trim() !== 'RESET') { appendLog('[secrets] 已取消重置（未输入 RESET）'); return; }
-        if (!confirm('再次确认：是否重置密钥箱？该操作不可撤销。')) { appendLog('[secrets] 已取消重置'); return; }
+        const step1 = prompt(tt('secrets.reset.confirm1'));
+        if (!step1 || step1.trim() !== 'RESET') { appendLog('[secrets] ' + tt('secrets.reset.cancelledNoReset')); return; }
+        if (!confirm(tt('secrets.reset.confirm2'))) { appendLog('[secrets] ' + tt('secrets.reset.cancelled')); return; }
         const body = { agentId };
         const r = await fetch('/api/secrets/reset', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
         let j = null; try { j = await r.json(); } catch {}
-        if (!r.ok || !(j && j.ok)) { appendLog('[secrets] 重置失败'); return; }
-        appendLog('[secrets] 已重置密钥箱（全局: ' + (j.deleted && j.deleted.global ? '删除' : '无') + '，代理: ' + (j.deleted && j.deleted.agent ? '删除' : '无') + '）');
+        if (!r.ok || !(j && j.ok)) { appendLog('[secrets] ' + tt('secrets.reset.failed')); return; }
+        const dp = tt('secrets.reset.donePrefix');
+        const gl = tt('secrets.reset.globalLabel');
+        const sp = tt('secrets.reset.separator');
+        const al = tt('secrets.reset.agentLabel');
+        const dl = tt('secrets.reset.deleted');
+        const nn = tt('secrets.reset.none');
+        const sf = tt('secrets.reset.suffix');
+        appendLog('[secrets] ' + dp + gl + ((j && j.deleted && j.deleted.global) ? dl : nn) + sp + al + ((j && j.deleted && j.deleted.agent) ? dl : nn) + sf);
         await render();
-      } catch (e) { appendLog('[secrets] 重置失败: ' + (((e && e.message) || e))); }
+      } catch (e) { appendLog('[secrets] ' + tt('secrets.reset.failed') + ': ' + (((e && e.message) || e))); }
     };
     if (resetBtn1) resetBtn1.addEventListener('click', ()=>{ onReset().catch(()=>{}) });
     if (resetBtn2) resetBtn2.addEventListener('click', ()=>{ onReset().catch(()=>{}) });
@@ -5141,19 +5147,24 @@ async function openSecrets(requestedNames, opts){
         const name = String((nameInput || {}).value || '').trim();
         const value = String((valueInput || {}).value || '');
         const scope = String((scopeSelect || {}).value || 'global');
-        if (!name) { appendLog('[secrets] 请输入密钥名称'); return; }
-        if (!value) { appendLog('[secrets] 请输入密钥值'); return; }
+        if (!name) { appendLog('[secrets] ' + tt('secrets.add.nameRequired')); return; }
+        if (!value) { appendLog('[secrets] ' + tt('secrets.add.valueRequired')); return; }
         addBtn.disabled = true;
-        addBtn.textContent = '添加中…';
+        addBtn.textContent = tt('secrets.adding');
         try {
           const r = await fetch('/api/secrets/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId, name, scope, value }) });
-          const j = await r.json();
-          if (r.status === 409) { appendLog('[secrets] 密钥箱未初始化'); addBtn.disabled = false; addBtn.textContent = '添加'; return; }
-          if (r.status === 423) { appendLog('[secrets] 密钥箱已锁定，请先解锁'); addBtn.disabled = false; addBtn.textContent = '添加'; return; }
-          if (!r.ok) { appendLog('[secrets] 添加失败: ' + (j.error || j.message || '未知错误')); addBtn.disabled = false; addBtn.textContent = '添加'; return; }
-          appendLog('[secrets] 已添加: ' + name);
+          let j = null; try { j = await r.json(); } catch {}
+          if (r.status === 409) { appendLog('[secrets] ' + tt('secrets.notInitialized')); return; }
+          if (r.status === 423) { appendLog('[secrets] ' + tt('secrets.locked.mustUnlock')); return; }
+          if (!r.ok) { appendLog('[secrets] ' + tt('secrets.add.failedPrefix') + ((j && (j.error || j.message)) || tt('secrets.unknownError'))); return; }
+          appendLog('[secrets] ' + tt('secrets.add.addedPrefix') + name);
           await render();
-        } catch (e) { appendLog('[secrets] 添加失败: ' + e); addBtn.disabled = false; addBtn.textContent = '添加'; }
+        } catch (e) {
+          appendLog('[secrets] ' + tt('secrets.add.failedPrefix') + (((e && e.message) || e) || ''));
+        } finally {
+          addBtn.disabled = false;
+          addBtn.textContent = tt('secrets.add.button');
+        }
       });
     }
 
@@ -5162,22 +5173,30 @@ async function openSecrets(requestedNames, opts){
     if (delBtn) {
       delBtn.addEventListener('click', async () => {
         const checks = dialog.querySelectorAll('.sec-del-check:checked');
-        if (!checks.length) { appendLog('[secrets] 未选中任何密钥'); return; }
+        if (!checks || !checks.length) { appendLog('[secrets] ' + tt('secrets.noneSelected')); return; }
         const delBindings = {};
         for (const c of checks) {
-          const n = c.dataset.name;
-          const s = c.dataset.scope || 'global';
-          delBindings[n] = { scope: s, delete: true };
+          const n = (c && c.dataset) ? c.dataset.name : '';
+          const s = ((c && c.dataset) ? c.dataset.scope : '') || 'global';
+          if (n) delBindings[n] = { scope: s, delete: true };
         }
         delBtn.disabled = true;
-        delBtn.textContent = '删除中…';
+        delBtn.textContent = tt('secrets.deleting');
         try {
           const r = await fetch('/api/secrets', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId, bindings: delBindings }) });
-          const j = await r.json();
-          if (!r.ok) { appendLog('[secrets] 删除失败: ' + (j.error || j.message || '未知错误')); delBtn.disabled = false; delBtn.textContent = '删除选中'; return; }
-          appendLog('[secrets] 已删除 ' + checks.length + ' 个密钥');
+          let j = null; try { j = await r.json(); } catch {}
+          if (!r.ok) {
+            appendLog('[secrets] ' + tt('secrets.delete.failedPrefix') + ((j && (j.error || j.message)) || tt('secrets.unknownError')));
+            return;
+          }
+          appendLog('[secrets] ' + tt('secrets.delete.deletedPrefix') + checks.length + tt('secrets.unlockedStatusSuffix'));
           await render();
-        } catch (e) { appendLog('[secrets] 删除失败: ' + e); delBtn.disabled = false; delBtn.textContent = '删除选中'; }
+        } catch (e) {
+          appendLog('[secrets] ' + tt('secrets.delete.failedPrefix') + (((e && e.message) || e) || ''));
+        } finally {
+          delBtn.disabled = false;
+          delBtn.textContent = tt('secrets.batchDelete');
+        }
       });
     }
 
