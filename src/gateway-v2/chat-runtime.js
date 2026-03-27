@@ -1868,7 +1868,17 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
     }
   } catch {}
 
-  const record = await ensureChatSession({ sessionId, agentId, policy });
+  let record;
+  try {
+    record = await ensureChatSession({ sessionId, agentId, policy });
+  } catch (e) {
+    const code = String((e && e.code) || '').toUpperCase();
+    const message = String((e && e.message) || e || 'Failed to start chat session');
+    if (code === 'ARCANA_NO_MODEL_SELECTED'){
+      return { ok: false, error: 'no_model_selected', status: (typeof e.status === 'number' ? e.status : 400), message };
+    }
+    return { ok: false, error: 'turn_failed', status: (typeof e.status === 'number' ? e.status : 500), message };
+  }
   const session = record.session;
 
   // Build prelude before appending current user message
