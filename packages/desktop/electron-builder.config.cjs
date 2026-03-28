@@ -33,6 +33,9 @@ const config = {
   win: {
     target: 'msi',
     artifactName: '${productName}-${version}-${os}-${arch}.${ext}',
+    // Explicitly set Windows installer/app icon to avoid WiX ARPPRODUCTICON issues
+    // when no icon is discovered automatically.
+    icon: 'build/icon.ico',
   },
   extraResources: [
     { from: '../../server', to: 'server' },
