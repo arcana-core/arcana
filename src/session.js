@@ -11,7 +11,6 @@ import createMemoryTools from './tools/memory.js';
 import { createAgentMemoryFsTools } from './tools/agent-memory-fs.js';
 import createSubagentsTool from './tools/subagents.js';
 import { createCronTool } from './tools/cron.js';
-import { createHeartbeatTool } from './tools/heartbeat.js';
 import { loadArcanaConfig, loadAgentConfig, applyProviderEnv, resolveModelFromConfig, resolveModelFromEnv, inferProviderFromEnv } from './config.js';
 import { join, dirname, extname, basename } from 'node:path';
 import { resolveArcanaHome, ensureArcanaHomeDir } from './arcana-home.js';
@@ -422,6 +421,7 @@ export async function createArcanaSession(opts={}){
   function resolveModel(){
     inlineBaseUrlExplicit = false;
     const sel = resolveModelFromConfig(cfg) || resolveModelFromEnv();
+    const hadExplicitSelection = !!sel;
     let model = null;
     let selProvider = '';
     let selId = '';
@@ -451,6 +451,38 @@ export async function createArcanaSession(opts={}){
           model = getModel(providerForLookup, selId);
         } catch {}
       }
+    }
+    // If user explicitly selected a model but we still couldn't resolve a
+    // concrete built-in template, construct a generic model description based
+    // on the user's selection and skip provider-family fallback. This preserves
+    // the exact model id/addressing so upstream gateways can return precise
+    // errors (e.g., unknown model vs. bad URL) instead of masking with a
+    // fallback like gpt-4o-mini.
+    if (!model && hadExplicitSelection){
+      try {
+        // Prefer the configured provider when present (e.g., openai-compatible),
+        // but keep the original selection as a subfamily prefix in the id so
+        // gateways that expect "anthropic/xxx" continue to receive it.
+        const provForGeneric = (cfg && cfg.provider ? String(cfg.provider).trim() : '') || selProvider;
+        const provLower = String(provForGeneric || '').toLowerCase();
+        let idForGeneric = selId;
+        if (selProvider && provForGeneric && selProvider.toLowerCase() !== provLower){
+          // Preserve the original provider prefix in the id when user wrote
+          // something like "anthropic/claude-sonnet-4.6" but the configured
+          // provider is an OpenAI‑compatible router.
+          idForGeneric = `${selProvider}/${selId}`;
+        }
+        // Pick a sensible API default for the generic template.
+        const template = {};
+        if (provLower === 'openai' || provLower === 'openai-compatible' || provLower === 'openrouter' || provLower === 'groq' || provLower === 'cerebras' || provLower === 'zai' || provLower === 'mistral'){
+          template.api = 'openai-completions';
+        } else if (provLower === 'anthropic') {
+          template.api = 'anthropic-messages';
+        } else if (provLower === 'google' || provLower === 'google-gemini-cli' || provLower === 'google-vertex'){
+          template.api = 'google-generative-ai';
+        }
+        model = buildModelFromInline(provForGeneric, idForGeneric, template);
+      } catch {}
     }
     if (!model){
       const rawProvider = cfg?.provider || inferProviderFromEnv() || '';
@@ -483,7 +515,8 @@ export async function createArcanaSession(opts={}){
           }
         }
       }
-      if (!model && providerNorm) model = pickFallbackModel(providerNorm);
+      // Only apply family fallback when the user did NOT explicitly select a model.
+      if (!model && !hadExplicitSelection && providerNorm) model = pickFallbackModel(providerNorm);
     }
 
     // Legacy cfg.base_url / env overrides for OpenAI/Anthropic.
@@ -657,7 +690,6 @@ export async function createArcanaSession(opts={}){
   const memoryTools = createMemoryTools();
   const agentMemoryFsTools = createAgentMemoryFsTools();
   const cronTool = createCronTool();
-  const heartbeatTool = createHeartbeatTool();
   const pkgRoot = arcanaPkgRoot();
   if (!process.env.ARCANA_PKG_ROOT){
     try { process.env.ARCANA_PKG_ROOT = pkgRoot; } catch {}
@@ -691,12 +723,10 @@ export async function createArcanaSession(opts={}){
   if (contextSessionId && contextSessionId.startsWith('agent:arcana:subagent:')){
     minimalAgentBootstrap = true;
   }
-
-  if (bootstrapContextMode === 'heartbeat_light' || bootstrapContextMode === 'lightweight'){
+  let agentBootstrap = { contextFiles: [], hasSoul: false };
+  if (bootstrapContextMode === 'lightweight'){
     minimalAgentBootstrap = true;
   }
-
-  let agentBootstrap = { contextFiles: [], hasSoul: false };
   try {
     agentBootstrap = buildAgentBootstrapContext(agentHomeRoot, { minimal: minimalAgentBootstrap }) || agentBootstrap;
   } catch {}
@@ -724,7 +754,6 @@ export async function createArcanaSession(opts={}){
     codex,
     subagents,
     cronTool,
-    heartbeatTool,
     ...filteredPlugins,
     ...skillTools,
     webRender,
@@ -741,33 +770,23 @@ export async function createArcanaSession(opts={}){
     cwd: workspaceRoot,
     agentDir: agentHomeRoot,
     agentsFilesOverride: (base)=>{
-      const heartbeatLight = bootstrapContextMode === 'heartbeat_light';
-
       const allBaseFiles = base && Array.isArray(base.agentsFiles) ? base.agentsFiles : [];
       let baseFiles = allBaseFiles;
       if (minimalAgentBootstrap && workspaceRootNormalized){
         baseFiles = allBaseFiles.filter((f)=>{
           if (!f || !f.path) return false;
-          const p = String(f.path).split('\\').join('/');
+          const p = String(f.path).split("\\").join("/");
           if (!p) return false;
           if (p === workspaceRootNormalized) return true;
-          return p.startsWith(workspaceRootNormalized + '/');
+          return p.startsWith(workspaceRootNormalized + "/");
         });
       }
       const merged = [...baseFiles];
       const seen = new Set();
       for (const f of baseFiles){
-        if (f && typeof f.path === 'string') seen.add(f.path);
+        if (f && typeof f.path === "string") seen.add(f.path);
       }
-      let extra = agentBootstrap && Array.isArray(agentBootstrap.contextFiles) ? agentBootstrap.contextFiles : [];
-      if (heartbeatLight){
-        const heartbeatPath = agentHomeRoot ? join(agentHomeRoot, 'HEARTBEAT.md') : null;
-        if (heartbeatPath){
-          extra = extra.filter((f)=> f && typeof f.path === 'string' && f.path === heartbeatPath);
-        } else {
-          extra = [];
-        }
-      }
+      const extra = agentBootstrap && Array.isArray(agentBootstrap.contextFiles) ? agentBootstrap.contextFiles : [];
       for (const f of extra){
         if (!f || !f.path || seen.has(f.path)) continue;
         merged.push(f);
@@ -779,31 +798,31 @@ export async function createArcanaSession(opts={}){
 
       // Workspace override: repo-local .pi/APPEND_SYSTEM.md
       try {
-        const repoAppend = readIfExists(join(repoRoot, '.pi', 'APPEND_SYSTEM.md'));
+        const repoAppend = readIfExists(join(repoRoot, ".pi", "APPEND_SYSTEM.md"));
         if (repoAppend) extras.push(repoAppend);
       } catch {}
 
       // Base APPEND_SYSTEM: prefer $ARCANA_HOME/APPEND_SYSTEM.md, fall back to packaged default.
       try {
-        let baseAppend = '';
+        let baseAppend = "";
         try {
           const homeDir = resolveArcanaHome();
-          if (homeDir) baseAppend = readIfExists(join(homeDir, 'APPEND_SYSTEM.md'));
+          if (homeDir) baseAppend = readIfExists(join(homeDir, "APPEND_SYSTEM.md"));
         } catch {}
         if (!baseAppend){
-          baseAppend = readIfExists(join(pkgRoot, '.pi', 'APPEND_SYSTEM.md'));
+          baseAppend = readIfExists(join(pkgRoot, ".pi", "APPEND_SYSTEM.md"));
         }
         if (baseAppend) extras.push(baseAppend);
       } catch {}
       const soulLine = hasSoulHint
-        ? 'If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.'
-        : '';
+        ? "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."
+        : "";
       if (soulLine) extras.push(soulLine);
       // Append skills prompt after APPEND_SYSTEM.md blocks and SOUL hint
       if (skillsPrompt && skillsPrompt.trim()) extras.push(skillsPrompt);
-      const merged = [...(base||[])];
-      for (const s of extras){ if (s && !merged.includes(s)) merged.push(s); }
-      return merged;
+      const mergedSp = [...(base||[])];
+      for (const sText of extras){ if (sText && !mergedSp.includes(sText)) mergedSp.push(sText); }
+      return mergedSp;
     }
   });
   await loader.reload();
