@@ -1,4 +1,5 @@
 import { nowMs } from '../util.js';
+import { decideWake } from './wake-agent.js';
 
 export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runnerRegistry, trace, wsHub } = {}){
   const runInLane = typeof lane === 'function'
@@ -189,8 +190,17 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
       }
 
       const startTsMs = nowMs();
-      let spanCtx = null;
+      // Wake-agent retry state (persisted)
+      let wakeState = null;
+      try {
+        wakeState = await getState({ agentId: aId, sessionKey: sKey, scope: 'wake' });
+      } catch {
+        wakeState = { value: null, version: 0, updatedAtMs: 0 };
+      }
+      const prevWakeRetryCount = Number(wakeState && wakeState.value && wakeState.value.retryCount || 0) || 0;
 
+      let spanCtx = null;
+      let __wakeScheduled = false;
       try {
         if (trace && typeof trace.emitSpan === 'function'){
           try {
@@ -324,6 +334,66 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
             });
           } catch {}
         }
+
+        // Wake-agent fallback: when runner did not explicitly schedule a next wake,
+        // decide whether to retry (model_error) or follow up (no_output).
+        try {
+          if (!nextDelay && scheduler && typeof scheduler.requestWake === 'function' && cfg.enabled){
+            // If runner explicitly reported it did not run / had no work, don't auto-wake.
+            if (result && Object.prototype.hasOwnProperty.call(result, 'ran') && result.ran === false) {
+              // Still persist wake retry state below (it will be reset on ok), but skip scheduling.
+            }
+            const outputs = result && Array.isArray(result.outputs) ? result.outputs : [];
+            const hasOutput = (result && typeof result.hasOutput === 'boolean')
+              ? !!result.hasOutput
+              : outputs.some((o)=> o && (o.kind === 'assistant_message' || o.kind === 'wake_info') && (o.text != null ? String(o.text).trim() : ''));
+            const kind = result && typeof result.kind === 'string' ? result.kind : (!ok ? 'model_error' : (hasOutput ? 'normal' : 'no_output'));
+
+            const maxRetriesRaw = Number(process.env.ARCANA_GATEWAY_V2_WAKE_MAX_RETRIES);
+            const maxRetries = (Number.isFinite(maxRetriesRaw) && maxRetriesRaw >= 0) ? Math.floor(maxRetriesRaw) : 3;
+            const baseDelayRaw = Number(process.env.ARCANA_GATEWAY_V2_WAKE_BASE_DELAY_MS);
+            const baseNextDelayMs = (Number.isFinite(baseDelayRaw) && baseDelayRaw >= 0) ? Math.floor(baseDelayRaw) : 5000;
+
+            const retryCount = ok ? 0 : (prevWakeRetryCount + 1);
+            const decision = decideWake({
+              ok,
+              hasOutput,
+              kind,
+              retryCount,
+              maxRetries,
+              baseNextDelayMs,
+            });
+
+            // Persist wake retry count even when we decide to stop (useful for debugging).
+            try {
+              await patchState({
+                agentId: aId,
+                sessionKey: sKey,
+                scope: 'wake',
+                expectedVersion: wakeState ? wakeState.version : null,
+                mutator: (prev) => ({
+                  ...(prev || {}),
+                  retryCount,
+                  lastKind: kind,
+                  lastOk: ok,
+                  lastDecision: decision && decision.action ? decision.action : null,
+                  lastDecisionDelayMs: decision && typeof decision.delayMs === 'number' ? decision.delayMs : null,
+                  lastDecisionAtMs: nowMs(),
+                }),
+              });
+            } catch {}
+
+            if (decision && decision.action === 'wake_later' && decision.delayMs > 0 && !(result && Object.prototype.hasOwnProperty.call(result, 'ran') && result.ran === false)) {
+              scheduler.requestWake({
+                agentId: aId,
+                sessionKey: sKey,
+                priority: 2,
+                reason: 'wake-agent',
+                delayMs: decision.delayMs,
+              });
+            }
+          }
+        } catch {}
       } catch (e) {
         ok = false;
         throw e;

@@ -46,6 +46,20 @@ export function createOutbox({ wsHub, inbox, trace, policy } = {}){
       return { delivered: true, event };
     }
 
+    // Wake info cards: lightweight, user-visible system notes about scheduled/triggered wakes.
+    if (kind === 'wake_info'){
+      const text = output.text != null ? String(output.text) : '';
+      if (!text) return { delivered: false, reason: 'empty_text' };
+      const event = await inbox.ingestEvent({
+        agentId: aId,
+        sessionKey: sKey,
+        type: 'wake_info',
+        source: runnerId || 'wake_agent',
+        data: { text },
+      });
+      return { delivered: true, event };
+    }
+
     const sinkId = output.sinkId || output.sink || null;
     if (sinkId && sinks.has(sinkId)){
       const sink = sinks.get(sinkId);
@@ -76,4 +90,3 @@ export function createOutbox({ wsHub, inbox, trace, policy } = {}){
 }
 
 export default { createOutbox };
-

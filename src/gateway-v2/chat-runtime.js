@@ -1125,8 +1125,8 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
 
   // --- Retry configuration ---
   const _retryMaxRaw = Number(process.env.ARCANA_COMPLETION_MAX_RETRIES);
-  const _retryMax = (Number.isFinite(_retryMaxRaw) && _retryMaxRaw >= 0) ? _retryMaxRaw : 2;
-  const maxAttempts = _retryMax + 1; // default 3 total attempts
+  const _retryMax = (Number.isFinite(_retryMaxRaw) && _retryMaxRaw >= 0) ? _retryMaxRaw : 0;
+  const maxAttempts = _retryMax + 1; // total attempts per completion (default 1)
   const defaultRetryDelayMs = 5000;
   const _retryDelayRaw = Number(process.env.ARCANA_COMPLETION_RETRY_DELAY_MS);
   const retryDelayMs = (Number.isFinite(_retryDelayRaw) && _retryDelayRaw >= 0) ? Math.max(_retryDelayRaw, defaultRetryDelayMs) : defaultRetryDelayMs;
@@ -1219,22 +1219,30 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
 
     if (usageHelper) usageHelper.reset();
 
-    // Idle timeout to detect stuck agent (no stream events for extended period)
+    // Idle timeout disabled by default. Set ARCANA_PROMPT_IDLE_TIMEOUT_MS>0 to re-enable.
     const _idleTimeoutRaw = Number(process.env.ARCANA_PROMPT_IDLE_TIMEOUT_MS);
-    const _idleTimeoutMs = (Number.isFinite(_idleTimeoutRaw) && _idleTimeoutRaw > 0) ? _idleTimeoutRaw : 120000;
+    const _idleTimeoutMs = (Number.isFinite(_idleTimeoutRaw) && _idleTimeoutRaw > 0) ? _idleTimeoutRaw : 0;
     let _idleTimer = null;
     let _idleReject = null;
-    const _idlePromise = new Promise((_, reject) => { _idleReject = reject; });
-    const _resetIdleTimer = () => {
-      if (_idleTimer) clearTimeout(_idleTimer);
-      if (_idleReject) {
-        _idleTimer = setTimeout(() => {
-          try { if (sess && typeof sess.abort === 'function') sess.abort(); } catch {}
-          try { _idleReject(new Error('Agent prompt idle timeout (' + _idleTimeoutMs + 'ms) — no stream events received. The agent may be stuck.')); } catch {}
-          _idleReject = null;
-        }, _idleTimeoutMs);
-      }
-    };
+    let _idlePromise = null;
+    let _resetIdleTimer = () => {};
+    if (_idleTimeoutMs > 0){
+      _idlePromise = new Promise((_, reject) => { _idleReject = reject; });
+      // redefine reset only when enabled
+      const __reset = () => {
+        if (_idleTimer) clearTimeout(_idleTimer);
+        if (_idleReject) {
+          _idleTimer = setTimeout(() => {
+            try { if (sess && typeof sess.abort === 'function') sess.abort(); } catch {}
+            try { _idleReject(new Error('Agent prompt idle timeout (' + _idleTimeoutMs + 'ms) — no stream events received. The agent may be stuck.')); } catch {}
+            _idleReject = null;
+          }, _idleTimeoutMs);
+        }
+      };
+      // shadow no-op with active implementation
+      // eslint-disable-next-line no-func-assign
+      _resetIdleTimer = __reset;
+    }
 
     const unsub = sess.subscribe((ev) => {
       try { _resetIdleTimer(); } catch {}
@@ -1312,21 +1320,25 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         }
       } catch {}
     });
-    _resetIdleTimer(); // start idle timer
+    _resetIdleTimer(); // no-op when idle timeout disabled
     try {
       // If the agent starts streaming between the earlier isSteer check and this call,
       // pass a safe fallback so we queue instead of throwing. 'followUp' is ignored
       // when not streaming, and avoids HTTP 500 "Agent is already processing" races.
       const promptOpts = { expandPromptTemplates: true };
       try { if (sess && sess.isStreaming) Object.assign(promptOpts, { streamingBehavior: 'followUp' }); } catch {}
-      await Promise.race([
-        runWithContext(ctx, () => sess.prompt(payloadMsg, promptOpts)),
-        _idlePromise,
-      ]);
+      if (_idlePromise){
+        await Promise.race([
+          runWithContext(ctx, () => sess.prompt(payloadMsg, promptOpts)),
+          _idlePromise,
+        ]);
+      } else {
+        await runWithContext(ctx, () => sess.prompt(payloadMsg, promptOpts));
+      }
     } catch (e) {
       promptError = e;
     } finally {
-      if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+      if (_idleTimer) { try { clearTimeout(_idleTimer); } catch {} _idleTimer = null; }
       _idleReject = null;
       try { unsub && unsub(); } catch {}
     }
@@ -1433,7 +1445,12 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     const _retryable = isRetryableCompletionError(promptError, finishReason, stopReason);
     if (!_retryable || _attempt >= maxAttempts) break; // final failure or non-retryable
 
-    try { console.warn('[arcana:gateway-v2] completion retry attempt=%d/%d delay=%dms reason=%s', _attempt, maxAttempts, retryDelayMs, promptError ? String(promptError.message || promptError).slice(0, 200) : _completionErr); } catch {}
+    try {
+      const _logRetries = truthyEnv("ARCANA_COMPLETION_LOG_RETRIES");
+      if (_logRetries){
+        console.warn("[arcana:gateway-v2] completion retry attempt=%d/%d delay=%dms reason=%s", _attempt, maxAttempts, retryDelayMs, promptError ? String(promptError.message || promptError).slice(0, 200) : _completionErr);
+      }
+    } catch {}
     await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
 
     // Reset usage helper for next attempt

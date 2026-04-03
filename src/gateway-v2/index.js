@@ -11,7 +11,7 @@ import { logError } from '../util/error.js';
 import { createWsHub } from './ws-hub.js';
 import * as eventStore from './event-store.js';
 import { eventBus, runWithContext } from '../event-bus.js';
-import { requestTurnAbort } from '../cron/arcana-task.js';
+import { requestTurnAbort, ensureSessionId } from '../cron/arcana-task.js';
 import { getSessionIdForKey } from '../session-key-store.js';
 import { getState, patchState } from './state-store.js';
 import { runInLane } from './lane.js';
@@ -89,6 +89,11 @@ function sanitizeConfig(cfg){
   try {
     if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_keep_user_turns')) {
       out.history_compression_keep_user_turns = cfg.history_compression_keep_user_turns;
+    }
+  } catch {}
+  try {
+    if (Object.prototype.hasOwnProperty.call(cfg, 'history_compression_compact_instructions')) {
+      out.history_compression_compact_instructions = cfg.history_compression_compact_instructions;
     }
   } catch {}
   delete out.key;
@@ -781,6 +786,38 @@ export async function startGatewayV2({ port } = {}) {
           const p = String(rawPol || '').trim().toLowerCase();
           if (p === 'open' || p === 'restricted') policy = p;
         } catch {}
+
+        // Optional queued mode: persist message to inbox and let the scheduler/engine run it.
+        // This is more resilient to transient model/network failures because the turn becomes retryable.
+        let queued = false;
+        try {
+          if (body && body.queued === true) queued = true;
+          const modeEnv = String(process.env.ARCANA_GATEWAY_V2_TURN_MODE || '').trim().toLowerCase();
+          if (modeEnv === 'queued' || modeEnv === 'reactor') queued = true;
+        } catch {}
+        if (queued){
+          try {
+            const ws = resolveWorkspaceRoot();
+            const ensuredId = await ensureSessionId({ sessionId: sessionIdRaw || '', sessionKey, title: 'Arcana Web', agentId, workspaceRoot: ws });
+            const sessionId = String(ensuredId || '').trim() || null;
+            const ev = await inbox.ingestEvent({
+              agentId,
+              sessionKey,
+              type: 'message',
+              source: 'api.turn',
+              data: { text, policy, sessionId },
+            });
+            try {
+              scheduler.requestWake({ agentId, sessionKey, reason: 'turn.queued', priority: 0, delayMs: 0 });
+            } catch {}
+            sendJson(res, 200, { ok: true, sessionId, mode: 'queued', eventId: ev && ev.eventId ? ev.eventId : null });
+            return;
+          } catch (e) {
+            sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+            return;
+          }
+        }
+
         const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, text, policy, title: 'Arcana Web', sync: false });
         if (!chat || chat.ok === false){
           const errMsg = chat && chat.error ? String(chat.error) : 'turn_failed';
@@ -820,6 +857,38 @@ export async function startGatewayV2({ port } = {}) {
           const p = String(rawPol || '').trim().toLowerCase();
           if (p === 'open' || p === 'restricted') policy = p;
         } catch {}
+
+        // Optional queued mode: persist message to inbox and let the scheduler/engine run it.
+        // This is more resilient to transient model/network failures because the turn becomes retryable.
+        let queued = false;
+        try {
+          if (body && body.queued === true) queued = true;
+          const modeEnv = String(process.env.ARCANA_GATEWAY_V2_TURN_MODE || '').trim().toLowerCase();
+          if (modeEnv === 'queued' || modeEnv === 'reactor') queued = true;
+        } catch {}
+        if (queued){
+          try {
+            const ws = resolveWorkspaceRoot();
+            const ensuredId = await ensureSessionId({ sessionId: sessionIdRaw || '', sessionKey, title: 'Arcana Web', agentId, workspaceRoot: ws });
+            const sessionId = String(ensuredId || '').trim() || null;
+            const ev = await inbox.ingestEvent({
+              agentId,
+              sessionKey,
+              type: 'message',
+              source: 'api.turn',
+              data: { text, policy, sessionId },
+            });
+            try {
+              scheduler.requestWake({ agentId, sessionKey, reason: 'turn.queued', priority: 0, delayMs: 0 });
+            } catch {}
+            sendJson(res, 200, { ok: true, sessionId, mode: 'queued', eventId: ev && ev.eventId ? ev.eventId : null });
+            return;
+          } catch (e) {
+            sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+            return;
+          }
+        }
+
         const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, text, policy, title: 'Arcana Web', sync: true });
         if (!chat || chat.ok === false){
           const status = chat && typeof chat.status === 'number' ? chat.status : 500;
@@ -1471,6 +1540,16 @@ export async function startGatewayV2({ port } = {}) {
             }
           } catch {}
 
+
+          try {
+            if (Object.prototype.hasOwnProperty.call(body, 'history_compression_compact_instructions')) {
+              const raw = body.history_compression_compact_instructions;
+              const str = (raw == null) ? '' : String(raw);
+              if (str.trim()) nextCfg.history_compression_compact_instructions = str;
+              else { try { delete nextCfg.history_compression_compact_instructions; } catch {} }
+            }
+          } catch {}
+
           await fsp.writeFile(pathCfg, JSON.stringify(nextCfg, null, 2), 'utf-8');
 
           // Invalidate all chat sessions after global config/provider key updates.
@@ -1648,6 +1727,16 @@ export async function startGatewayV2({ port } = {}) {
                   if (Number.isFinite(num) && num > 0) {
                     nextCfg.history_compression_keep_user_turns = Math.floor(num);
                   }
+                }
+              } catch {}
+
+
+              try {
+                if (Object.prototype.hasOwnProperty.call(body, 'history_compression_compact_instructions')) {
+                  const raw = body.history_compression_compact_instructions;
+                  const str = (raw == null) ? '' : String(raw);
+                  if (str.trim()) nextCfg.history_compression_compact_instructions = str;
+                  else { try { delete nextCfg.history_compression_compact_instructions; } catch {} }
                 }
               } catch {}
 

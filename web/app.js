@@ -2688,6 +2688,9 @@ async function saveSkillsConfigUI(){
       }
     } catch {}
 
+    const token = getStoredApiToken();
+    const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
+
     const body = { agentId: aid, disabled };
     const r = await fetch('/api/skills', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
@@ -3396,52 +3399,41 @@ async function openSession(id){
   try { renderLiveInfoFor(id); } catch {}
   try {
     if (toolStreamEnabled){
-      try { ensureTransportReady().catch(()=>{}); } catch{}
+      try { ensureTransportReady().catch(()=>{}); } catch {}
     }
-  } catch{}
+  } catch {}
 }
 
 function renderMessages(msgs){
+  try{ if(!messages) return; } catch {}
   messages.innerHTML = '';
-  for (const m of (msgs||[])){
+  const arr = Array.isArray(msgs) ? msgs : [];
+  for (const m of arr){
     if (!m) continue;
     const role = (m && m.role) ? m.role : '';
     if (!__arcana_showToolMessages && (role === 'tool' || role === 'system')) continue;
     const rawText = (m && typeof m.text === 'string') ? m.text : '';
     if (role === 'assistant'){
-      const isHb = rawText.startsWith('[heartbeat]');
-      let body = rawText;
-      if (isHb){
-        const p1 = '[heartbeat]\n\n';
-        const p2 = '[heartbeat]\n';
-        if (body.startsWith(p1)) body = body.slice(p1.length);
-        else if (body.startsWith(p2)) body = body.slice(p2.length);
-      }
-      const extracted = extractMediaFromAssistantText(body);
+      const extracted = extractMediaFromAssistantText(rawText);
       const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
       const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
-      const displayText = isHb ? '💓 ' + cleanText : cleanText;
-      const bubble = appendMessage('assistant', displayText, m.ts || '');
-      if (isHb && bubble) bubble.classList.add('heartbeat-msg');
+      const bubble = appendMessage('assistant', cleanText, m.ts || '');
       if (bubble && mediaRefs.length){
         const parts = ensureBubbleParts(bubble) || {};
         const mediaEl = parts.media || bubble;
         let sidCurrent = '';
+        try { sidCurrent = getCurrentSessionId() || currentId || ''; } catch {}
+        const existingSrcs = new Set();
         try{
-          const sidFn = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId : null;
-          const sid = sidFn ? sidFn() : (currentId || '');
-          sidCurrent = String(sid || '');
-        } catch{}
-        for (const refRaw of mediaRefs){
-          const ref = String(refRaw || '').trim();
-          if (!ref) continue;
-          const lower = ref.toLowerCase();
-          let src = ref;
-          if (!(lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:'))){
-            const pathParam = encodeURIComponent(ref);
-            const sidParam = sidCurrent ? '&sessionId=' + encodeURIComponent(sidCurrent) : '';
-            src = '/api/local-file?path=' + pathParam + sidParam;
+          if (mediaEl.querySelectorAll){
+            const imgs = mediaEl.querySelectorAll('img');
+            for (const img of imgs){ if (img && img.src) existingSrcs.add(img.src); }
           }
+        } catch {}
+        for (const refRaw of mediaRefs){
+          const ref = String(refRaw || '').trim(); if (!ref) continue;
+          const src = mediaRefToImgSrc(ref, sidCurrent);
+          if (existingSrcs.has(src)) continue;
           const img = document.createElement('img');
           img.src = src;
           img.style.maxWidth = '100%';
@@ -3449,10 +3441,17 @@ function renderMessages(msgs){
           img.style.display = 'block';
           img.style.marginTop = '8px';
           mediaEl.appendChild(img);
+          try{ existingSrcs.add(img.src); } catch {}
         }
       }
-    } else {
-      appendMessage(role || 'user', rawText, m.ts || '');
+      continue;
+    }
+    if (role === 'user'){
+      appendMessage('user', rawText, m.ts || '');
+      continue;
+    }
+    if (rawText){
+      appendMessage(role || 'assistant', rawText, m.ts || '');
     }
   }
   messages.scrollTop = messages.scrollHeight;
@@ -3863,6 +3862,25 @@ function handleGatewayV2Envelope(payload){
         }
 
         messages.scrollTop = messages.scrollHeight;
+        return;
+      }
+      if (evType === 'wake_info'){
+        const d = ev.data || {};
+        const text = (typeof d.text === 'string' && d.text) ? d.text : '';
+        const sid = getCurrentSessionId() || currentId || '';
+        if (sid && text){
+          try { logMain(sid, "[wake] " + String(text)); } catch (e) {}
+          try {
+            upsertToolAction({
+              type: 'tool_execution_update',
+              toolName: 'wake-agent',
+              sessionId: sid,
+              partialResult: text,
+              toolCallId: 'wake:' + String(ev.tsMs || Date.now()),
+            });
+          } catch {}
+          try{ if (activeLogTab === 'tools'){ renderToolsPanel(sid); } } catch {}
+        }
         return;
       }
       if (evType === 'turn.error' || evType === 'scheduler.wake_error'){
@@ -4551,26 +4569,6 @@ function handleArcanaEvent(data){
           }
           if (targetId === currentId){ renderLiveInfoFor(targetId); }
         } catch {}
-        return;
-      }
-
-      if (data.type === 'heartbeat_message'){
-        // Heartbeat delivered a message to a session.
-        if (data.sessionId && data.sessionId !== currentId){
-          // Another session received a heartbeat — update unread/list.
-          try { requestRefreshList(); } catch {}
-          return;
-        }
-        // Current session received a heartbeat message — append with visual distinction.
-        const hbText = typeof data.text === 'string' ? data.text : '';
-        // Strip the '[heartbeat]\n\n' prefix for display; the label is shown via CSS class.
-        const displayText = hbText.replace(/^\[heartbeat\]\n\n?/, '');
-        if (displayText) {
-          const bubble = appendMessage('assistant', '💓 ' + displayText);
-          if (bubble) bubble.classList.add('heartbeat-msg');
-          messages.scrollTop = messages.scrollHeight;
-          try { if (currentId) markSessionSeen(currentId); } catch {}
-        }
         return;
       }
 

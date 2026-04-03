@@ -29,23 +29,12 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
       clearWake(key);
       try {
         if (engine && typeof engine.tick === 'function'){
-          const res = await engine.tick({
+          await engine.tick({
             agentId: entry.agentId,
             sessionKey: entry.sessionKey,
             reason: entry.reason,
             skipIfRunning: true,
           });
-          if (res && res.skipped && res.reason === 'requests-in-flight'){
-            try {
-              requestWake({
-                agentId: entry.agentId,
-                sessionKey: entry.sessionKey,
-                priority: entry.priority,
-                reason: 'requests-in-flight',
-                delayMs: 1000,
-              });
-            } catch {}
-          }
         }
       } catch (e) {
         try {
