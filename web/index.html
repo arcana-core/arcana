@@ -81,6 +81,7 @@
               <select id="cfg-provider-global">
                 <option value="">(auto)</option>
                 <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
                 <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
                 <option value="azure-openai-responses">Azure OpenAI Responses</option>
                 <option value="openai-codex">OpenAI Codex</option>
@@ -103,8 +104,8 @@
               </select>
               <div>Model</div>
               <input id="cfg-model-global" placeholder="model-id" />
-              <div>Base URL</div>
-              <input id="cfg-base-url-global" placeholder="可选，自定义网关" />
+              <div id="cfg-base-url-label-global" class="cfg-base-url-label">Base URL</div>
+              <input id="cfg-base-url-global" class="cfg-base-url-input" placeholder="Custom endpoint" />
               <div>API Key</div>
               <div style="display:flex;gap:8px;align-items:center;">
                 <input id="cfg-key-global" type="password" placeholder="仅用于更新，不会回显" />
@@ -131,6 +132,7 @@
               <select id="cfg-provider-agent">
                 <option value="">(inherit global)</option>
                 <option value="openai">OpenAI</option>
+                <option value="deepseek">DeepSeek</option>
                 <option value="openai-compatible">OpenAI 兼容接口 (OpenAI-compatible)</option>
                 <option value="azure-openai-responses">Azure OpenAI Responses</option>
                 <option value="openai-codex">OpenAI Codex</option>
@@ -153,8 +155,8 @@
               </select>
               <div>Model</div>
               <input id="cfg-model-agent" placeholder="留空则使用全局默认" />
-              <div>Base URL</div>
-              <input id="cfg-base-url-agent" placeholder="留空则使用全局默认" />
+              <div id="cfg-base-url-label-agent" class="cfg-base-url-label">Base URL</div>
+              <input id="cfg-base-url-agent" class="cfg-base-url-input" placeholder="Inherit global default" />
               <div>API Key</div>
               <div style="display:flex;gap:8px;align-items:center;">
                 <input id="cfg-key-agent" type="password" placeholder="仅用于更新，不会回显" />

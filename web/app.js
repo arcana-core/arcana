@@ -2271,6 +2271,7 @@ try{
 const HISTORY_COMPRESSION_DEFAULT_ENABLED = true;
 const HISTORY_COMPRESSION_DEFAULT_THRESHOLD = 100000;
 const HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS = 10;
+const BASE_URL_VISIBLE_PROVIDERS = new Set(['openai-compatible', 'generic', 'azure-openai-responses']);
 
 function getConfigInputValue(id){
   try{
@@ -2312,6 +2313,34 @@ function updateEffectiveConfigSummary(){
   }catch{}
 }
 
+function shouldShowBaseUrlForProvider(provider){
+  try{
+    const value = String(provider || '').trim().toLowerCase();
+    return BASE_URL_VISIBLE_PROVIDERS.has(value);
+  }catch{}
+  return false;
+}
+
+function setConfigBaseUrlVisibility(scope, visible){
+  try{
+    const suffix = (scope === 'agent') ? 'agent' : 'global';
+    const display = visible ? '' : 'none';
+    const label = qs('cfg-base-url-label-' + suffix);
+    const input = qs('cfg-base-url-' + suffix);
+    if (label) label.style.display = display;
+    if (input) input.style.display = display;
+  }catch{}
+}
+
+function updateConfigBaseUrlVisibility(){
+  try{
+    const globalProvider = getConfigInputValue('cfg-provider-global');
+    const agentProvider = getConfigInputValue('cfg-provider-agent');
+    setConfigBaseUrlVisibility('global', shouldShowBaseUrlForProvider(globalProvider));
+    setConfigBaseUrlVisibility('agent', shouldShowBaseUrlForProvider(agentProvider || globalProvider));
+  }catch{}
+}
+
 function updateConfigScopeUi(scope){
   try{
     const want = (scope === 'agent') ? 'agent' : 'global';
@@ -2339,6 +2368,7 @@ function updateConfigScopeUi(scope){
     agentOnly.forEach(btn=>{
       try{ btn.style.display = isAgent ? '' : 'none'; }catch{}
     });
+    updateConfigBaseUrlVisibility();
   }catch{}
 }
 
@@ -2531,6 +2561,7 @@ async function loadConfigUI(){
       const aKeepEl = qs('cfg-compress-keep-user-turns-agent'); if (aKeepEl) aKeepEl.value = String(globalCompressKeep);
       appendLog('[config] ' + tt('config.load.agentFailed'));
     }
+    try{ updateConfigBaseUrlVisibility(); }catch{}
     try{ updateEffectiveConfigSummary(); }catch{}
     // Best-effort: refresh live info model label immediately
     try { if (currentId) renderLiveInfoFor(currentId); } catch {}
@@ -2819,7 +2850,10 @@ try{
     try{
       const el = qs(id);
       if (!el || !el.addEventListener) return;
-      const handler = ()=>{ try{ updateEffectiveConfigSummary(); }catch{} };
+      const handler = ()=>{
+        try{ updateConfigBaseUrlVisibility(); }catch{}
+        try{ updateEffectiveConfigSummary(); }catch{}
+      };
       el.addEventListener('input', handler);
       el.addEventListener('change', handler);
     }catch{}
@@ -3564,11 +3598,7 @@ async function sendWithSession(){
       return;
     }
     if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = (j && j.text) || tt('chat.noResponse'); }
-    if (getCurrentSessionId() === sidAtSend || currentId === sidAtSend){
-      await openSession(sidAtSend);
-    } else {
     requestRefreshList();
-    }
   } catch(e) { if (activeAssistant) activeAssistant.textContent = tt('chat.errorPrefix') + (((e && e.message) || e)); }
   finally { messages.scrollTop = messages.scrollHeight; }
 }
@@ -3628,13 +3658,8 @@ async function sendWithGatewayV2(){
     try{
       const sidFromServer = j && j.sessionId ? String(j.sessionId) : '';
       if (sidFromServer){
-        // Keep current session in sync with the backing Gateway session.
-        if (!currentId || currentId !== sidFromServer){
-          setCurrent(sidFromServer);
-        }
-        // Reload messages from the server so the final assistant message
-        // matches persisted history (covers rare event-stream drops).
-        await openSession(sidFromServer);
+        // Intentionally avoid forced session switch/reload here to preserve input focus.
+        requestRefreshList();
       } else {
         // Fallback: if we did not get a sessionId, at least refresh the list.
         requestRefreshList();
@@ -4068,7 +4093,14 @@ function handleArcanaEvent(data){
       if (data.type === 'turn_start'){
         if (!data.sessionId) { return; }
         const targetId = data.sessionId || sid;
-        try { if (data.sessionId) { typing.set(data.sessionId, true); try { requestRefreshList(); } catch {} } } catch {}
+        try {
+          if (data.sessionId) {
+            typing.set(data.sessionId, true);
+            if (data.sessionId !== currentId){
+              try { requestRefreshList(); } catch {}
+            }
+          }
+        } catch {}
         let snap = null;
         try {
           snap = ensureLiveForSession(targetId);
@@ -4102,7 +4134,7 @@ function handleArcanaEvent(data){
       if (data.type === 'turn_end'){
         if (!data.sessionId) { return; }
         const targetId = data.sessionId || sid;
-        try { if (data.sessionId) { typing.delete(data.sessionId); try { requestRefreshList(); } catch {} } } catch {}
+        try { if (data.sessionId) { typing.delete(data.sessionId); } } catch {}
         try {
           const snap = ensureLiveForSession(targetId);
           if (snap){
