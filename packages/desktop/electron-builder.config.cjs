@@ -38,6 +38,7 @@ const config = {
     icon: 'build/icon.ico',
   },
   extraResources: [
+    { from: '../../.pi', to: '.pi' },
     { from: '../../server', to: 'server' },
     { from: '../../src', to: 'src' },
     { from: '../../web', to: 'web', filter: ['**/*', '!models/**'] },
