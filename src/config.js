@@ -44,11 +44,12 @@ export function applyProviderEnv(cfg) {
   if (!cfg) return;
   const provider = (cfg.provider || "openai").toLowerCase();
   const base = cfg.base_url?.trim();
+  const openaiCompatBase = base || (provider === "deepseek" ? "https://api.deepseek.com" : "");
 
-  if (provider === "openai" || provider === "openai-compatible") {
-    if (base) {
-      process.env.OPENAI_BASE_URL = base;      // common convention
-      process.env.OPENAI_API_BASE = base;      // alt convention
+  if (provider === "openai" || provider === "openai-compatible" || provider === "deepseek") {
+    if (openaiCompatBase) {
+      process.env.OPENAI_BASE_URL = openaiCompatBase;      // common convention
+      process.env.OPENAI_API_BASE = openaiCompatBase;      // alt convention
     } else {
       delete process.env.OPENAI_BASE_URL;
       delete process.env.OPENAI_API_BASE;
@@ -138,6 +139,7 @@ export function resolveModelFromConfig(cfg){
 export function inferProviderFromEnv(){
   const p = (process.env.ARCANA_PROVIDER||"").trim().toLowerCase();
   if (p) return p;
+  try { if (Object.prototype.hasOwnProperty.call(process.env, 'DEEPSEEK_API_KEY')) return 'deepseek'; } catch {}
   // Prefer explicit base URLs when present.
   if (process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE) return "openai";
   if (process.env.ANTHROPIC_BASE_URL) return "anthropic";

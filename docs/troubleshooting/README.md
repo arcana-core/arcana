@@ -10,10 +10,11 @@ Symptoms and fixes (reference codes from arcana doctor and support-bundle)
 
 - Unknown provider (CONFIG_PROVIDER_UNKNOWN)
   - Use a provider supported by @mariozechner/pi-ai (see its README Supported Providers section), for example openai, azure-openai-responses, anthropic, google, google-vertex, mistral, groq, cerebras, xai, openrouter, vercel-ai-gateway, minimax, amazon-bedrock, moonshot.
-  - Arcana also accepts `openai-compatible` for OpenAI-compatible APIs (e.g. Ollama, vLLM, LM Studio) and `generic` for fully custom gateways.
+  - Arcana also accepts `openai-compatible` and `deepseek` for OpenAI-compatible APIs, and `generic` for fully custom gateways.
 
 - Provider/base_url issues
   - baseUrl should point at the API root, not a full endpoint. Arcana automatically normalizes common suffixes like `/v1`, `/v1/messages`, `/messages`, `/chat/completions`, and `/responses` so the underlying SDK does not append them twice.
+  - For provider `deepseek`, Arcana uses the official API root `https://api.deepseek.com` by default when `base_url` is empty.
 
 - API key missing (ENV_API_KEY_MISSING)
 - Open the Secrets UI and bind providers/<provider>/api_key for your chosen provider（例如在 Secrets 区域为 providers/openai/api_key 保存 API Key，值会加密写入内部密码箱）。

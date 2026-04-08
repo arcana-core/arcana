@@ -4,6 +4,7 @@ export const WELL_KNOWN_SECRETS = [
   // Provider API keys
   { name: 'providers/openai/api_key', provider: 'openai', kind: 'api_key' },
   { name: 'providers/openai-compatible/api_key', provider: 'openai-compatible', kind: 'api_key' },
+  { name: 'providers/deepseek/api_key', provider: 'deepseek', kind: 'api_key' },
   { name: 'providers/azure-openai-responses/api_key', provider: 'azure-openai-responses', kind: 'api_key' },
   { name: 'providers/anthropic/api_key', provider: 'anthropic', kind: 'api_key' },
   { name: 'providers/google/api_key', provider: 'google', kind: 'api_key' },

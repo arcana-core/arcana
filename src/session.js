@@ -52,14 +52,30 @@ function pickFallbackModel(provider){
 		google: ['gemini-2.0-flash','gemini-2.0-flash-lite','gemini-1.5-flash','gemini-1.5-pro','gemini-2.5-flash-lite-preview-06-17','gemini-2.5-pro-preview-06-17'],
 		openai: ['gpt-4o-mini','chatgpt-4o-latest'],
 		'openai-compatible': ['gpt-4o-mini','chatgpt-4o-latest'],
+		deepseek: ['deepseek-chat','gpt-4o-mini','chatgpt-4o-latest'],
 		anthropic: ['claude-3-5-sonnet-20241022'],
 		openrouter: ['meta-llama/llama-3.1-8b-instruct:free'],
 		xai: ['grok-beta']
 	};
-	// Map "openai-compatible" to the underlying pi-ai provider id.
-	const providerForModels = p === 'openai-compatible' ? 'openai' : p;
+	// Map OpenAI-compatible aliases to the underlying pi-ai provider id.
+	const providerForModels = p === 'openai-compatible' || p === 'deepseek' ? 'openai' : p;
 	const arr = candidatesByProvider[p] || candidatesByProvider[providerForModels] || [];
 	for (const id of arr) { try { const m = getModel(providerForModels, id); if (m) return m; } catch {} }
+	if (p === 'deepseek'){
+		return {
+			id: 'deepseek-chat',
+			name: 'deepseek-chat',
+			provider: 'deepseek',
+			api: 'openai-completions',
+			baseUrl: 'https://api.deepseek.com',
+			reasoning: false,
+			input: ['text'],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200000,
+			maxTokens: 8192,
+			headers: {},
+		};
+	}
 	return null;
 }
 
@@ -372,7 +388,7 @@ export async function createArcanaSession(opts={}){
     if (!prov || !modelId) return null;
 
     const provNorm = prov.toLowerCase();
-    const providerForLookup = provNorm === 'openai-compatible' ? 'openai' : provNorm;
+    const providerForLookup = provNorm === 'openai-compatible' || provNorm === 'deepseek' ? 'openai' : provNorm;
 
     let baseTemplate = null;
     try {
@@ -391,6 +407,7 @@ export async function createArcanaSession(opts={}){
       if (s) s = s.replace(/\/+$/g, '');
       baseUrl = s;
     }
+    if (!baseUrl && provNorm === 'deepseek') baseUrl = 'https://api.deepseek.com';
 
     const baseHeaders = (baseTemplate && baseTemplate.headers && typeof baseTemplate.headers === 'object') ? baseTemplate.headers : {};
     const overrideHeaders = (src.headers && typeof src.headers === 'object') ? src.headers : {};
@@ -447,7 +464,7 @@ export async function createArcanaSession(opts={}){
       if (!model){
         try {
           const norm = normalizeInlineProviderId(selProvider);
-          const providerForLookup = norm === 'openai-compatible' ? 'openai' : (norm || selProvider);
+          const providerForLookup = norm === 'openai-compatible' || norm === 'deepseek' ? 'openai' : (norm || selProvider);
           model = getModel(providerForLookup, selId);
         } catch {}
       }
@@ -474,7 +491,7 @@ export async function createArcanaSession(opts={}){
         }
         // Pick a sensible API default for the generic template.
         const template = {};
-        if (provLower === 'openai' || provLower === 'openai-compatible' || provLower === 'openrouter' || provLower === 'groq' || provLower === 'cerebras' || provLower === 'zai' || provLower === 'mistral'){
+        if (provLower === 'openai' || provLower === 'openai-compatible' || provLower === 'deepseek' || provLower === 'openrouter' || provLower === 'groq' || provLower === 'cerebras' || provLower === 'zai' || provLower === 'mistral'){
           template.api = 'openai-completions';
         } else if (provLower === 'anthropic') {
           template.api = 'anthropic-messages';
@@ -524,7 +541,7 @@ export async function createArcanaSession(opts={}){
     const baseOverrideOpenAI = normalizeOpenAIBase(baseOverrideRaw || '');
     if (baseOverrideOpenAI && model && !inlineBaseUrlExplicit){
       const providerNorm = String(model.provider || '').trim().toLowerCase();
-      if (providerNorm === 'openai' || providerNorm === 'openai-compatible'){
+      if (providerNorm === 'openai' || providerNorm === 'openai-compatible' || providerNorm === 'deepseek'){
         model = { ...model, baseUrl: baseOverrideOpenAI };
       }
     }
@@ -633,7 +650,7 @@ export async function createArcanaSession(opts={}){
           if (modelsObj && id){
             const keysToTry = [];
             if (prov) keysToTry.push(`${prov}:${id}`, `${prov}/${id}`);
-            if (prov === 'openai-compatible') keysToTry.push(`openai:${id}`, `openai/${id}`);
+            if (prov === 'openai-compatible' || prov === 'deepseek') keysToTry.push(`openai:${id}`, `openai/${id}`);
             for (const k of keysToTry){
               const m = pickCaseInsensitive(modelsObj, k);
               if (m) merged = mergeHeadersCaseInsensitive(merged, m);
@@ -1085,11 +1102,14 @@ export async function createArcanaSession(opts={}){
 
 		const authStorage = created && created.session && created.session.modelRegistry && created.session.modelRegistry.authStorage;
 		if (key && authStorage && typeof authStorage.setRuntimeApiKey === 'function') {
-			// When cfg.provider is "openai-compatible" but the resolved model is backed
-			// by the "openai" provider in pi-ai, apply the key to both ids.
-			if (cfgProviderLower === 'openai-compatible' && modelProviderLower === 'openai') {
+			// When cfg.provider is an OpenAI-compatible alias but the resolved model
+			// is backed by the "openai" provider in pi-ai, apply the key to both ids.
+			if ((cfgProviderLower === 'openai-compatible' || cfgProviderLower === 'deepseek') && modelProviderLower === 'openai') {
 				authStorage.setRuntimeApiKey('openai', key);
-				authStorage.setRuntimeApiKey('openai-compatible', key);
+				authStorage.setRuntimeApiKey(cfgProviderLower, key);
+			} else if (cfgProviderLower === 'openai' && (modelProviderLower === 'openai-compatible' || modelProviderLower === 'deepseek')) {
+				authStorage.setRuntimeApiKey('openai', key);
+				authStorage.setRuntimeApiKey(modelProviderLower, key);
 			} else {
 				// Prefer applying to the resolved model provider. Also register under the
 				// configured provider id when they differ (harmless and improves compatibility).

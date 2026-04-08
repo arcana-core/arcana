@@ -26,13 +26,23 @@ function pickFallbackModel(provider){
     google: ['gemini-2.0-flash','gemini-2.0-flash-lite','gemini-1.5-flash','gemini-1.5-pro','gemini-2.5-flash-lite-preview-06-17','gemini-2.5-pro-preview-06-17'],
     openai: ['gpt-4o-mini','chatgpt-4o-latest'],
     'openai-compatible': ['gpt-4o-mini','chatgpt-4o-latest'],
+    deepseek: ['deepseek-chat','gpt-4o-mini','chatgpt-4o-latest'],
     anthropic: ['claude-3-5-sonnet-20241022'],
     openrouter: ['meta-llama/llama-3.1-8b-instruct:free'],
     xai: ['grok-beta']
   };
-  const providerForModels = p === 'openai-compatible' ? 'openai' : p;
+  const providerForModels = p === 'openai-compatible' || p === 'deepseek' ? 'openai' : p;
   const arr = candidatesByProvider[p] || candidatesByProvider[providerForModels] || [];
   for (const id of arr) { try { const m = getModel(providerForModels, id); if (m) return m; } catch {} }
+  if (p === 'deepseek'){
+    return {
+      id: 'deepseek-chat',
+      name: 'deepseek-chat',
+      provider: 'deepseek',
+      api: 'openai-completions',
+      baseUrl: 'https://api.deepseek.com',
+    };
+  }
   return null;
 }
 
@@ -67,7 +77,7 @@ export async function runDoctor({ cwd } = {}){
   }
   if (prov) {
     const pLower = prov.toLowerCase();
-    providerKnown = providerList.includes(pLower) || pLower === 'openai-compatible' || pLower === 'generic';
+    providerKnown = providerList.includes(pLower) || pLower === 'openai-compatible' || pLower === 'deepseek' || pLower === 'generic';
   }
   const modelsProvidersCount = (cfg && cfg.models && cfg.models.providers && typeof cfg.models.providers === 'object')
     ? Object.keys(cfg.models.providers).length
@@ -79,7 +89,7 @@ export async function runDoctor({ cwd } = {}){
     status: status(cfgOk && providerKnown, cfgOk && !providerKnown),
     code: cfgOk ? (providerKnown ? 'CONFIG_FOUND' : 'CONFIG_PROVIDER_UNKNOWN') : 'CONFIG_NOT_FOUND',
     details: cfgDetails,
-    next: cfgOk ? (providerKnown ? [] : ['Set a supported provider: one of the providers supported by @mariozechner/pi-ai (see its README), plus openai-compatible or generic for OpenAI-compatible/custom gateways.']) : ['Create arcana.config.json or set env ARCANA_MODEL/ARCANA_PROVIDER']
+    next: cfgOk ? (providerKnown ? [] : ['Set a supported provider: one of the providers supported by @mariozechner/pi-ai (see its README), plus openai-compatible, deepseek, or generic for OpenAI-compatible/custom gateways.']) : ['Create arcana.config.json or set env ARCANA_MODEL/ARCANA_PROVIDER']
   });
 
   // env & model resolution
@@ -89,7 +99,8 @@ export async function runDoctor({ cwd } = {}){
   const provider = (cfg?.provider || inferProviderFromEnv() || '').toLowerCase();
   if (modelSel) {
     try {
-      const providerForLookup = String(modelSel.provider || '').trim().toLowerCase() === 'openai-compatible' ? 'openai' : modelSel.provider;
+      const providerNorm = String(modelSel.provider || '').trim().toLowerCase();
+      const providerForLookup = providerNorm === 'openai-compatible' || providerNorm === 'deepseek' ? 'openai' : modelSel.provider;
       model = getModel(providerForLookup, modelSel.id);
     } catch {}
     if (!model) modelNext.push('Check model id or provider in config/env.');
@@ -103,7 +114,7 @@ export async function runDoctor({ cwd } = {}){
   try {
     const agentHomeRoot = resolveAgentHomeRoot();
     const { bindings } = await secrets.listNames(agentHomeRoot);
-    const providersNeedingKeys = ['openai','openai-compatible','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'];
+    const providersNeedingKeys = ['openai','openai-compatible','deepseek','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'];
     secretsFlags = {};
     for (const provId of providersNeedingKeys){
       const name = providerApiKeyName(provId);
@@ -115,7 +126,7 @@ export async function runDoctor({ cwd } = {}){
   } catch {
     secretsFlags = {};
   }
-  const providerRequiresKey = ['openai','openai-compatible','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'].includes(provider);
+  const providerRequiresKey = ['openai','openai-compatible','deepseek','azure-openai-responses','anthropic','google','google-vertex','mistral','groq','cerebras','xai','openrouter','vercel-ai-gateway','minimax','moonshot','generic'].includes(provider);
   const hasSecretForProvider = providerRequiresKey ? !!secretsFlags[provider] : false;
   const needKey = providerRequiresKey && !hasSecretForProvider && !cfg?.key;
   const envOk = !needKey;
