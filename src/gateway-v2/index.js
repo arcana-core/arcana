@@ -396,10 +396,24 @@ function sendJson(res, statusCode, body){
   res.end(json);
 }
 
+function isLoopbackBindHost(raw){
+  try {
+    const value = String(raw == null ? '' : raw).trim().toLowerCase();
+    if (!value) return false;
+    return value === 'localhost' || value === '127.0.0.1' || value === '::1' || value === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 export async function startGatewayV2({ port } = {}) {
   const desiredPort = typeof port === 'number' && Number.isFinite(port)
     ? port
     : (process.env.PORT ? Number(process.env.PORT) : 8787);
+  const bindHost = process.env.ARCANA_BIND_HOST && String(process.env.ARCANA_BIND_HOST).trim()
+    ? String(process.env.ARCANA_BIND_HOST).trim()
+    : '127.0.0.1';
+  const bypassTokenAuth = isLoopbackBindHost(bindHost);
 
   apiToken = loadOrCreateApiToken();
   try {
@@ -412,6 +426,9 @@ export async function startGatewayV2({ port } = {}) {
       console.log('[arcana:gateway-v2] API token ' + hint + ' (localStorage key: arcana.apiToken.v1)');
     }
   } catch {}
+  if (bypassTokenAuth){
+    console.warn('[arcana:gateway-v2] loopback bind host detected; API token auth bypass enabled for local requests');
+  }
 
   const wsHub = createWsHub({
     getInitialMessages: () => {
@@ -652,14 +669,14 @@ export async function startGatewayV2({ port } = {}) {
       const u = new URL(url, 'http://localhost');
 
       if (u.pathname.startsWith('/v2/')){
-        if (!isAuthorizedRequest(req, apiToken)){
+        if (!bypassTokenAuth && !isAuthorizedRequest(req, apiToken)){
           sendJson(res, 401, { ok: false, error: 'unauthorized' });
           return;
         }
       }
 
       if (u.pathname.startsWith('/api/')){
-        if (!isAuthorizedRequest(req, apiToken)){
+        if (!bypassTokenAuth && !isAuthorizedRequest(req, apiToken)){
           sendJson(res, 401, { ok: false, error: 'unauthorized' });
           return;
         }
@@ -2096,7 +2113,7 @@ export async function startGatewayV2({ port } = {}) {
         socket.destroy();
         return;
       }
-      if (!isAuthorizedRequest(req, apiToken)){
+      if (!bypassTokenAuth && !isAuthorizedRequest(req, apiToken)){
         try { socket.destroy(); } catch {}
         return;
       }
@@ -2107,10 +2124,6 @@ export async function startGatewayV2({ port } = {}) {
       try { socket.destroy(); } catch {}
     }
   });
-
-  const bindHost = process.env.ARCANA_BIND_HOST && String(process.env.ARCANA_BIND_HOST).trim()
-    ? String(process.env.ARCANA_BIND_HOST).trim()
-    : '127.0.0.1';
 
   await new Promise((resolve) => {
     server.listen(desiredPort, bindHost, () => resolve());
