@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "title": "Landing Page Controls",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "heroTitle": {
+        "type": "string",
+        "title": "Hero Title"
+      }
+    }
+  },
+  "bindings": [
+    {
+      "field": "heroTitle",
+      "selector": ".hero-title",
+      "op": "setText"
+    }
+  ]
+}

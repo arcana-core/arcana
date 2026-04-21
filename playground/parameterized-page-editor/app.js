@@ -1,4 +1,5 @@
 import { createEditorState } from './src/state.js';
+import { normalizeManifest } from './src/manifest.js';
 
 const state = createEditorState();
 
@@ -77,9 +78,13 @@ manifestInput.addEventListener('change', async () => {
   }
 
   try {
-    state.manifest = JSON.parse(manifestText);
-  } catch {
-    state.errors.push('Manifest file must contain valid JSON.');
+    state.manifest = normalizeManifest(JSON.parse(manifestText));
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      state.errors.push('Manifest file must contain valid JSON.');
+    } else {
+      state.errors.push(error instanceof Error ? error.message : 'Manifest file is invalid.');
+    }
   }
 
   syncControls();

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "title": "Broken",
+  "schema": {
+    "type": "object",
+    "properties": {}
+  },
+  "bindings": [
+    {
+      "field": "missing",
+      "selector": ".hero-title",
+      "op": "setText"
+    }
+  ]
+}
