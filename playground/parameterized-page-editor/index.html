@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parameterized Page Editor</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <p class="eyebrow">Standalone Prototype</p>
+        <h1>Parameterized Page Editor</h1>
+        <p class="subtitle">Load an HTML page and a JSON manifest, then prepare parameter changes before applying them to the preview.</p>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar" aria-label="Editor controls">
+          <section class="control-card">
+            <label class="field" for="html-file">
+              <span class="field-label">HTML file</span>
+              <input id="html-file" name="html-file" type="file" accept=".html,text/html">
+            </label>
+
+            <label class="field" for="manifest-file">
+              <span class="field-label">Manifest file</span>
+              <input id="manifest-file" name="manifest-file" type="file" accept=".json,application/json">
+            </label>
+
+            <div class="button-row">
+              <button id="apply-button" type="button" disabled>Apply</button>
+              <button id="reset-button" type="button" disabled>Reset</button>
+            </div>
+          </section>
+
+          <section class="panel-card" aria-labelledby="panel-heading">
+            <div class="panel-header">
+              <h2 id="panel-heading">Parameters</h2>
+              <p>Controls appear here after the manifest is loaded.</p>
+            </div>
+            <div id="panel-root" class="panel-root">Waiting for source files.</div>
+          </section>
+
+          <output id="status-output" class="status-output" for="html-file manifest-file" aria-live="polite">
+            Load an HTML file and a manifest file to enable preview actions.
+          </output>
+        </aside>
+
+        <section class="canvas-panel" aria-labelledby="canvas-heading">
+          <div class="canvas-header">
+            <p class="canvas-kicker">Preview Surface</p>
+            <h2 id="canvas-heading">Preview canvas</h2>
+          </div>
+          <iframe
+            id="preview-frame"
+            class="preview-frame"
+            title="Preview canvas"
+            srcdoc="<p class='preview-empty'>Preview not loaded yet.</p>"
+          ></iframe>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
