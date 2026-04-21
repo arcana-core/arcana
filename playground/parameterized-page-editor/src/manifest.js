@@ -26,7 +26,7 @@ export function collectSchemaFields(schema, prefix = '', output = []) {
 
     const fieldPath = prefix ? `${prefix}.${propertyName}` : propertyName;
 
-    if (property.type === 'object' && property.properties) {
+    if (property.properties) {
       collectSchemaFields(property, fieldPath, output);
       continue;
     }
@@ -89,9 +89,12 @@ export function normalizeManifest(rawManifest) {
     };
   });
 
-  const normalizedUi = manifest.ui === undefined
-    ? { order: fieldPaths, sections: [] }
-    : ensureObject(manifest.ui, 'Manifest ui');
+  const rawUi = manifest.ui === undefined ? {} : ensureObject(manifest.ui, 'Manifest ui');
+  const normalizedUi = {
+    ...rawUi,
+    order: Array.isArray(rawUi.order) ? rawUi.order : fieldPaths,
+    sections: Array.isArray(rawUi.sections) ? rawUi.sections : [],
+  };
 
   return {
     ...manifest,

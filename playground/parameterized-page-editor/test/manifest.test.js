@@ -22,6 +22,44 @@ test('normalizeManifest accepts a valid manifest and fills missing ui defaults',
   assert.equal(manifest.bindings[0].field, 'heroTitle');
 });
 
+test('normalizeManifest collects nested fields when nested properties omit explicit object type', () => {
+  const manifest = normalizeManifest({
+    schema: {
+      type: 'object',
+      properties: {
+        hero: {
+          properties: {
+            title: { type: 'string' }
+          }
+        }
+      }
+    },
+    bindings: [
+      { field: 'hero.title', selector: '.hero-title', op: 'setText' }
+    ]
+  });
+
+  assert.deepEqual(manifest.ui, { order: ['hero.title'], sections: [] });
+  assert.equal(manifest.bindings[0].field, 'hero.title');
+});
+
+test('normalizeManifest fills missing ui defaults when ui is partial', () => {
+  const manifest = normalizeManifest({
+    schema: {
+      type: 'object',
+      properties: {
+        heroTitle: { type: 'string' }
+      }
+    },
+    bindings: [
+      { field: 'heroTitle', selector: '.hero-title', op: 'setText' }
+    ],
+    ui: {}
+  });
+
+  assert.deepEqual(manifest.ui, { order: ['heroTitle'], sections: [] });
+});
+
 test('normalizeManifest rejects bindings that reference an unknown field', () => {
   assert.throws(
     () => normalizeManifest({
