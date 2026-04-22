@@ -16,6 +16,54 @@ const INSPECTOR_HTML = `
   </body>
 </html>
 `;
+const CURATED_MANIFEST = {
+  title: 'Curated Overlay',
+  schema: {
+    type: 'object',
+    properties: {
+      headline: {
+        type: 'string',
+        title: 'Hero Headline',
+      },
+      tone: {
+        type: 'string',
+        title: 'Tone',
+      },
+      accent: {
+        type: 'string',
+        title: 'Accent Color',
+      },
+    },
+  },
+  ui: {
+    order: ['tone', 'headline', 'accent'],
+  },
+  bindings: [
+    {
+      field: 'headline',
+      selector: '.hero-title',
+      op: 'setText',
+    },
+    {
+      field: 'headline',
+      selector: '.hero-title',
+      op: 'setAttribute',
+      target: 'aria-label',
+    },
+    {
+      field: 'tone',
+      selector: '.hero-title',
+      op: 'setAttribute',
+      target: 'data-tone',
+    },
+    {
+      field: 'accent',
+      selector: '.hero-title',
+      op: 'setStyle',
+      target: 'color',
+    },
+  ],
+};
 
 test.beforeAll(async () => {
   server = await createStaticServer(new URL('..', import.meta.url));
@@ -285,4 +333,78 @@ test('applies link href, image alt, and class name edits directly to the preview
   await page.locator('[data-field-key="classNames"]').fill('hero-shell shell-updated');
   await page.getByRole('button', { name: 'Apply' }).click();
   await expect(page.frameLocator('#preview-frame').locator('div.hero-shell')).toHaveAttribute('class', 'hero-shell shell-updated');
+});
+
+test('keeps html-only editing working when no manifest is loaded', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+
+  await expect(page.locator('#panel-root details[data-section-key="curated"]')).toHaveCount(0);
+  await page.locator('#panel-root details[data-section-key="content"][open] [data-field-key="text"]').fill('HTML Only');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  await expect(page.frameLocator('#preview-frame').locator('h1.hero-title')).toHaveText('HTML Only');
+});
+
+test('shows curated controls only for bound selections when a manifest is loaded', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+  await page.getByLabel('Manifest file (optional)').setInputFiles({
+    name: 'curated.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(CURATED_MANIFEST)),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+
+  const curatedSection = page.locator('#panel-root details[data-section-key="curated"]');
+  await expect(curatedSection).toBeVisible();
+  await expect(curatedSection).toContainText('Curated');
+  await expect(curatedSection.locator('[data-field-key="curated:tone"]')).toHaveValue('');
+  await expect(curatedSection.locator('[data-field-key="curated:headline"]')).toHaveValue('Arcana Editor');
+  await expect(curatedSection.locator('[data-field-key="curated:accent"]')).toHaveValue('');
+  await expect(curatedSection.locator('.inspector-term')).toHaveText(['Tone', 'Hero Headline', 'Accent Color']);
+
+  await page.frameLocator('#preview-frame').locator('div.hero-shell').click();
+  await expect(page.locator('#panel-root details[data-section-key="curated"]')).toHaveCount(0);
+});
+
+test('applies curated text, attribute, and style values to the selected preview element', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+  await page.getByLabel('Manifest file (optional)').setInputFiles({
+    name: 'curated.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(CURATED_MANIFEST)),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+
+  await page.locator('[data-field-key="curated:tone"]').fill('warm');
+  await page.locator('[data-field-key="curated:headline"]').fill('Curated Launch');
+  await page.locator('[data-field-key="curated:accent"]').fill('royalblue');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  const previewTitle = page.frameLocator('#preview-frame').locator('h1.hero-title');
+  await expect(previewTitle).toHaveText('Curated Launch');
+  await expect(previewTitle).toHaveAttribute('aria-label', 'Curated Launch');
+  await expect(previewTitle).toHaveAttribute('data-tone', 'warm');
+  await expect(previewTitle).toHaveCSS('color', 'rgb(65, 105, 225)');
 });

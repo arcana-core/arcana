@@ -37,6 +37,33 @@ export function collectSchemaFields(schema, prefix = '', output = []) {
   return output;
 }
 
+export function getSchemaProperty(schema, fieldPath) {
+  const normalizedSchema = ensureObject(schema, 'Manifest schema');
+  const pathSegments = String(fieldPath || '')
+    .split('.')
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  if (pathSegments.length === 0) {
+    return null;
+  }
+
+  let currentSchema = normalizedSchema;
+
+  for (const segment of pathSegments) {
+    const properties = ensureObject(currentSchema.properties, 'Manifest schema.properties');
+    const nextSchema = properties[segment];
+
+    if (!nextSchema || typeof nextSchema !== 'object' || Array.isArray(nextSchema)) {
+      return null;
+    }
+
+    currentSchema = nextSchema;
+  }
+
+  return currentSchema;
+}
+
 export function normalizeManifest(rawManifest) {
   const manifest = ensureObject(rawManifest, 'Manifest');
   const schema = ensureObject(manifest.schema, 'Manifest schema');

@@ -2,9 +2,14 @@ import { createEditorState } from './src/state.js';
 import { normalizeManifest } from './src/manifest.js';
 import { attachPreviewSelection, clearSelectedElement } from './src/selection.js';
 import { deriveInspectorModel, applyInspectorValues } from './src/default-inspector.js';
+import {
+  deriveCuratedInspectorModel,
+  applyCuratedInspectorValues,
+} from './src/curated-inspector.js';
 
 const state = createEditorState();
 const INSPECTOR_SECTIONS = [
+  { key: 'curated', title: 'Curated' },
   { key: 'content', title: 'Content' },
   { key: 'layout', title: 'Layout' },
   { key: 'style', title: 'Style' },
@@ -49,6 +54,8 @@ function clearSelectionState() {
   state.selectedPreviewElement = null;
   state.selectedElement = null;
   state.inspectorValues = {};
+  state.curatedInspector = { fields: [], values: {} };
+  state.curatedValues = {};
 }
 
 function refreshSelectedElementFromDom() {
@@ -62,11 +69,20 @@ function refreshSelectedElementFromDom() {
     previewFrame.contentWindow,
   );
   state.inspectorValues = { ...state.selectedElement.values };
+  state.curatedInspector = deriveCuratedInspectorModel(state.manifest, state.selectedPreviewElement);
+  state.curatedValues = { ...state.curatedInspector.values };
 }
 
 function handleInspectorValueInput(fieldKey, value) {
   state.inspectorValues = {
     ...state.inspectorValues,
+    [fieldKey]: value,
+  };
+}
+
+function handleCuratedValueInput(fieldKey, value) {
+  state.curatedValues = {
+    ...state.curatedValues,
     [fieldKey]: value,
   };
 }
@@ -79,7 +95,7 @@ function createReadOnlyValue(field) {
   );
 }
 
-function createEditableControl(field) {
+function createEditableControl(field, value, onChange) {
   let control;
 
   if (field.control === 'textarea') {
@@ -104,9 +120,9 @@ function createEditableControl(field) {
   }
 
   control.className = 'inspector-control';
-  control.dataset.fieldKey = field.key;
+  control.dataset.fieldKey = field.inputKey || field.key;
   control.setAttribute('aria-label', field.label);
-  control.value = state.inspectorValues[field.key] ?? '';
+  control.value = value ?? '';
 
   if (field.placeholder) {
     control.placeholder = field.placeholder;
@@ -114,19 +130,19 @@ function createEditableControl(field) {
 
   const eventName = field.control === 'select' ? 'change' : 'input';
   control.addEventListener(eventName, () => {
-    handleInspectorValueInput(field.key, control.value);
+    onChange(field.key, control.value);
   });
 
   return control;
 }
 
-function createInspectorRow(field) {
+function createInspectorRow(field, value, onChange) {
   const row = createElement('div', 'inspector-row');
   const term = createElement('dt', 'inspector-term', field.label);
   const content = createElement('dd', 'inspector-field');
 
   if (field.editable && field.key) {
-    content.append(createEditableControl(field));
+    content.append(createEditableControl(field, value, onChange));
 
     if (field.placeholder) {
       const hint = createElement('p', 'inspector-help', field.placeholder);
@@ -189,12 +205,32 @@ function renderPanel() {
     header.append(eyebrow, title, meta);
     panelRoot.append(header);
 
-    const sections = INSPECTOR_SECTIONS.map((section) => {
-      const rows = (state.selectedElement.sections[section.key] || [])
-        .map((field) => createInspectorRow(field));
+    const sections = [];
+    const curatedRows = state.curatedInspector.fields
+      .map((field) => createInspectorRow(
+        field,
+        state.curatedValues[field.key] ?? '',
+        handleCuratedValueInput,
+      ));
 
-      return createInspectorSection(section, rows);
-    });
+    if (curatedRows.length > 0) {
+      sections.push(createInspectorSection(INSPECTOR_SECTIONS[0], curatedRows));
+    }
+
+    sections.push(
+      ...INSPECTOR_SECTIONS
+        .slice(1)
+        .map((section) => {
+          const rows = (state.selectedElement.sections[section.key] || [])
+            .map((field) => createInspectorRow(
+              field,
+              state.inspectorValues[field.key] ?? '',
+              handleInspectorValueInput,
+            ));
+
+          return createInspectorSection(section, rows);
+        }),
+    );
 
     panelRoot.append(...sections);
     return;
@@ -310,6 +346,10 @@ manifestInput.addEventListener('change', async () => {
     }
   }
 
+  if (state.selectedPreviewElement) {
+    refreshSelectedElementFromDom();
+  }
+
   syncControls();
 });
 
@@ -318,13 +358,18 @@ applyButton.addEventListener('click', () => {
     return;
   }
 
-  const result = applyInspectorValues(state.selectedPreviewElement, state.inspectorValues);
-  state.errors = [...result.errors];
+  const defaultResult = applyInspectorValues(state.selectedPreviewElement, state.inspectorValues);
+  const curatedResult = applyCuratedInspectorValues(
+    state.selectedPreviewElement,
+    state.curatedValues,
+    state.curatedInspector.fields,
+  );
+  state.errors = [...defaultResult.errors, ...curatedResult.errors];
   refreshSelectedElementFromDom();
   renderPanel();
 
-  if (result.errors.length > 0) {
-    setStatus(result.errors[0]);
+  if (state.errors.length > 0) {
+    setStatus(state.errors[0]);
     return;
   }
 

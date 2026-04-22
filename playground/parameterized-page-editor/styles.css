@@ -230,6 +230,15 @@ button:disabled {
   overflow: hidden;
 }
 
+.inspector-section[data-section-key="curated"] {
+  border-color: rgba(178, 74, 47, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(178, 74, 47, 0.08);
+}
+
+.inspector-section[data-section-key="curated"] .inspector-summary {
+  background: linear-gradient(180deg, rgba(255, 236, 219, 0.96), rgba(247, 227, 205, 0.92));
+}
+
 .inspector-summary {
   cursor: pointer;
   list-style: none;

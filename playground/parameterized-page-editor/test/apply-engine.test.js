@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { deriveInspectorModel, applyInspectorValues } from '../src/default-inspector.js';
+import {
+  deriveCuratedInspectorModel,
+  applyCuratedInspectorValues,
+} from '../src/curated-inspector.js';
 
 function createElementStub({
   tagName,
@@ -40,6 +44,23 @@ function createElementStub({
     },
     getAttribute(name) {
       return attributeMap.has(name) ? attributeMap.get(name) : null;
+    },
+    matches(selector) {
+      const normalized = String(selector || '').trim();
+
+      if (!normalized) {
+        return false;
+      }
+
+      if (normalized.startsWith('.')) {
+        return element.classList.includes(normalized.slice(1));
+      }
+
+      if (normalized.startsWith('#')) {
+        return element.id === normalized.slice(1);
+      }
+
+      return normalized.toLowerCase() === element.tagName.toLowerCase();
     },
     setAttribute(name, value) {
       const normalized = String(value);
@@ -298,4 +319,116 @@ test('applyInspectorValues validates and clears image dimensions explicitly', ()
   assert.equal(element.getAttribute('height'), '360');
   assert.equal(element.getAttribute('class'), null);
   assert.equal(element.getAttribute('style'), null);
+});
+
+test('deriveCuratedInspectorModel only returns matching supported fields ordered by manifest ui.order', () => {
+  const element = createElementStub({
+    tagName: 'h1',
+    textContent: 'Arcana Editor',
+    className: 'hero-title',
+    attributes: [
+      { name: 'class', value: 'hero-title' },
+      { name: 'data-tone', value: 'warm' },
+      { name: 'style', value: 'color: tomato' },
+    ],
+  });
+  const manifest = {
+    schema: {
+      type: 'object',
+      properties: {
+        headline: { type: 'string', title: 'Headline' },
+        tone: { type: 'string', title: 'Tone' },
+        accent: { type: 'string', title: 'Accent' },
+        hidden: { type: 'string', title: 'Hidden' },
+      },
+    },
+    ui: {
+      order: ['tone', 'headline', 'accent', 'hidden'],
+    },
+    bindings: [
+      { field: 'headline', selector: '.hero-title', op: 'setText', target: null, options: {} },
+      { field: 'headline', selector: '.hero-title', op: 'setAttribute', target: 'aria-label', options: {} },
+      { field: 'tone', selector: '.hero-title', op: 'setAttribute', target: 'data-tone', options: {} },
+      { field: 'accent', selector: '.hero-title', op: 'setStyle', target: 'color', options: {} },
+      { field: 'hidden', selector: '.other-node', op: 'setText', target: null, options: {} },
+      { field: 'headline', selector: '.hero-title', op: 'setHtml', target: null, options: {} },
+    ],
+  };
+
+  const model = deriveCuratedInspectorModel(manifest, element);
+
+  assert.deepEqual(model.fields.map((field) => field.key), ['tone', 'headline', 'accent']);
+  assert.deepEqual(model.fields.map((field) => field.label), ['Tone', 'Headline', 'Accent']);
+  assert.equal(model.values.tone, 'warm');
+  assert.equal(model.values.headline, 'Arcana Editor');
+  assert.equal(model.values.accent, 'tomato');
+  assert.equal(model.fields[1].bindings.length, 2);
+  assert.deepEqual(model.fields[1].bindings.map((binding) => binding.op), ['setText', 'setAttribute']);
+});
+
+test('applyCuratedInspectorValues writes matching text, attribute, style, and image bindings only to the selected element', () => {
+  const titleElement = createElementStub({
+    tagName: 'h1',
+    textContent: 'Arcana Editor',
+    className: 'hero-title',
+    attributes: [
+      { name: 'class', value: 'hero-title' },
+      { name: 'data-tone', value: 'warm' },
+      { name: 'style', value: 'color: tomato' },
+      { name: 'aria-label', value: 'Arcana Editor' },
+    ],
+  });
+  const imageElement = createElementStub({
+    tagName: 'img',
+    className: 'hero-image',
+    attributes: [
+      { name: 'class', value: 'hero-image' },
+      { name: 'src', value: '/hero.png' },
+    ],
+  });
+  const manifest = {
+    schema: {
+      type: 'object',
+      properties: {
+        headline: { type: 'string', title: 'Headline' },
+        tone: { type: 'string', title: 'Tone' },
+        accent: { type: 'string', title: 'Accent' },
+        image: { type: 'string', title: 'Hero Image' },
+      },
+    },
+    ui: {
+      order: ['headline', 'tone', 'accent', 'image'],
+    },
+    bindings: [
+      { field: 'headline', selector: '.hero-title', op: 'setText', target: null, options: {} },
+      { field: 'headline', selector: '.hero-title', op: 'setAttribute', target: 'aria-label', options: {} },
+      { field: 'tone', selector: '.hero-title', op: 'setAttribute', target: 'data-tone', options: {} },
+      { field: 'accent', selector: '.hero-title', op: 'setStyle', target: 'color', options: {} },
+      { field: 'image', selector: '.hero-image', op: 'setImageSrc', target: null, options: {} },
+      { field: 'headline', selector: '.other-node', op: 'setText', target: null, options: {} },
+    ],
+  };
+
+  const titleModel = deriveCuratedInspectorModel(manifest, titleElement);
+  const titleResult = applyCuratedInspectorValues(titleElement, {
+    headline: 'Arcana Launch',
+    tone: 'cool',
+    accent: 'royalblue',
+    image: '/ignored.png',
+  }, titleModel.fields);
+
+  assert.deepEqual(titleResult.errors, []);
+  assert.equal(titleElement.textContent, 'Arcana Launch');
+  assert.equal(titleElement.getAttribute('aria-label'), 'Arcana Launch');
+  assert.equal(titleElement.getAttribute('data-tone'), 'cool');
+  assert.equal(titleElement.style.getPropertyValue('color'), 'royalblue');
+  assert.equal(imageElement.getAttribute('src'), '/hero.png');
+
+  const imageModel = deriveCuratedInspectorModel(manifest, imageElement);
+  applyCuratedInspectorValues(imageElement, {
+    image: '/updated.png',
+    headline: 'Ignored on image selection',
+  }, imageModel.fields);
+
+  assert.equal(imageElement.getAttribute('src'), '/updated.png');
 });
