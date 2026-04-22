@@ -24,6 +24,33 @@ const TEXT_LIKE_TAGS = new Set([
 ]);
 const DISPLAY_OPTIONS = ['', 'block', 'inline', 'inline-block', 'flex', 'grid', 'none'];
 const VISIBILITY_OPTIONS = ['', 'visible', 'hidden', 'collapse'];
+const COMMON_ATTRIBUTE_NAMES = new Set([
+  'class',
+  'style',
+  'href',
+  'target',
+  'src',
+  'alt',
+  'width',
+  'height',
+]);
+const SAFE_ATTRIBUTE_FIELDS = [
+  { name: 'id', label: 'Id' },
+  { name: 'title', label: 'Title' },
+  { name: 'role', label: 'Role' },
+];
+const SAFE_ATTRIBUTE_NAMES = new Set(SAFE_ATTRIBUTE_FIELDS.map((field) => field.name));
+const ADVANCED_STYLE_FIELDS = [
+  { name: 'margin', label: 'Margin' },
+  { name: 'padding', label: 'Padding' },
+  { name: 'border', label: 'Border' },
+  { name: 'border-radius', label: 'Border radius' },
+  { name: 'opacity', label: 'Opacity' },
+  { name: 'font-size', label: 'Font size' },
+  { name: 'line-height', label: 'Line height' },
+  { name: 'letter-spacing', label: 'Letter spacing' },
+];
+const ADVANCED_STYLE_NAMES = new Set(ADVANCED_STYLE_FIELDS.map((field) => field.name));
 
 function createField({
   key = '',
@@ -174,6 +201,10 @@ function createEditableTextField(key, label, value, placeholder, control = 'text
   });
 }
 
+function isEditableRawAttribute(name) {
+  return SAFE_ATTRIBUTE_NAMES.has(name) || name.startsWith('aria-') || name.startsWith('data-');
+}
+
 function deriveContentFields(element, tagName) {
   if (isLinkElement(tagName)) {
     const text = getTextContent(element);
@@ -298,25 +329,49 @@ function deriveStyleFields(element, tagName, inlineStyle) {
 }
 
 function deriveAttributeFields(attributes) {
-  if (attributes.length === 0) {
-    return [createField({ label: 'Attributes', value: 'No raw attributes captured.', muted: true })];
-  }
+  const attributeMap = new Map(attributes.map((attribute) => [attribute.name, attribute.value]));
+  const additionalAttributeNames = attributes
+    .map((attribute) => attribute.name)
+    .filter((name) => (
+      !SAFE_ATTRIBUTE_NAMES.has(name)
+      && !COMMON_ATTRIBUTE_NAMES.has(name)
+      && isEditableRawAttribute(name)
+    ));
+  const orderedAttributeNames = [
+    ...SAFE_ATTRIBUTE_FIELDS.map((field) => field.name),
+    ...additionalAttributeNames,
+  ];
 
-  return attributes.map((attribute) => createField({
-    label: attribute.name,
-    value: attribute.value || '(empty)',
-  }));
+  return orderedAttributeNames.map((name) => {
+    const label = SAFE_ATTRIBUTE_FIELDS.find((field) => field.name === name)?.label || name;
+    const value = attributeMap.get(name) || '';
+
+    return createField({
+      key: `attr:${name}`,
+      label,
+      value,
+      muted: !value,
+      editable: true,
+      placeholder: `${label} is not set.`,
+    });
+  });
 }
 
-function deriveAdvancedFields(element) {
-  return [
-    createField({ label: 'Selector target', value: describeElement(element) }),
-    createField({
-      label: 'Style controls',
-      value: 'Expanded style editing will be added in a later task.',
-      muted: true,
-    }),
-  ];
+function deriveAdvancedFields(element, inlineStyle) {
+  void element;
+
+  return ADVANCED_STYLE_FIELDS.map((field) => {
+    const value = inlineStyle.get(field.name) || '';
+
+    return createField({
+      key: `style:${field.name}`,
+      label: field.label,
+      value,
+      muted: !value,
+      editable: true,
+      placeholder: `${field.label} inline style is not set.`,
+    });
+  });
 }
 
 function setAttributeValue(element, name, value) {
@@ -421,7 +476,7 @@ export function deriveInspectorModel(element, view = element?.ownerDocument?.def
     layout: deriveLayoutFields(element, tagName, inlineStyle),
     style: deriveStyleFields(element, tagName, inlineStyle),
     attributes: deriveAttributeFields(attributes),
-    advanced: deriveAdvancedFields(element),
+    advanced: deriveAdvancedFields(element, inlineStyle),
   };
 
   return {
@@ -484,6 +539,30 @@ export function applyInspectorValues(element, values) {
   if (typeof values.height === 'string' && isImageElement(tagName)) {
     setDimensionValue(element, 'height', values.height, errors, 'Height');
   }
+
+  Object.entries(values).forEach(([key, value]) => {
+    if (typeof value !== 'string') {
+      return;
+    }
+
+    if (key.startsWith('attr:')) {
+      const attributeName = key.slice(5);
+
+      if (attributeName !== INTERNAL_SELECTION_ATTRIBUTE && !COMMON_ATTRIBUTE_NAMES.has(attributeName) && isEditableRawAttribute(attributeName)) {
+        setAttributeValue(element, attributeName, value);
+      }
+
+      return;
+    }
+
+    if (key.startsWith('style:')) {
+      const styleName = key.slice(6);
+
+      if (ADVANCED_STYLE_NAMES.has(styleName)) {
+        setStyleValue(element, styleName, value);
+      }
+    }
+  });
 
   return { errors };
 }

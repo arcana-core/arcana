@@ -335,6 +335,47 @@ test('applies link href, image alt, and class name edits directly to the preview
   await expect(page.frameLocator('#preview-frame').locator('div.hero-shell')).toHaveAttribute('class', 'hero-shell shell-updated');
 });
 
+test('expands advanced editing, applies advanced and attribute fields, and reset reloads live dom values', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+
+  const attributesSection = page.locator('#panel-root details[data-section-key="attributes"]');
+  const advancedSection = page.locator('#panel-root details[data-section-key="advanced"]');
+  const previewTitle = page.frameLocator('#preview-frame').locator('h1.hero-title');
+
+  await expect(attributesSection).not.toHaveAttribute('open', '');
+  await expect(advancedSection).not.toHaveAttribute('open', '');
+
+  await attributesSection.locator('summary').click();
+  await advancedSection.locator('summary').click();
+
+  await expect(attributesSection).toHaveAttribute('open', '');
+  await expect(advancedSection).toHaveAttribute('open', '');
+
+  await attributesSection.locator('[data-field-key="attr:title"]').fill('Launch title');
+  await advancedSection.locator('[data-field-key="style:font-size"]').fill('3rem');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  await expect(previewTitle).toHaveAttribute('title', 'Launch title');
+  await expect(previewTitle).toHaveCSS('font-size', '48px');
+  await expect(attributesSection.locator('[data-field-key="attr:title"]')).toHaveValue('Launch title');
+  await expect(advancedSection.locator('[data-field-key="style:font-size"]')).toHaveValue('3rem');
+
+  await attributesSection.locator('[data-field-key="attr:title"]').fill('Unsaved title');
+  await advancedSection.locator('[data-field-key="style:font-size"]').fill('1.5rem');
+  await page.getByRole('button', { name: 'Reset' }).click();
+
+  await expect(attributesSection.locator('[data-field-key="attr:title"]')).toHaveValue('Launch title');
+  await expect(advancedSection.locator('[data-field-key="style:font-size"]')).toHaveValue('3rem');
+});
+
 test('keeps html-only editing working when no manifest is loaded', async ({ page }) => {
   await page.goto(server.url + '/index.html');
 

@@ -173,24 +173,49 @@ test('deriveInspectorModel derives common fields for text-like elements', () => 
     tagName: 'h1',
     textContent: 'Arcana Editor',
     className: 'hero-title',
+    id: 'headline',
     attributes: [
+      { name: 'id', value: 'headline' },
       { name: 'class', value: 'hero-title' },
+      { name: 'title', value: 'Hero headline' },
+      { name: 'aria-label', value: 'Arcana Editor' },
+      { name: 'data-tone', value: 'warm' },
       { name: 'style', value: 'color: rgb(20, 30, 40);' },
     ],
   });
   const model = deriveInspectorModel(element, createViewStub({}));
 
-  assert.equal(model.label, 'h1.hero-title');
+  assert.equal(model.label, 'h1#headline.hero-title');
   assert.deepEqual(sectionLabels(model, 'content'), ['Text']);
   assert.deepEqual(sectionLabels(model, 'layout'), ['Display', 'Visibility', 'Spacing']);
   assert.deepEqual(sectionLabels(model, 'style'), ['Text color', 'Background', 'Inline style', 'Class names']);
   assert.equal(model.sections.style[0].value, 'rgb(20, 30, 40)');
-  assert.equal(model.sections.attributes[0].label, 'class');
+  assert.equal(model.sections.attributes[0].label, 'Id');
   assert.equal(model.sections.content[0].editable, true);
   assert.equal(model.sections.style[0].editable, true);
   assert.equal(model.sections.style[1].editable, true);
   assert.equal(model.sections.style[2].editable, false);
   assert.equal(model.sections.style[3].editable, true);
+  assert.deepEqual(
+    model.sections.attributes.map((field) => ({
+      key: field.key,
+      label: field.label,
+      editable: field.editable,
+      value: field.value,
+    })),
+    [
+      { key: 'attr:id', label: 'Id', editable: true, value: 'headline' },
+      { key: 'attr:title', label: 'Title', editable: true, value: 'Hero headline' },
+      { key: 'attr:role', label: 'Role', editable: true, value: '' },
+      { key: 'attr:aria-label', label: 'aria-label', editable: true, value: 'Arcana Editor' },
+      { key: 'attr:data-tone', label: 'data-tone', editable: true, value: 'warm' },
+    ],
+  );
+  assert.deepEqual(
+    model.sections.advanced.map((field) => field.label),
+    ['Margin', 'Padding', 'Border', 'Border radius', 'Opacity', 'Font size', 'Line height', 'Letter spacing'],
+  );
+  assert.equal(model.sections.advanced[0].editable, true);
 });
 
 test('deriveInspectorModel derives link fields', () => {
@@ -209,7 +234,10 @@ test('deriveInspectorModel derives link fields', () => {
   assert.deepEqual(sectionLabels(model, 'content'), ['Text', 'Href', 'Target']);
   assert.equal(model.sections.content[1].value, '/pricing');
   assert.equal(model.sections.content[2].value, '_blank');
-  assert.equal(model.sections.attributes[1].label, 'href');
+  assert.deepEqual(
+    model.sections.attributes.map((field) => field.key),
+    ['attr:id', 'attr:title', 'attr:role'],
+  );
 });
 
 test('deriveInspectorModel derives image fields', () => {
@@ -251,7 +279,53 @@ test('deriveInspectorModel derives generic container fields without invented con
   assert.equal(model.sections.content[0].muted, true);
   assert.deepEqual(sectionLabels(model, 'layout'), ['Display', 'Visibility', 'Spacing']);
   assert.deepEqual(sectionLabels(model, 'style'), ['Background', 'Inline style', 'Class names']);
-  assert.equal(model.sections.attributes[0].label, 'id');
+  assert.equal(model.sections.attributes[0].label, 'Id');
+});
+
+test('deriveInspectorModel excludes internal and common attributes while exposing safe editable attribute and advanced style fields', () => {
+  const element = createElementStub({
+    tagName: 'a',
+    textContent: 'Open docs',
+    className: 'hero-link',
+    id: 'docs-link',
+    attributes: [
+      { name: 'id', value: 'docs-link' },
+      { name: 'class', value: 'hero-link' },
+      { name: 'href', value: '/docs' },
+      { name: 'target', value: '_blank' },
+      { name: 'title', value: 'Read the docs' },
+      { name: 'role', value: 'button' },
+      { name: 'aria-label', value: 'Open documentation' },
+      { name: 'data-variant', value: 'primary' },
+      { name: 'data-arcana-selected-element', value: 'true' },
+      {
+        name: 'style',
+        value: 'margin: 12px; padding: 8px; border-radius: 24px; font-size: 2rem; line-height: 1.2',
+      },
+    ],
+  });
+  const model = deriveInspectorModel(element, createViewStub({}));
+
+  assert.deepEqual(
+    model.sections.attributes.map((field) => field.key),
+    ['attr:id', 'attr:title', 'attr:role', 'attr:aria-label', 'attr:data-variant'],
+  );
+  assert.equal(model.sections.attributes.some((field) => field.label === 'href'), false);
+  assert.equal(model.sections.attributes.some((field) => field.label === 'class'), false);
+  assert.equal(model.sections.attributes.some((field) => field.label === 'data-arcana-selected-element'), false);
+  assert.deepEqual(
+    model.sections.advanced.map((field) => [field.key, field.value]),
+    [
+      ['style:margin', '12px'],
+      ['style:padding', '8px'],
+      ['style:border', ''],
+      ['style:border-radius', '24px'],
+      ['style:opacity', ''],
+      ['style:font-size', '2rem'],
+      ['style:line-height', '1.2'],
+      ['style:letter-spacing', ''],
+    ],
+  );
 });
 
 test('applyInspectorValues writes editable fields and removes cleared attributes/styles', () => {
@@ -319,6 +393,56 @@ test('applyInspectorValues validates and clears image dimensions explicitly', ()
   assert.equal(element.getAttribute('height'), '360');
   assert.equal(element.getAttribute('class'), null);
   assert.equal(element.getAttribute('style'), null);
+});
+
+test('applyInspectorValues applies editable attribute and advanced style fields conservatively', () => {
+  const element = createElementStub({
+    tagName: 'div',
+    className: 'hero-shell',
+    id: 'shell',
+    attributes: [
+      { name: 'id', value: 'shell' },
+      { name: 'class', value: 'hero-shell' },
+      { name: 'title', value: 'Hero shell' },
+      { name: 'role', value: 'region' },
+      { name: 'aria-label', value: 'Shell' },
+      { name: 'data-tone', value: 'warm' },
+      {
+        name: 'style',
+        value: 'margin: 12px; padding: 8px; border-radius: 24px; opacity: 0.8; font-size: 1.25rem',
+      },
+    ],
+  });
+
+  applyInspectorValues(element, {
+    'attr:id': 'shell-updated',
+    'attr:title': '',
+    'attr:role': 'presentation',
+    'attr:aria-label': 'Updated shell',
+    'attr:data-tone': '',
+    'style:margin': '24px 12px',
+    'style:padding': '',
+    'style:border': '1px solid tomato',
+    'style:border-radius': '',
+    'style:opacity': '0.95',
+    'style:font-size': '2rem',
+    'style:line-height': '1.4',
+    'style:letter-spacing': '0.08em',
+  });
+
+  assert.equal(element.getAttribute('id'), 'shell-updated');
+  assert.equal(element.getAttribute('title'), null);
+  assert.equal(element.getAttribute('role'), 'presentation');
+  assert.equal(element.getAttribute('aria-label'), 'Updated shell');
+  assert.equal(element.getAttribute('data-tone'), null);
+  assert.equal(element.style.getPropertyValue('margin'), '24px 12px');
+  assert.equal(element.style.getPropertyValue('padding'), '');
+  assert.equal(element.style.getPropertyValue('border'), '1px solid tomato');
+  assert.equal(element.style.getPropertyValue('border-radius'), '');
+  assert.equal(element.style.getPropertyValue('opacity'), '0.95');
+  assert.equal(element.style.getPropertyValue('font-size'), '2rem');
+  assert.equal(element.style.getPropertyValue('line-height'), '1.4');
+  assert.equal(element.style.getPropertyValue('letter-spacing'), '0.08em');
 });
 
 test('deriveCuratedInspectorModel only returns matching supported fields ordered by manifest ui.order', () => {
