@@ -4,9 +4,9 @@ export function createEditorState() {
   return {
     htmlText: '',
     manifest: null,
-    values: {},
-    lastAppliedValues: {},
+    selectedPreviewElement: null,
     selectedElement: null,
+    inspectorValues: {},
     selectedInspectorSections: [...DEFAULT_OPEN_INSPECTOR_SECTIONS],
     errors: [],
   };

@@ -296,6 +296,38 @@ button:disabled {
   color: var(--muted);
 }
 
+.inspector-field {
+  margin: 0;
+}
+
+.inspector-control {
+  width: 100%;
+  padding: 0.72rem 0.82rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 253, 248, 0.96);
+  color: var(--ink);
+  font: inherit;
+}
+
+.inspector-control:focus {
+  outline: 2px solid rgba(178, 74, 47, 0.28);
+  outline-offset: 1px;
+  border-color: var(--highlight);
+}
+
+textarea.inspector-control {
+  min-height: 5.4rem;
+  resize: vertical;
+}
+
+.inspector-help {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.35;
+}
+
 .status-output {
   display: block;
   margin-top: 1rem;

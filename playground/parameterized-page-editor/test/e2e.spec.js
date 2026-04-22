@@ -31,12 +31,14 @@ test('renders the standalone editor shell', async ({ page }) => {
   const htmlFileInput = page.getByLabel('HTML file');
   const manifestFileInput = page.getByLabel('Manifest file (optional)');
   const applyButton = page.getByRole('button', { name: 'Apply' });
+  const resetButton = page.getByRole('button', { name: 'Reset' });
 
   await expect(page.getByRole('heading', { name: 'Parameterized Page Editor' })).toBeVisible();
   await expect(htmlFileInput).toBeVisible();
   await expect(manifestFileInput).toBeVisible();
   await expect(page.getByTitle('Preview canvas')).toBeVisible();
   await expect(applyButton).toBeDisabled();
+  await expect(resetButton).toBeDisabled();
   await expect(page.locator('#preview-frame')).toHaveAttribute('sandbox', 'allow-same-origin');
 
   await htmlFileInput.setInputFiles({
@@ -44,6 +46,10 @@ test('renders the standalone editor shell', async ({ page }) => {
     mimeType: 'text/html',
     buffer: Buffer.from('<!doctype html><html lang="en"><body><h2>Loaded Preview</h2></body></html>'),
   });
+
+  await expect(applyButton).toBeDisabled();
+  await expect(resetButton).toBeDisabled();
+  await expect(page.locator('#status-output')).toContainText('HTML loaded. Click a preview element to inspect it and edit its common properties.');
 
   await manifestFileInput.setInputFiles({
     name: 'sample.json',
@@ -68,8 +74,9 @@ test('renders the standalone editor shell', async ({ page }) => {
     })),
   });
 
-  await expect(applyButton).toBeEnabled();
-  await expect(page.locator('#status-output')).toContainText('HTML and manifest loaded. Apply is ready.');
+  await expect(applyButton).toBeDisabled();
+  await expect(resetButton).toBeDisabled();
+  await expect(page.locator('#status-output')).toContainText('Manifest loaded. Click a preview element to edit it.');
 });
 
 test('selects an element and shows inspector sections', async ({ page }) => {
@@ -98,15 +105,15 @@ test('selects an element and shows inspector sections', async ({ page }) => {
   await expect(page.locator('#panel-root')).toContainText('Advanced');
   await expect(page.locator('#panel-root details[open] summary')).toHaveText(['Content', 'Layout', 'Style']);
   await expect(page.locator('#panel-root summary')).toHaveCount(5);
-  await expect(contentSection).toContainText('Text');
-  await expect(contentSection).toContainText('Arcana Editor');
-  await expect(layoutSection).toContainText('Display');
-  await expect(layoutSection).toContainText('Visibility');
+  await expect(page.getByRole('button', { name: 'Apply' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Reset' })).toBeEnabled();
+  await expect(contentSection.locator('[data-field-key="text"]')).toHaveValue('Arcana Editor');
+  await expect(layoutSection.locator('[data-field-key="display"]')).toHaveValue('');
+  await expect(layoutSection.locator('[data-field-key="visibility"]')).toHaveValue('');
   await expect(layoutSection).toContainText('Spacing');
-  await expect(styleSection).toContainText('Text color');
-  await expect(styleSection).toContainText('Background');
-  await expect(styleSection).toContainText('Class names');
-  await expect(styleSection).toContainText('hero-title');
+  await expect(styleSection.locator('[data-field-key="textColor"]')).toHaveValue('');
+  await expect(styleSection.locator('[data-field-key="background"]')).toHaveValue('');
+  await expect(styleSection.locator('[data-field-key="classNames"]')).toHaveValue('hero-title');
   await expect(page.locator('#panel-root')).toContainText('class');
   await expect(page.locator('#panel-root')).not.toContainText('data-arcana-selected-element');
 });
@@ -126,14 +133,10 @@ test('derives link fields', async ({ page }) => {
 
   await expect(page.locator('#status-output')).toContainText('Selected: a.hero-link');
   await expect(page.locator('#panel-root')).toContainText('Tag: a · 3 captured attributes');
-  await expect(contentSection).toContainText('Text');
-  await expect(contentSection).toContainText('See pricing');
-  await expect(contentSection).toContainText('Href');
-  await expect(contentSection).toContainText('/pricing');
-  await expect(contentSection).toContainText('Target');
-  await expect(contentSection).toContainText('_blank');
-  await expect(styleSection).toContainText('Class names');
-  await expect(styleSection).toContainText('hero-link');
+  await expect(contentSection.locator('[data-field-key="text"]')).toHaveValue('See pricing');
+  await expect(contentSection.locator('[data-field-key="href"]')).toHaveValue('/pricing');
+  await expect(contentSection.locator('[data-field-key="target"]')).toHaveValue('_blank');
+  await expect(styleSection.locator('[data-field-key="classNames"]')).toHaveValue('hero-link');
 });
 
 test('derives image fields', async ({ page }) => {
@@ -152,16 +155,11 @@ test('derives image fields', async ({ page }) => {
 
   await expect(page.locator('#status-output')).toContainText('Selected: img.hero-image');
   await expect(page.locator('#panel-root')).toContainText('Tag: img · 5 captured attributes');
-  await expect(contentSection).toContainText('Src');
-  await expect(contentSection).toContainText('/hero.png');
-  await expect(contentSection).toContainText('Alt');
-  await expect(contentSection).toContainText('Hero image');
-  await expect(layoutSection).toContainText('Width');
-  await expect(layoutSection).toContainText('640');
-  await expect(layoutSection).toContainText('Height');
-  await expect(layoutSection).toContainText('360');
-  await expect(styleSection).toContainText('Class names');
-  await expect(styleSection).toContainText('hero-image');
+  await expect(contentSection.locator('[data-field-key="src"]')).toHaveValue('/hero.png');
+  await expect(contentSection.locator('[data-field-key="alt"]')).toHaveValue('Hero image');
+  await expect(layoutSection.locator('[data-field-key="width"]')).toHaveValue('640');
+  await expect(layoutSection.locator('[data-field-key="height"]')).toHaveValue('360');
+  await expect(styleSection.locator('[data-field-key="classNames"]')).toHaveValue('hero-image');
 });
 
 test('derives container fields', async ({ page }) => {
@@ -181,12 +179,11 @@ test('derives container fields', async ({ page }) => {
   await expect(page.locator('#status-output')).toContainText('Selected: div.hero-shell');
   await expect(page.locator('#panel-root')).toContainText('Tag: div · 1 captured attributes');
   await expect(contentSection).toContainText('No common content fields for this element type.');
-  await expect(layoutSection).toContainText('Display');
-  await expect(layoutSection).toContainText('Visibility');
+  await expect(layoutSection.locator('[data-field-key="display"]')).toHaveValue('');
+  await expect(layoutSection.locator('[data-field-key="visibility"]')).toHaveValue('');
   await expect(layoutSection).toContainText('Spacing');
-  await expect(styleSection).toContainText('Background');
-  await expect(styleSection).toContainText('Class names');
-  await expect(styleSection).toContainText('hero-shell');
+  await expect(styleSection.locator('[data-field-key="background"]')).toHaveValue('');
+  await expect(styleSection.locator('[data-field-key="classNames"]')).toHaveValue('hero-shell');
   await expect(contentSection).not.toContainText('Href');
   await expect(contentSection).not.toContainText('Src');
   await expect(contentSection).not.toContainText('Alt');
@@ -239,6 +236,53 @@ test('clears selection when reloading the same html', async ({ page }) => {
   });
 
   await expect(previewHeading).not.toHaveAttribute('data-arcana-selected-element', 'true');
-  await expect(page.locator('#status-output')).toContainText('HTML loaded. Click a preview element to inspect it, or add a manifest file to enable editing.');
+  await expect(page.locator('#status-output')).toContainText('HTML loaded. Click a preview element to inspect it and edit its common properties.');
   await expect(page.locator('#panel-root')).not.toContainText('h1.hero-title');
+});
+
+test('applies heading text edits without a manifest and reset reloads live dom values', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+  await page.locator('[data-field-key="text"]').fill('Arcana Launch');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  await expect(page.frameLocator('#preview-frame').locator('h1.hero-title')).toHaveText('Arcana Launch');
+  await expect(page.locator('[data-field-key="text"]')).toHaveValue('Arcana Launch');
+
+  await page.locator('[data-field-key="text"]').fill('Unsaved text');
+  await page.getByRole('button', { name: 'Reset' }).click();
+
+  await expect(page.locator('[data-field-key="text"]')).toHaveValue('Arcana Launch');
+});
+
+test('applies link href, image alt, and class name edits directly to the preview dom', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('a.hero-link').click();
+  await page.locator('[data-field-key="href"]').fill('/docs');
+  await page.getByRole('button', { name: 'Apply' }).click();
+  await expect(page.frameLocator('#preview-frame').locator('a.hero-link')).toHaveAttribute('href', '/docs');
+
+  await page.frameLocator('#preview-frame').locator('img.hero-image').click();
+  await page.locator('[data-field-key="alt"]').fill('Updated alt');
+  await page.getByRole('button', { name: 'Apply' }).click();
+  await expect(page.frameLocator('#preview-frame').locator('img.hero-image')).toHaveAttribute('alt', 'Updated alt');
+
+  await page.frameLocator('#preview-frame').locator('div.hero-shell').click();
+  await page.locator('[data-field-key="classNames"]').fill('hero-shell shell-updated');
+  await page.getByRole('button', { name: 'Apply' }).click();
+  await expect(page.frameLocator('#preview-frame').locator('div.hero-shell')).toHaveAttribute('class', 'hero-shell shell-updated');
 });

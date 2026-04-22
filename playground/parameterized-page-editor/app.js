@@ -1,7 +1,7 @@
 import { createEditorState } from './src/state.js';
 import { normalizeManifest } from './src/manifest.js';
 import { attachPreviewSelection, clearSelectedElement } from './src/selection.js';
-import { deriveInspectorModel } from './src/default-inspector.js';
+import { deriveInspectorModel, applyInspectorValues } from './src/default-inspector.js';
 
 const state = createEditorState();
 const INSPECTOR_SECTIONS = [
@@ -23,7 +23,7 @@ let detachPreviewSelection = () => {};
 let lastRenderedPreviewMarkup = previewFrame.getAttribute('srcdoc') || '';
 
 function canApply() {
-  return Boolean(state.htmlText && state.manifest);
+  return Boolean(state.htmlText && state.selectedPreviewElement);
 }
 
 function createElement(name, className, textContent) {
@@ -45,12 +45,98 @@ function setStatus(message) {
   statusOutput.textContent = message;
 }
 
-function createInspectorRow(label, value, muted = false) {
-  const row = createElement('div', 'inspector-row');
-  const term = createElement('dt', 'inspector-term', label);
-  const description = createElement('dd', muted ? 'inspector-value inspector-value-muted' : 'inspector-value', value);
+function clearSelectionState() {
+  state.selectedPreviewElement = null;
+  state.selectedElement = null;
+  state.inspectorValues = {};
+}
 
-  row.append(term, description);
+function refreshSelectedElementFromDom() {
+  if (!state.selectedPreviewElement) {
+    clearSelectionState();
+    return;
+  }
+
+  state.selectedElement = deriveInspectorModel(
+    state.selectedPreviewElement,
+    previewFrame.contentWindow,
+  );
+  state.inspectorValues = { ...state.selectedElement.values };
+}
+
+function handleInspectorValueInput(fieldKey, value) {
+  state.inspectorValues = {
+    ...state.inspectorValues,
+    [fieldKey]: value,
+  };
+}
+
+function createReadOnlyValue(field) {
+  return createElement(
+    'p',
+    field.muted ? 'inspector-value inspector-value-muted' : 'inspector-value',
+    field.value,
+  );
+}
+
+function createEditableControl(field) {
+  let control;
+
+  if (field.control === 'textarea') {
+    control = document.createElement('textarea');
+    control.rows = 3;
+  } else if (field.control === 'select') {
+    control = document.createElement('select');
+
+    field.options.forEach((optionValue) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = optionValue || 'Not set';
+      control.append(option);
+    });
+  } else {
+    control = document.createElement('input');
+    control.type = 'text';
+
+    if (field.key === 'width' || field.key === 'height') {
+      control.inputMode = 'numeric';
+    }
+  }
+
+  control.className = 'inspector-control';
+  control.dataset.fieldKey = field.key;
+  control.setAttribute('aria-label', field.label);
+  control.value = state.inspectorValues[field.key] ?? '';
+
+  if (field.placeholder) {
+    control.placeholder = field.placeholder;
+  }
+
+  const eventName = field.control === 'select' ? 'change' : 'input';
+  control.addEventListener(eventName, () => {
+    handleInspectorValueInput(field.key, control.value);
+  });
+
+  return control;
+}
+
+function createInspectorRow(field) {
+  const row = createElement('div', 'inspector-row');
+  const term = createElement('dt', 'inspector-term', field.label);
+  const content = createElement('dd', 'inspector-field');
+
+  if (field.editable && field.key) {
+    content.append(createEditableControl(field));
+
+    if (field.placeholder) {
+      const hint = createElement('p', 'inspector-help', field.placeholder);
+      content.append(hint);
+    }
+  } else {
+    content.append(createReadOnlyValue(field));
+  }
+
+  row.append(term, content);
   return row;
 }
 
@@ -105,7 +191,7 @@ function renderPanel() {
 
     const sections = INSPECTOR_SECTIONS.map((section) => {
       const rows = (state.selectedElement.sections[section.key] || [])
-        .map((field) => createInspectorRow(field.label, field.value, field.muted));
+        .map((field) => createInspectorRow(field));
 
       return createInspectorSection(section, rows);
     });
@@ -120,9 +206,9 @@ function renderPanel() {
 
   if (state.htmlText && state.manifest) {
     const manifestTitle = state.manifest.title || state.manifest.name || 'Manifest loaded';
-    message = `${manifestTitle} is ready. Select a preview element to inspect it before binding controls.`;
+    message = `${manifestTitle} is ready. Select a preview element to edit its common fields.`;
   } else if (state.htmlText) {
-    message = 'HTML loaded. Select any visible preview element. A manifest is optional for this scaffold.';
+    message = 'HTML loaded. Select any visible preview element to edit its common properties.';
   } else if (state.manifest) {
     const manifestTitle = state.manifest.title || state.manifest.name || 'Manifest loaded';
     message = `${manifestTitle} is loaded. Add an HTML file to inspect the preview.`;
@@ -156,14 +242,14 @@ function syncControls() {
     setStatus(state.errors[state.errors.length - 1]);
   } else if (state.selectedElement) {
     setStatus(`Selected: ${state.selectedElement.label}`);
-  } else if (enabled) {
-    setStatus('HTML and manifest loaded. Apply is ready.');
+  } else if (state.htmlText && state.manifest) {
+    setStatus('Manifest loaded. Click a preview element to edit it.');
   } else if (state.htmlText) {
-    setStatus('HTML loaded. Click a preview element to inspect it, or add a manifest file to enable editing.');
+    setStatus('HTML loaded. Click a preview element to inspect it and edit its common properties.');
   } else if (state.manifest) {
     setStatus('Manifest loaded. Add an HTML file to enable editing.');
   } else {
-    setStatus('Load an HTML file to inspect the preview. Manifest is optional for selection scaffolding.');
+    setStatus('Load an HTML file to inspect the preview. Manifest is optional for selection and direct editing.');
   }
 
   renderPanel();
@@ -184,8 +270,12 @@ function handlePreviewLoad() {
   }
 
   detachPreviewSelection = attachPreviewSelection(previewFrame, (element) => {
-    state.selectedElement = deriveInspectorModel(element, previewFrame.contentWindow);
+    state.errors = [];
+    state.selectedPreviewElement = element;
+    refreshSelectedElementFromDom();
     renderPanel();
+    applyButton.disabled = false;
+    resetButton.disabled = false;
     setStatus(`Selected: ${state.selectedElement.label}`);
   });
 }
@@ -194,7 +284,7 @@ previewFrame.addEventListener('load', handlePreviewLoad);
 
 htmlInput.addEventListener('change', async () => {
   state.errors = [];
-  state.selectedElement = null;
+  clearSelectionState();
   state.htmlText = await readSelectedFile(htmlInput);
   syncControls();
 });
@@ -224,13 +314,32 @@ manifestInput.addEventListener('change', async () => {
 });
 
 applyButton.addEventListener('click', () => {
-  state.lastAppliedValues = { ...state.values };
-  setStatus('Apply is scaffolded. Parameter mutations will be wired in a later task.');
+  if (!state.selectedPreviewElement) {
+    return;
+  }
+
+  const result = applyInspectorValues(state.selectedPreviewElement, state.inspectorValues);
+  state.errors = [...result.errors];
+  refreshSelectedElementFromDom();
+  renderPanel();
+
+  if (result.errors.length > 0) {
+    setStatus(result.errors[0]);
+    return;
+  }
+
+  setStatus(`Applied changes to ${state.selectedElement.label}.`);
 });
 
 resetButton.addEventListener('click', () => {
-  state.values = { ...state.lastAppliedValues };
-  setStatus('Reset is scaffolded. Parameter reset behavior will be wired in a later task.');
+  if (!state.selectedPreviewElement) {
+    return;
+  }
+
+  state.errors = [];
+  refreshSelectedElementFromDom();
+  renderPanel();
+  setStatus(`Reset form values from ${state.selectedElement.label}.`);
 });
 
 syncControls();
