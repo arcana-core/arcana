@@ -4,6 +4,8 @@ export function createEditorState() {
     manifest: null,
     values: {},
     lastAppliedValues: {},
+    selectedElement: null,
+    selectedInspectorSections: ['content', 'layout', 'style'],
     errors: [],
   };
 }

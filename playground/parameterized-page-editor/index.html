@@ -11,7 +11,7 @@
       <header class="topbar">
         <p class="eyebrow">Standalone Prototype</p>
         <h1>Parameterized Page Editor</h1>
-        <p class="subtitle">Load an HTML page and a JSON manifest, then prepare parameter changes before applying them to the preview.</p>
+        <p class="subtitle">Load an HTML page, optionally add a JSON manifest, and click the preview to inspect a target before parameter editing is wired in.</p>
       </header>
 
       <main class="workspace">
@@ -23,7 +23,7 @@
             </label>
 
             <label class="field" for="manifest-file">
-              <span class="field-label">Manifest file</span>
+              <span class="field-label">Manifest file (optional)</span>
               <input id="manifest-file" name="manifest-file" type="file" accept=".json,application/json">
             </label>
 
@@ -35,14 +35,14 @@
 
           <section class="panel-card" aria-labelledby="panel-heading">
             <div class="panel-header">
-              <h2 id="panel-heading">Parameters</h2>
-              <p>Controls appear here after the manifest is loaded.</p>
+              <h2 id="panel-heading">Inspector</h2>
+              <p>Select a preview element to populate the scaffold. Manifest-backed controls will layer onto this panel later.</p>
             </div>
-            <div id="panel-root" class="panel-root">Waiting for source files.</div>
+            <div id="panel-root" class="panel-root">Load an HTML file to start selecting elements.</div>
           </section>
 
           <output id="status-output" class="status-output" for="html-file manifest-file" aria-live="polite">
-            Load an HTML file and a manifest file to enable preview actions.
+            Load an HTML file to inspect the preview. Manifest is optional for selection scaffolding.
           </output>
         </aside>
 
@@ -54,7 +54,7 @@
           <iframe
             id="preview-frame"
             class="preview-frame"
-            sandbox=""
+            sandbox="allow-same-origin"
             title="Preview canvas"
             srcdoc="<p class='preview-empty'>Preview not loaded yet.</p>"
           ></iframe>
