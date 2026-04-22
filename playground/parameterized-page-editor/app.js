@@ -20,6 +20,7 @@ const statusOutput = document.querySelector('#status-output');
 const previewFrame = document.querySelector('#preview-frame');
 let detachPreviewSelection = () => {};
 let lastRenderedPreviewMarkup = previewFrame.getAttribute('srcdoc') || '';
+const INTERNAL_SELECTION_ATTRIBUTE = 'data-arcana-selected-element';
 
 function canApply() {
   return Boolean(state.htmlText && state.manifest);
@@ -150,6 +151,13 @@ function renderPanel() {
 }
 
 function buildSelectedElementMetadata(element) {
+  const attributes = Array.from(element.attributes)
+    .filter((attribute) => attribute.name !== INTERNAL_SELECTION_ATTRIBUTE)
+    .map((attribute) => ({
+      name: attribute.name,
+      value: attribute.value,
+    }));
+
   return {
     tagName: element.tagName.toLowerCase(),
     label: describeElement(element),
@@ -166,10 +174,7 @@ function buildSelectedElementMetadata(element) {
         inlineStyle: element.getAttribute('style') || '',
         computedPlaceholder: 'Color and typography controls will be wired in a later task.',
       },
-      attributes: Array.from(element.attributes).map((attribute) => ({
-        name: attribute.name,
-        value: attribute.value,
-      })),
+      attributes,
       advanced: {
         selectorHint: describeElement(element),
         bindingPlaceholder: 'Manifest-backed mutation bindings will appear here later.',

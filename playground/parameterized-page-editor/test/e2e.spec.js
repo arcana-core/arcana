@@ -74,13 +74,16 @@ test('selects an element and shows inspector sections', async ({ page }) => {
 
   await expect(page.locator('#status-output')).toContainText('Selected: h1.hero-title');
   await expect(page.locator('#panel-root')).toContainText('h1.hero-title');
+  await expect(page.locator('#panel-root')).toContainText('Tag: h1 · 1 captured attributes');
   await expect(page.locator('#panel-root')).toContainText('Content');
   await expect(page.locator('#panel-root')).toContainText('Layout');
   await expect(page.locator('#panel-root')).toContainText('Style');
   await expect(page.locator('#panel-root')).toContainText('Attributes');
   await expect(page.locator('#panel-root')).toContainText('Advanced');
-  await expect(page.locator('#panel-root details[open]')).toHaveCount(3);
+  await expect(page.locator('#panel-root details[open] summary')).toHaveText(['Content', 'Layout', 'Style']);
   await expect(page.locator('#panel-root summary')).toHaveCount(5);
+  await expect(page.locator('#panel-root')).toContainText('class');
+  await expect(page.locator('#panel-root')).not.toContainText('data-arcana-selected-element');
 });
 
 test('surfaces manifest errors after selection', async ({ page }) => {
