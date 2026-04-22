@@ -1,4 +1,9 @@
-import { createEditorState } from './src/state.js';
+import {
+  createEditorState,
+  createSavedEditorStateSnapshot,
+  parseSavedEditorState,
+  serializeSavedEditorState,
+} from './src/state.js';
 import { normalizeManifest } from './src/manifest.js';
 import { attachPreviewSelection, clearSelectedElement } from './src/selection.js';
 import { deriveInspectorModel, applyInspectorValues } from './src/default-inspector.js';
@@ -21,8 +26,11 @@ const htmlInput = document.querySelector('#html-file');
 const manifestInput = document.querySelector('#manifest-file');
 const applyButton = document.querySelector('#apply-button');
 const resetButton = document.querySelector('#reset-button');
+const exportStateButton = document.querySelector('#export-state-button');
+const importStateButton = document.querySelector('#import-state-button');
 const panelRoot = document.querySelector('#panel-root');
 const statusOutput = document.querySelector('#status-output');
+const stateTransferArea = document.querySelector('#state-transfer');
 const previewFrame = document.querySelector('#preview-frame');
 let detachPreviewSelection = () => {};
 let lastRenderedPreviewMarkup = previewFrame.getAttribute('srcdoc') || '';
@@ -48,6 +56,10 @@ function createElement(name, className, textContent) {
 function setStatus(message) {
   statusOutput.value = message;
   statusOutput.textContent = message;
+}
+
+function setStateTransferText(value) {
+  stateTransferArea.value = value;
 }
 
 function clearSelectionState() {
@@ -292,6 +304,68 @@ function syncControls() {
   renderPreview();
 }
 
+function getAvailableSectionKeys() {
+  return new Set(INSPECTOR_SECTIONS.map(({ key }) => key));
+}
+
+function applySavedEditorState(snapshot) {
+  if (!state.selectedPreviewElement) {
+    setStatus('Select a preview element before importing saved state.');
+    return;
+  }
+
+  const availableSectionKeys = getAvailableSectionKeys();
+  state.selectedInspectorSections = snapshot.selectedInspectorSections
+    .filter((sectionKey) => availableSectionKeys.has(sectionKey));
+
+  if (state.selectedInspectorSections.length === 0) {
+    state.selectedInspectorSections = [...getAvailableSectionKeys()]
+      .filter((sectionKey) => sectionKey === 'content' || sectionKey === 'layout' || sectionKey === 'style');
+  }
+
+  const nextInspectorValues = {
+    ...state.inspectorValues,
+    ...snapshot.defaultValues,
+  };
+  const defaultResult = applyInspectorValues(state.selectedPreviewElement, nextInspectorValues);
+
+  let curatedResult = { errors: [] };
+  let curatedSkipMessage = '';
+
+  if (Object.keys(snapshot.curatedValues).length > 0) {
+    if (!state.manifest) {
+      curatedSkipMessage = 'Skipped curated values because no manifest is loaded.';
+    } else if (state.curatedInspector.fields.length === 0) {
+      curatedSkipMessage = 'Skipped curated values because the current selection has no active curated bindings.';
+    } else {
+      const nextCuratedValues = {
+        ...state.curatedValues,
+        ...snapshot.curatedValues,
+      };
+      curatedResult = applyCuratedInspectorValues(
+        state.selectedPreviewElement,
+        nextCuratedValues,
+        state.curatedInspector.fields,
+      );
+    }
+  }
+
+  state.errors = [...defaultResult.errors, ...curatedResult.errors];
+  refreshSelectedElementFromDom();
+  renderPanel();
+
+  if (state.errors.length > 0) {
+    setStatus(state.errors[0]);
+    return;
+  }
+
+  const selectionDescriptor = snapshot.selection.label
+    ? ` Saved snapshot target: ${snapshot.selection.label}.`
+    : '';
+  const skipDescriptor = curatedSkipMessage ? ` ${curatedSkipMessage}` : '';
+  setStatus(`Imported saved state onto ${state.selectedElement.label}.${selectionDescriptor}${skipDescriptor}`);
+}
+
 async function readSelectedFile(input) {
   const [file] = input.files ?? [];
   return file ? file.text() : '';
@@ -389,6 +463,43 @@ resetButton.addEventListener('click', () => {
   refreshSelectedElementFromDom();
   renderPanel();
   setStatus(`Reset form values from ${state.selectedElement.label}.`);
+});
+
+exportStateButton.addEventListener('click', () => {
+  if (!state.selectedElement) {
+    setStatus('Select a preview element before exporting saved state.');
+    return;
+  }
+
+  const snapshot = createSavedEditorStateSnapshot({
+    selectedElement: state.selectedElement,
+    selectedInspectorSections: state.selectedInspectorSections,
+    inspectorValues: state.inspectorValues,
+    curatedValues: state.curatedValues,
+  });
+
+  setStateTransferText(serializeSavedEditorState(snapshot));
+  setStatus(`Exported saved state for ${state.selectedElement.label}.`);
+});
+
+importStateButton.addEventListener('click', () => {
+  const sourceText = stateTransferArea.value.trim();
+
+  if (!sourceText) {
+    setStatus('Paste saved state JSON into the textarea before importing.');
+    return;
+  }
+
+  let snapshot;
+
+  try {
+    snapshot = parseSavedEditorState(sourceText);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Saved editor state is invalid.');
+    return;
+  }
+
+  applySavedEditorState(snapshot);
 });
 
 syncControls();

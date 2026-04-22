@@ -33,6 +33,32 @@
             </div>
           </section>
 
+          <section class="control-card" aria-labelledby="state-transfer-heading">
+            <div class="panel-header">
+              <h2 id="state-transfer-heading">State Transfer</h2>
+              <p>Export the current selection into reusable JSON, then paste or reapply it onto the selected live element.</p>
+            </div>
+
+            <label class="field" for="state-transfer">
+              <span class="field-label">Saved editor state JSON</span>
+              <textarea
+                id="state-transfer"
+                name="state-transfer"
+                class="state-transfer"
+                rows="12"
+                spellcheck="false"
+                placeholder='{
+  "kind": "parameterized-page-editor-state"
+}'
+              ></textarea>
+            </label>
+
+            <div class="button-row button-row-compact">
+              <button id="export-state-button" type="button">Export state</button>
+              <button id="import-state-button" type="button">Import state</button>
+            </div>
+          </section>
+
           <section class="panel-card" aria-labelledby="panel-heading">
             <div class="panel-header">
               <h2 id="panel-heading">Inspector</h2>

@@ -123,6 +123,7 @@ body::before {
   background: var(--surface-strong);
 }
 
+.sidebar > .control-card + .control-card,
 .panel-card {
   margin-top: 1rem;
 }
@@ -150,10 +151,33 @@ input[type="file"] {
   font: inherit;
 }
 
+.state-transfer {
+  width: 100%;
+  min-height: 14rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(255, 253, 248, 0.96);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+
+.state-transfer:focus {
+  outline: 2px solid rgba(178, 74, 47, 0.28);
+  outline-offset: 1px;
+  border-color: var(--highlight);
+}
+
 .button-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
   margin-top: 1.25rem;
+}
+
+.button-row-compact {
+  margin-top: 0.75rem;
 }
 
 button {

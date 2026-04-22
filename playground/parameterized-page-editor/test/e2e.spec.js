@@ -472,3 +472,73 @@ test('applies curated text, attribute, and style values to the selected preview 
   await expect(previewTitle).toHaveAttribute('data-tone', 'warm');
   await expect(previewTitle).toHaveCSS('color', 'rgb(65, 105, 225)');
 });
+
+test('exports editor state and imports it with and without a manifest', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+  await page.getByLabel('Manifest file (optional)').setInputFiles({
+    name: 'curated.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(CURATED_MANIFEST)),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+
+  const attributesSection = page.locator('#panel-root details[data-section-key="attributes"]');
+  const stateArea = page.getByLabel('Saved editor state JSON');
+
+  await expect(attributesSection).not.toHaveAttribute('open', '');
+  await attributesSection.locator('summary').click();
+  await expect(attributesSection).toHaveAttribute('open', '');
+
+  await page.locator('[data-field-key="attr:title"]').fill('Saved title');
+  await page.locator('[data-field-key="curated:tone"]').fill('ember');
+  await page.locator('[data-field-key="curated:headline"]').fill('Saved curated headline');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  await page.getByRole('button', { name: 'Export state' }).click();
+  await expect(stateArea).toHaveValue(/"defaultValues"/);
+  await expect(stateArea).toHaveValue(/"curatedValues"/);
+  await expect(stateArea).toHaveValue(/"selectedInspectorSections"/);
+  const exportedState = await stateArea.inputValue();
+
+  await page.getByRole('button', { name: 'Import state' }).click();
+
+  const previewTitle = page.frameLocator('#preview-frame').locator('h1.hero-title');
+  await expect(previewTitle).toHaveText('Saved curated headline');
+  await expect(previewTitle).toHaveAttribute('aria-label', 'Saved curated headline');
+  await expect(previewTitle).toHaveAttribute('data-tone', 'ember');
+  await expect(previewTitle).toHaveAttribute('title', 'Saved title');
+  await expect(page.locator('[data-field-key="attr:title"]')).toHaveValue('Saved title');
+  await expect(attributesSection).toHaveAttribute('open', '');
+  await expect(page.locator('#status-output')).toContainText('Imported saved state');
+
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+  await page.locator('#panel-root details[data-section-key="attributes"] summary').click();
+  await page.locator('[data-field-key="attr:title"]').fill('Temporary title');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  await stateArea.fill(exportedState);
+  await page.getByRole('button', { name: 'Import state' }).click();
+
+  const htmlOnlyTitle = page.frameLocator('#preview-frame').locator('h1.hero-title');
+  const htmlOnlyAttributesSection = page.locator('#panel-root details[data-section-key="attributes"]');
+  await expect(page.locator('#panel-root details[data-section-key="curated"]')).toHaveCount(0);
+  await expect(htmlOnlyTitle).toHaveText('Saved curated headline');
+  await expect(htmlOnlyTitle).toHaveAttribute('title', 'Saved title');
+  await expect(page.locator('[data-field-key="attr:title"]')).toHaveValue('Saved title');
+  await expect(htmlOnlyAttributesSection).toHaveAttribute('open', '');
+  await expect(page.locator('#status-output')).toContainText('Skipped curated values because no manifest is loaded.');
+});
