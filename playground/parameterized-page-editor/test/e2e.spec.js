@@ -2,6 +2,7 @@ import { test, expect } from '@playwright/test';
 import { createStaticServer } from './helpers/static-server.js';
 
 let server;
+const HERO_HTML = '<!doctype html><html lang="en"><body><section class="hero"><h1 class="hero-title">Arcana Editor</h1><p>Selection scaffold</p></section></body></html>';
 
 test.beforeAll(async () => {
   server = await createStaticServer(new URL('..', import.meta.url));
@@ -64,9 +65,7 @@ test('selects an element and shows inspector sections', async ({ page }) => {
   await page.getByLabel('HTML file').setInputFiles({
     name: 'hero.html',
     mimeType: 'text/html',
-    buffer: Buffer.from(
-      '<!doctype html><html lang="en"><body><section class="hero"><h1 class="hero-title">Arcana Editor</h1><p>Selection scaffold</p></section></body></html>',
-    ),
+    buffer: Buffer.from(HERO_HTML),
   });
 
   const previewFrame = page.frameLocator('#preview-frame');
@@ -82,4 +81,52 @@ test('selects an element and shows inspector sections', async ({ page }) => {
   await expect(page.locator('#panel-root')).toContainText('Advanced');
   await expect(page.locator('#panel-root details[open]')).toHaveCount(3);
   await expect(page.locator('#panel-root summary')).toHaveCount(5);
+});
+
+test('surfaces manifest errors after selection', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'hero.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(HERO_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+  await expect(page.locator('#status-output')).toContainText('Selected: h1.hero-title');
+
+  await page.getByLabel('Manifest file (optional)').setInputFiles({
+    name: 'broken.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from('{ invalid json'),
+  });
+
+  await expect(page.locator('#status-output')).toContainText('Manifest file must contain valid JSON.');
+});
+
+test('clears selection when reloading the same html', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  const htmlFileInput = page.getByLabel('HTML file');
+  const previewHeading = page.frameLocator('#preview-frame').locator('h1.hero-title');
+
+  await htmlFileInput.setInputFiles({
+    name: 'hero.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(HERO_HTML),
+  });
+
+  await previewHeading.click();
+  await expect(previewHeading).toHaveAttribute('data-arcana-selected-element', 'true');
+  await expect(page.locator('#status-output')).toContainText('Selected: h1.hero-title');
+
+  await htmlFileInput.setInputFiles({
+    name: 'hero.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(HERO_HTML),
+  });
+
+  await expect(previewHeading).not.toHaveAttribute('data-arcana-selected-element', 'true');
+  await expect(page.locator('#status-output')).toContainText('HTML loaded. Click a preview element to inspect it, or add a manifest file to enable editing.');
+  await expect(page.locator('#panel-root')).not.toContainText('h1.hero-title');
 });

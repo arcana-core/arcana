@@ -1,6 +1,6 @@
 import { createEditorState } from './src/state.js';
 import { normalizeManifest } from './src/manifest.js';
-import { attachPreviewSelection, describeElement } from './src/selection.js';
+import { attachPreviewSelection, clearSelectedElement, describeElement } from './src/selection.js';
 
 const state = createEditorState();
 const INSPECTOR_SECTIONS = [
@@ -182,6 +182,10 @@ function renderPreview() {
   const nextMarkup = state.htmlText || "<p class='preview-empty'>Preview not loaded yet.</p>";
 
   if (nextMarkup === lastRenderedPreviewMarkup) {
+    if (previewFrame.contentDocument) {
+      clearSelectedElement(previewFrame.contentDocument);
+    }
+
     return;
   }
 
@@ -194,12 +198,12 @@ function syncControls() {
   applyButton.disabled = !enabled;
   resetButton.disabled = !enabled;
 
-  if (state.selectedElement) {
+  if (state.errors.length > 0) {
+    setStatus(state.errors[state.errors.length - 1]);
+  } else if (state.selectedElement) {
     setStatus(`Selected: ${state.selectedElement.label}`);
   } else if (enabled) {
     setStatus('HTML and manifest loaded. Apply is ready.');
-  } else if (state.errors.length > 0) {
-    setStatus(state.errors[state.errors.length - 1]);
   } else if (state.htmlText) {
     setStatus('HTML loaded. Click a preview element to inspect it, or add a manifest file to enable editing.');
   } else if (state.manifest) {
