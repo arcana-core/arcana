@@ -381,6 +381,29 @@ test('shows curated controls only for bound selections when a manifest is loaded
   await expect(page.locator('#panel-root details[data-section-key="curated"]')).toHaveCount(0);
 });
 
+test('clears curated controls when the manifest is removed', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+  await page.getByLabel('Manifest file (optional)').setInputFiles({
+    name: 'curated.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(CURATED_MANIFEST)),
+  });
+
+  await page.frameLocator('#preview-frame').locator('h1.hero-title').click();
+  await expect(page.locator('#panel-root details[data-section-key="curated"]')).toBeVisible();
+
+  await page.getByLabel('Manifest file (optional)').setInputFiles([]);
+
+  await expect(page.locator('#panel-root details[data-section-key="curated"]')).toHaveCount(0);
+  await expect(page.locator('#status-output')).toContainText('Selected: h1.hero-title');
+});
+
 test('applies curated text, attribute, and style values to the selected preview element', async ({ page }) => {
   await page.goto(server.url + '/index.html');
 

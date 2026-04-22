@@ -332,6 +332,10 @@ manifestInput.addEventListener('change', async () => {
   const manifestText = await readSelectedFile(manifestInput);
 
   if (!manifestText) {
+    if (state.selectedPreviewElement) {
+      refreshSelectedElementFromDom();
+    }
+
     syncControls();
     return;
   }
