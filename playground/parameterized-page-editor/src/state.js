@@ -1,3 +1,5 @@
+export const DEFAULT_OPEN_INSPECTOR_SECTIONS = ['content', 'layout', 'style'];
+
 export function createEditorState() {
   return {
     htmlText: '',
@@ -5,7 +7,7 @@ export function createEditorState() {
     values: {},
     lastAppliedValues: {},
     selectedElement: null,
-    selectedInspectorSections: ['content', 'layout', 'style'],
+    selectedInspectorSections: [...DEFAULT_OPEN_INSPECTOR_SECTIONS],
     errors: [],
   };
 }

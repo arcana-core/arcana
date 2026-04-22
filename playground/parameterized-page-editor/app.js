@@ -1,6 +1,7 @@
 import { createEditorState } from './src/state.js';
 import { normalizeManifest } from './src/manifest.js';
-import { attachPreviewSelection, clearSelectedElement, describeElement } from './src/selection.js';
+import { attachPreviewSelection, clearSelectedElement } from './src/selection.js';
+import { deriveInspectorModel } from './src/default-inspector.js';
 
 const state = createEditorState();
 const INSPECTOR_SECTIONS = [
@@ -20,7 +21,6 @@ const statusOutput = document.querySelector('#status-output');
 const previewFrame = document.querySelector('#preview-frame');
 let detachPreviewSelection = () => {};
 let lastRenderedPreviewMarkup = previewFrame.getAttribute('srcdoc') || '';
-const INTERNAL_SELECTION_ATTRIBUTE = 'data-arcana-selected-element';
 
 function canApply() {
   return Boolean(state.htmlText && state.manifest);
@@ -97,36 +97,18 @@ function renderPanel() {
     const meta = createElement(
       'p',
       'inspector-copy',
-      `Tag: ${state.selectedElement.tagName} · ${state.selectedElement.editable.attributes.length} captured attributes`,
+      `Tag: ${state.selectedElement.tagName} · ${state.selectedElement.attributeCount} captured attributes`,
     );
 
     header.append(eyebrow, title, meta);
     panelRoot.append(header);
 
-    const sections = [
-      createInspectorSection(INSPECTOR_SECTIONS[0], [
-        createInspectorRow('Text content', state.selectedElement.editable.content.textContent || 'No text content detected.', !state.selectedElement.editable.content.textContent),
-        createInspectorRow('HTML', state.selectedElement.editable.content.htmlPlaceholder, true),
-      ]),
-      createInspectorSection(INSPECTOR_SECTIONS[1], [
-        createInspectorRow('Box model', state.selectedElement.editable.layout.boxModelPlaceholder, true),
-        createInspectorRow('Positioning', state.selectedElement.editable.layout.positionPlaceholder, true),
-      ]),
-      createInspectorSection(INSPECTOR_SECTIONS[2], [
-        createInspectorRow('Inline style', state.selectedElement.editable.style.inlineStyle || 'No inline styles present.', !state.selectedElement.editable.style.inlineStyle),
-        createInspectorRow('Computed styles', state.selectedElement.editable.style.computedPlaceholder, true),
-      ]),
-      createInspectorSection(
-        INSPECTOR_SECTIONS[3],
-        state.selectedElement.editable.attributes.length > 0
-          ? state.selectedElement.editable.attributes.map((attribute) => createInspectorRow(attribute.name, attribute.value || '(empty)'))
-          : [createInspectorRow('Attributes', 'No attributes captured.', true)],
-      ),
-      createInspectorSection(INSPECTOR_SECTIONS[4], [
-        createInspectorRow('Selector target', state.selectedElement.editable.advanced.selectorHint),
-        createInspectorRow('Mutation bindings', state.selectedElement.editable.advanced.bindingPlaceholder, true),
-      ]),
-    ];
+    const sections = INSPECTOR_SECTIONS.map((section) => {
+      const rows = (state.selectedElement.sections[section.key] || [])
+        .map((field) => createInspectorRow(field.label, field.value, field.muted));
+
+      return createInspectorSection(section, rows);
+    });
 
     panelRoot.append(...sections);
     return;
@@ -148,39 +130,6 @@ function renderPanel() {
 
   emptyState.append(title, createElement('p', 'inspector-copy', message));
   panelRoot.append(emptyState);
-}
-
-function buildSelectedElementMetadata(element) {
-  const attributes = Array.from(element.attributes)
-    .filter((attribute) => attribute.name !== INTERNAL_SELECTION_ATTRIBUTE)
-    .map((attribute) => ({
-      name: attribute.name,
-      value: attribute.value,
-    }));
-
-  return {
-    tagName: element.tagName.toLowerCase(),
-    label: describeElement(element),
-    editable: {
-      content: {
-        textContent: element.textContent?.trim() || '',
-        htmlPlaceholder: 'Rich content editing will be added in a later task.',
-      },
-      layout: {
-        boxModelPlaceholder: 'Spacing and sizing controls will land in a later task.',
-        positionPlaceholder: 'Position controls will be scaffolded in a later task.',
-      },
-      style: {
-        inlineStyle: element.getAttribute('style') || '',
-        computedPlaceholder: 'Color and typography controls will be wired in a later task.',
-      },
-      attributes,
-      advanced: {
-        selectorHint: describeElement(element),
-        bindingPlaceholder: 'Manifest-backed mutation bindings will appear here later.',
-      },
-    },
-  };
 }
 
 function renderPreview() {
@@ -235,7 +184,7 @@ function handlePreviewLoad() {
   }
 
   detachPreviewSelection = attachPreviewSelection(previewFrame, (element) => {
-    state.selectedElement = buildSelectedElementMetadata(element);
+    state.selectedElement = deriveInspectorModel(element, previewFrame.contentWindow);
     renderPanel();
     setStatus(`Selected: ${state.selectedElement.label}`);
   });

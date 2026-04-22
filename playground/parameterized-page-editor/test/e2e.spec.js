@@ -3,6 +3,19 @@ import { createStaticServer } from './helpers/static-server.js';
 
 let server;
 const HERO_HTML = '<!doctype html><html lang="en"><body><section class="hero"><h1 class="hero-title">Arcana Editor</h1><p>Selection scaffold</p></section></body></html>';
+const INSPECTOR_HTML = `
+<!doctype html>
+<html lang="en">
+  <body>
+    <section class="hero" style="background-color: rgb(250, 240, 230); margin: 12px; padding: 8px;">
+      <h1 class="hero-title">Arcana Editor</h1>
+      <a class="hero-link" href="/pricing" target="_blank">See pricing</a>
+      <img class="hero-image" src="/hero.png" alt="Hero image" width="640" height="360">
+      <div class="hero-shell"><span>Nested content</span></div>
+    </section>
+  </body>
+</html>
+`;
 
 test.beforeAll(async () => {
   server = await createStaticServer(new URL('..', import.meta.url));
@@ -69,6 +82,9 @@ test('selects an element and shows inspector sections', async ({ page }) => {
   });
 
   const previewFrame = page.frameLocator('#preview-frame');
+  const contentSection = page.locator('#panel-root details[data-section-key="content"][open]');
+  const layoutSection = page.locator('#panel-root details[data-section-key="layout"][open]');
+  const styleSection = page.locator('#panel-root details[data-section-key="style"][open]');
 
   await previewFrame.locator('h1.hero-title').click();
 
@@ -82,8 +98,101 @@ test('selects an element and shows inspector sections', async ({ page }) => {
   await expect(page.locator('#panel-root')).toContainText('Advanced');
   await expect(page.locator('#panel-root details[open] summary')).toHaveText(['Content', 'Layout', 'Style']);
   await expect(page.locator('#panel-root summary')).toHaveCount(5);
+  await expect(contentSection).toContainText('Text');
+  await expect(contentSection).toContainText('Arcana Editor');
+  await expect(layoutSection).toContainText('Display');
+  await expect(layoutSection).toContainText('Visibility');
+  await expect(layoutSection).toContainText('Spacing');
+  await expect(styleSection).toContainText('Text color');
+  await expect(styleSection).toContainText('Background');
+  await expect(styleSection).toContainText('Class names');
+  await expect(styleSection).toContainText('hero-title');
   await expect(page.locator('#panel-root')).toContainText('class');
   await expect(page.locator('#panel-root')).not.toContainText('data-arcana-selected-element');
+});
+
+test('derives link fields', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+  const contentSection = page.locator('#panel-root details[data-section-key="content"][open]');
+  const styleSection = page.locator('#panel-root details[data-section-key="style"][open]');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('a.hero-link').click();
+
+  await expect(page.locator('#status-output')).toContainText('Selected: a.hero-link');
+  await expect(page.locator('#panel-root')).toContainText('Tag: a · 3 captured attributes');
+  await expect(contentSection).toContainText('Text');
+  await expect(contentSection).toContainText('See pricing');
+  await expect(contentSection).toContainText('Href');
+  await expect(contentSection).toContainText('/pricing');
+  await expect(contentSection).toContainText('Target');
+  await expect(contentSection).toContainText('_blank');
+  await expect(styleSection).toContainText('Class names');
+  await expect(styleSection).toContainText('hero-link');
+});
+
+test('derives image fields', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+  const contentSection = page.locator('#panel-root details[data-section-key="content"][open]');
+  const layoutSection = page.locator('#panel-root details[data-section-key="layout"][open]');
+  const styleSection = page.locator('#panel-root details[data-section-key="style"][open]');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('img.hero-image').click();
+
+  await expect(page.locator('#status-output')).toContainText('Selected: img.hero-image');
+  await expect(page.locator('#panel-root')).toContainText('Tag: img · 5 captured attributes');
+  await expect(contentSection).toContainText('Src');
+  await expect(contentSection).toContainText('/hero.png');
+  await expect(contentSection).toContainText('Alt');
+  await expect(contentSection).toContainText('Hero image');
+  await expect(layoutSection).toContainText('Width');
+  await expect(layoutSection).toContainText('640');
+  await expect(layoutSection).toContainText('Height');
+  await expect(layoutSection).toContainText('360');
+  await expect(styleSection).toContainText('Class names');
+  await expect(styleSection).toContainText('hero-image');
+});
+
+test('derives container fields', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+  const contentSection = page.locator('#panel-root details[data-section-key="content"][open]');
+  const layoutSection = page.locator('#panel-root details[data-section-key="layout"][open]');
+  const styleSection = page.locator('#panel-root details[data-section-key="style"][open]');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('div.hero-shell').click();
+
+  await expect(page.locator('#status-output')).toContainText('Selected: div.hero-shell');
+  await expect(page.locator('#panel-root')).toContainText('Tag: div · 1 captured attributes');
+  await expect(contentSection).toContainText('No common content fields for this element type.');
+  await expect(layoutSection).toContainText('Display');
+  await expect(layoutSection).toContainText('Visibility');
+  await expect(layoutSection).toContainText('Spacing');
+  await expect(styleSection).toContainText('Background');
+  await expect(styleSection).toContainText('Class names');
+  await expect(styleSection).toContainText('hero-shell');
+  await expect(contentSection).not.toContainText('Href');
+  await expect(contentSection).not.toContainText('Src');
+  await expect(contentSection).not.toContainText('Alt');
+  await expect(styleSection).not.toContainText('Href');
+  await expect(styleSection).not.toContainText('Src');
+  await expect(styleSection).not.toContainText('Alt');
 });
 
 test('surfaces manifest errors after selection', async ({ page }) => {
