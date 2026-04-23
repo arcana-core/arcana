@@ -26,17 +26,102 @@ const htmlInput = document.querySelector('#html-file');
 const manifestInput = document.querySelector('#manifest-file');
 const applyButton = document.querySelector('#apply-button');
 const resetButton = document.querySelector('#reset-button');
+const zoomOutButton = document.querySelector('#zoom-out-button');
+const zoomResetButton = document.querySelector('#zoom-reset-button');
+const zoomInButton = document.querySelector('#zoom-in-button');
 const exportStateButton = document.querySelector('#export-state-button');
 const importStateButton = document.querySelector('#import-state-button');
 const panelRoot = document.querySelector('#panel-root');
 const statusOutput = document.querySelector('#status-output');
 const stateTransferArea = document.querySelector('#state-transfer');
+const previewStage = document.querySelector('#preview-stage');
 const previewFrame = document.querySelector('#preview-frame');
 let detachPreviewSelection = () => {};
 let lastRenderedPreviewMarkup = previewFrame.getAttribute('srcdoc') || '';
+const PREVIEW_ZOOM_STEPS = [0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5];
+const DEFAULT_PREVIEW_SIZE = {
+  width: 1280,
+  height: 720,
+};
 
 function canApply() {
   return Boolean(state.htmlText && state.selectedPreviewElement);
+}
+
+function clampZoom(nextZoom) {
+  return Math.min(1.5, Math.max(0.5, nextZoom));
+}
+
+function formatZoomLabel(zoom) {
+  return `${Math.round(zoom * 100)}%`;
+}
+
+function updateZoomControls() {
+  zoomResetButton.textContent = formatZoomLabel(state.previewZoom);
+  zoomOutButton.disabled = state.previewZoom <= PREVIEW_ZOOM_STEPS[0];
+  zoomInButton.disabled = state.previewZoom >= PREVIEW_ZOOM_STEPS[PREVIEW_ZOOM_STEPS.length - 1];
+}
+
+function applyPreviewScale() {
+  const zoom = clampZoom(state.previewZoom);
+  const width = state.previewContentSize.width || DEFAULT_PREVIEW_SIZE.width;
+  const height = state.previewContentSize.height || DEFAULT_PREVIEW_SIZE.height;
+
+  previewStage.style.width = `${Math.max(320, Math.ceil(width * zoom))}px`;
+  previewStage.style.height = `${Math.max(240, Math.ceil(height * zoom))}px`;
+  previewFrame.style.width = `${width}px`;
+  previewFrame.style.height = `${height}px`;
+  previewFrame.style.transform = `scale(${zoom})`;
+  updateZoomControls();
+}
+
+function setPreviewZoom(nextZoom) {
+  state.previewZoom = clampZoom(nextZoom);
+  applyPreviewScale();
+}
+
+function stepPreviewZoom(direction) {
+  const currentIndex = PREVIEW_ZOOM_STEPS.findIndex((step) => step >= state.previewZoom);
+  const normalizedIndex = currentIndex === -1 ? PREVIEW_ZOOM_STEPS.length - 1 : currentIndex;
+  const nextIndex = Math.min(
+    PREVIEW_ZOOM_STEPS.length - 1,
+    Math.max(0, normalizedIndex + direction),
+  );
+
+  setPreviewZoom(PREVIEW_ZOOM_STEPS[nextIndex]);
+}
+
+function measurePreviewContentSize() {
+  const documentElement = previewFrame.contentDocument?.documentElement;
+  const body = previewFrame.contentDocument?.body;
+
+  if (!documentElement || !body) {
+    state.previewContentSize = { ...DEFAULT_PREVIEW_SIZE };
+    applyPreviewScale();
+    return;
+  }
+
+  const width = Math.max(
+    DEFAULT_PREVIEW_SIZE.width,
+    documentElement.scrollWidth,
+    documentElement.offsetWidth,
+    documentElement.clientWidth,
+    body.scrollWidth,
+    body.offsetWidth,
+    body.clientWidth,
+  );
+  const height = Math.max(
+    DEFAULT_PREVIEW_SIZE.height,
+    documentElement.scrollHeight,
+    documentElement.offsetHeight,
+    documentElement.clientHeight,
+    body.scrollHeight,
+    body.offsetHeight,
+    body.clientHeight,
+  );
+
+  state.previewContentSize = { width, height };
+  applyPreviewScale();
 }
 
 function createElement(name, className, textContent) {
@@ -274,6 +359,8 @@ function renderPreview() {
       clearSelectedElement(previewFrame.contentDocument);
     }
 
+    measurePreviewContentSize();
+
     return;
   }
 
@@ -374,6 +461,7 @@ async function readSelectedFile(input) {
 function handlePreviewLoad() {
   detachPreviewSelection();
   detachPreviewSelection = () => {};
+  measurePreviewContentSize();
 
   if (!state.htmlText) {
     return;
@@ -391,6 +479,15 @@ function handlePreviewLoad() {
 }
 
 previewFrame.addEventListener('load', handlePreviewLoad);
+zoomOutButton.addEventListener('click', () => {
+  stepPreviewZoom(-1);
+});
+zoomResetButton.addEventListener('click', () => {
+  setPreviewZoom(1);
+});
+zoomInButton.addEventListener('click', () => {
+  stepPreviewZoom(1);
+});
 
 htmlInput.addEventListener('change', async () => {
   state.errors = [];
@@ -445,6 +542,7 @@ applyButton.addEventListener('click', () => {
   state.errors = [...defaultResult.errors, ...curatedResult.errors];
   refreshSelectedElementFromDom();
   renderPanel();
+  measurePreviewContentSize();
 
   if (state.errors.length > 0) {
     setStatus(state.errors[0]);
@@ -462,6 +560,7 @@ resetButton.addEventListener('click', () => {
   state.errors = [];
   refreshSelectedElementFromDom();
   renderPanel();
+  measurePreviewContentSize();
   setStatus(`Reset form values from ${state.selectedElement.label}.`);
 });
 
@@ -502,4 +601,5 @@ importStateButton.addEventListener('click', () => {
   applySavedEditorState(snapshot);
 });
 
+applyPreviewScale();
 syncControls();

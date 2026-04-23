@@ -76,6 +76,11 @@ export function createEditorState() {
     manifest: null,
     selectedPreviewElement: null,
     selectedElement: null,
+    previewZoom: 1,
+    previewContentSize: {
+      width: 1280,
+      height: 720,
+    },
     curatedInspector: { fields: [], values: {} },
     curatedValues: {},
     inspectorValues: {},

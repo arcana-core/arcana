@@ -30,6 +30,16 @@ const INSPECTOR_HTML = `
   </body>
 </html>
 `;
+const LARGE_CANVAS_HTML = `
+<!doctype html>
+<html lang="en">
+  <body style="margin: 0;">
+    <div style="width: 2200px; height: 1800px; background: linear-gradient(135deg, #f1eadc, #b23c1c);">
+      <h1 style="margin: 0; padding: 24px;">Large Preview</h1>
+    </div>
+  </body>
+</html>
+`;
 const CURATED_MANIFEST = {
   title: 'Curated Overlay',
   schema: {
@@ -102,6 +112,7 @@ test('renders the standalone editor shell', async ({ page }) => {
   await expect(applyButton).toBeDisabled();
   await expect(resetButton).toBeDisabled();
   await expect(page.locator('#preview-frame')).toHaveAttribute('sandbox', 'allow-same-origin');
+  await expect(page.getByRole('button', { name: '100%' })).toBeVisible();
 
   await htmlFileInput.setInputFiles({
     name: 'sample.html',
@@ -139,6 +150,41 @@ test('renders the standalone editor shell', async ({ page }) => {
   await expect(applyButton).toBeDisabled();
   await expect(resetButton).toBeDisabled();
   await expect(page.locator('#status-output')).toContainText('Manifest loaded. Click a preview element to edit it.');
+});
+
+test('supports preview scrolling and zoom for large imported pages', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'large.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(LARGE_CANVAS_HTML),
+  });
+
+  const previewViewport = page.locator('#preview-viewport');
+  const previewStage = page.locator('#preview-stage');
+
+  await expect(previewViewport).toBeVisible();
+  await expect(previewStage).toHaveCSS('width', '2200px');
+  await expect(previewStage).toHaveCSS('height', '1800px');
+
+  const overflowMetrics = await previewViewport.evaluate((element) => ({
+    scrollWidth: element.scrollWidth,
+    clientWidth: element.clientWidth,
+    scrollHeight: element.scrollHeight,
+    clientHeight: element.clientHeight,
+  }));
+
+  expect(overflowMetrics.scrollWidth).toBeGreaterThan(overflowMetrics.clientWidth);
+  expect(overflowMetrics.scrollHeight).toBeGreaterThan(overflowMetrics.clientHeight);
+
+  await page.getByRole('button', { name: 'Zoom Out' }).click();
+  await expect(page.getByRole('button', { name: '90%' })).toBeVisible();
+  await expect(previewStage).toHaveCSS('width', '1980px');
+
+  await page.getByRole('button', { name: 'Zoom In' }).click();
+  await expect(page.getByRole('button', { name: '100%' })).toBeVisible();
+  await expect(previewStage).toHaveCSS('width', '2200px');
 });
 
 test('selects an element and shows inspector sections', async ({ page }) => {

@@ -77,13 +77,25 @@
             <p class="canvas-kicker">Preview Surface</p>
             <h2 id="canvas-heading">Preview canvas</h2>
           </div>
-          <iframe
-            id="preview-frame"
-            class="preview-frame"
-            sandbox="allow-same-origin"
-            title="Preview canvas"
-            srcdoc="<p class='preview-empty'>Preview not loaded yet.</p>"
-          ></iframe>
+          <div class="canvas-toolbar" aria-label="Preview zoom controls">
+            <span class="canvas-toolbar-label">Zoom</span>
+            <div class="button-row button-row-compact canvas-toolbar-actions">
+              <button id="zoom-out-button" type="button">Zoom Out</button>
+              <button id="zoom-reset-button" type="button">100%</button>
+              <button id="zoom-in-button" type="button">Zoom In</button>
+            </div>
+          </div>
+          <div id="preview-viewport" class="preview-viewport">
+            <div id="preview-stage" class="preview-stage">
+              <iframe
+                id="preview-frame"
+                class="preview-frame"
+                sandbox="allow-same-origin"
+                title="Preview canvas"
+                srcdoc="<p class='preview-empty'>Preview not loaded yet.</p>"
+              ></iframe>
+            </div>
+          </div>
         </section>
       </main>
     </div>
