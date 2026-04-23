@@ -47,8 +47,11 @@ const ADVANCED_STYLE_FIELDS = [
   { name: 'border-radius', label: 'Border radius' },
   { name: 'opacity', label: 'Opacity' },
   { name: 'font-size', label: 'Font size' },
+  { name: 'font-family', label: 'Font family' },
+  { name: 'font-weight', label: 'Font weight' },
   { name: 'line-height', label: 'Line height' },
   { name: 'letter-spacing', label: 'Letter spacing' },
+  { name: 'text-align', label: 'Text align' },
 ];
 const ADVANCED_STYLE_NAMES = new Set(ADVANCED_STYLE_FIELDS.map((field) => field.name));
 
@@ -163,6 +166,45 @@ function formatStyleValue(value, emptyFallback) {
   }
 
   return { value, muted: false };
+}
+
+function toCamelCaseStyleName(name) {
+  return name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+function getComputedStyleValue(view, element, name) {
+  if (!view?.getComputedStyle || !element) {
+    return '';
+  }
+
+  const style = view.getComputedStyle(element);
+
+  if (!style) {
+    return '';
+  }
+
+  const propertyValue = style.getPropertyValue?.(name);
+
+  if (typeof propertyValue === 'string' && propertyValue.trim()) {
+    return propertyValue.trim();
+  }
+
+  const camelCaseName = toCamelCaseStyleName(name);
+  const fallbackValue = style[camelCaseName];
+
+  return typeof fallbackValue === 'string' ? fallbackValue.trim() : '';
+}
+
+function createInlineStylePlaceholder(label, inlineValue, computedValue) {
+  if (inlineValue) {
+    return inlineValue;
+  }
+
+  if (computedValue) {
+    return `Current: ${computedValue}`;
+  }
+
+  return `${label} inline style is not set.`;
 }
 
 function formatSpacing(inlineStyle) {
@@ -382,11 +424,10 @@ function deriveAttributeFields(attributes) {
   });
 }
 
-function deriveAdvancedFields(element, inlineStyle) {
-  void element;
-
+function deriveAdvancedFields(element, inlineStyle, computedStyleValues) {
   return ADVANCED_STYLE_FIELDS.map((field) => {
     const value = inlineStyle.get(field.name) || '';
+    const computedValue = computedStyleValues.get(field.name) || '';
 
     return createField({
       key: `style:${field.name}`,
@@ -394,7 +435,7 @@ function deriveAdvancedFields(element, inlineStyle) {
       value,
       muted: !value,
       editable: true,
-      placeholder: `${field.label} inline style is not set.`,
+      placeholder: createInlineStylePlaceholder(field.label, value, computedValue),
     });
   });
 }
@@ -493,15 +534,16 @@ export function deriveInspectorModel(element, view = element?.ownerDocument?.def
   const tagName = getTagName(element);
   const attributes = collectRawAttributes(element);
   const inlineStyle = parseInlineStyle(element);
-
-  void view;
+  const computedStyleValues = new Map(
+    ADVANCED_STYLE_FIELDS.map((field) => [field.name, getComputedStyleValue(view, element, field.name)]),
+  );
 
   const sections = {
     content: deriveContentFields(element, tagName),
     layout: deriveLayoutFields(element, tagName, inlineStyle),
     style: deriveStyleFields(element, tagName, inlineStyle),
     attributes: deriveAttributeFields(attributes),
-    advanced: deriveAdvancedFields(element, inlineStyle),
+    advanced: deriveAdvancedFields(element, inlineStyle, computedStyleValues),
   };
 
   return {

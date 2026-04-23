@@ -153,6 +153,13 @@ function createViewStub(style) {
         visibility: '',
         color: '',
         backgroundColor: '',
+        opacity: '',
+        fontSize: '',
+        fontFamily: '',
+        fontWeight: '',
+        textAlign: '',
+        lineHeight: '',
+        letterSpacing: '',
         marginTop: '',
         marginRight: '',
         marginBottom: '',
@@ -218,7 +225,7 @@ test('deriveInspectorModel derives common fields for text-like elements', () => 
   );
   assert.deepEqual(
     model.sections.advanced.map((field) => field.label),
-    ['Margin', 'Padding', 'Border', 'Border radius', 'Opacity', 'Font size', 'Line height', 'Letter spacing'],
+    ['Margin', 'Padding', 'Border', 'Border radius', 'Opacity', 'Font size', 'Font family', 'Font weight', 'Line height', 'Letter spacing', 'Text align'],
   );
   assert.equal(model.sections.advanced[0].editable, true);
 });
@@ -304,6 +311,33 @@ test('deriveInspectorModel exposes text editing for plain-text div containers', 
   assert.equal(model.sections.content[0].value, '明宫残卷');
 });
 
+test('deriveInspectorModel surfaces computed advanced style values as placeholders when inline values are absent', () => {
+  const element = createElementStub({
+    tagName: 'div',
+    className: 'start-subtitle',
+    textContent: '明宫残卷',
+    attributes: [
+      { name: 'class', value: 'start-subtitle' },
+    ],
+  });
+  const model = deriveInspectorModel(element, createViewStub({
+    opacity: '0.85',
+    fontSize: '14px',
+    fontFamily: 'KaiTi, serif',
+    fontWeight: '700',
+    lineHeight: '1.6',
+    letterSpacing: '0.18em',
+    textAlign: 'center',
+  }));
+
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:font-size')?.value, '');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:font-size')?.placeholder, 'Current: 14px');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:opacity')?.placeholder, 'Current: 0.85');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:font-family')?.placeholder, 'Current: KaiTi, serif');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:font-weight')?.placeholder, 'Current: 700');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:text-align')?.placeholder, 'Current: center');
+});
+
 test('deriveInspectorModel excludes internal and common attributes while exposing safe editable attribute and advanced style fields', () => {
   const element = createElementStub({
     tagName: 'a',
@@ -344,10 +378,17 @@ test('deriveInspectorModel excludes internal and common attributes while exposin
       ['style:border-radius', '24px'],
       ['style:opacity', ''],
       ['style:font-size', '2rem'],
+      ['style:font-family', ''],
+      ['style:font-weight', ''],
       ['style:line-height', '1.2'],
       ['style:letter-spacing', ''],
+      ['style:text-align', ''],
     ],
   );
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:opacity')?.placeholder, 'Opacity inline style is not set.');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:font-family')?.placeholder, 'Font family inline style is not set.');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:font-weight')?.placeholder, 'Font weight inline style is not set.');
+  assert.equal(model.sections.advanced.find((field) => field.key === 'style:text-align')?.placeholder, 'Text align inline style is not set.');
 });
 
 test('applyInspectorValues writes editable fields and removes cleared attributes/styles', () => {
@@ -448,8 +489,11 @@ test('applyInspectorValues applies editable attribute and advanced style fields 
     'style:border-radius': '',
     'style:opacity': '0.95',
     'style:font-size': '2rem',
+    'style:font-family': 'KaiTi, serif',
+    'style:font-weight': '700',
     'style:line-height': '1.4',
     'style:letter-spacing': '0.08em',
+    'style:text-align': 'center',
   });
 
   assert.equal(element.getAttribute('id'), 'shell-updated');
@@ -463,8 +507,11 @@ test('applyInspectorValues applies editable attribute and advanced style fields 
   assert.equal(element.style.getPropertyValue('border-radius'), '');
   assert.equal(element.style.getPropertyValue('opacity'), '0.95');
   assert.equal(element.style.getPropertyValue('font-size'), '2rem');
+  assert.equal(element.style.getPropertyValue('font-family'), 'KaiTi, serif');
+  assert.equal(element.style.getPropertyValue('font-weight'), '700');
   assert.equal(element.style.getPropertyValue('line-height'), '1.4');
   assert.equal(element.style.getPropertyValue('letter-spacing'), '0.08em');
+  assert.equal(element.style.getPropertyValue('text-align'), 'center');
 });
 
 test('applyInspectorValues updates plain-text div containers through the shared text field', () => {

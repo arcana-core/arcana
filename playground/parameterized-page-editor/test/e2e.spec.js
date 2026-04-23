@@ -6,6 +6,19 @@ const HERO_HTML = '<!doctype html><html lang="en"><body><section class="hero"><h
 const INSPECTOR_HTML = `
 <!doctype html>
 <html lang="en">
+  <head>
+    <style>
+      .start-subtitle {
+        font-size: 14px;
+        opacity: 0.85;
+        font-family: Georgia, serif;
+        font-weight: 700;
+        text-align: center;
+        line-height: 1.6;
+        letter-spacing: 0.18em;
+      }
+    </style>
+  </head>
   <body>
     <section class="hero" style="background-color: rgb(250, 240, 230); margin: 12px; padding: 8px;">
       <h1 class="hero-title">Arcana Editor</h1>
@@ -244,6 +257,7 @@ test('derives container fields', async ({ page }) => {
 test('derives editable text for plain-text div containers', async ({ page }) => {
   await page.goto(server.url + '/index.html');
   const contentSection = page.locator('#panel-root details[data-section-key="content"][open]');
+  const advancedSection = page.locator('#panel-root details[data-section-key="advanced"]');
 
   await page.getByLabel('HTML file').setInputFiles({
     name: 'inspector.html',
@@ -255,6 +269,10 @@ test('derives editable text for plain-text div containers', async ({ page }) => 
 
   await expect(page.locator('#status-output')).toContainText('Selected: div.start-subtitle');
   await expect(contentSection.locator('[data-field-key="text"]')).toHaveValue('明宫残卷');
+  await advancedSection.locator('summary').click();
+  await expect(advancedSection.locator('[data-field-key="style:font-size"]')).toHaveAttribute('placeholder', 'Current: 14px');
+  await expect(advancedSection.locator('[data-field-key="style:opacity"]')).toHaveAttribute('placeholder', 'Current: 0.85');
+  await expect(advancedSection.locator('[data-field-key="style:font-family"]')).toHaveAttribute('placeholder', 'Current: Georgia, serif');
 });
 
 test('surfaces manifest errors after selection', async ({ page }) => {
@@ -394,19 +412,27 @@ test('expands advanced editing, applies advanced and attribute fields, and reset
 
   await attributesSection.locator('[data-field-key="attr:title"]').fill('Launch title');
   await advancedSection.locator('[data-field-key="style:font-size"]').fill('3rem');
+  await advancedSection.locator('[data-field-key="style:font-family"]').fill('KaiTi, serif');
+  await advancedSection.locator('[data-field-key="style:opacity"]').fill('0.92');
   await page.getByRole('button', { name: 'Apply' }).click();
 
   await expect(previewTitle).toHaveAttribute('title', 'Launch title');
   await expect(previewTitle).toHaveCSS('font-size', '48px');
+  await expect(previewTitle).toHaveCSS('opacity', '0.92');
+  await expect(previewTitle).toHaveAttribute('style', /font-family:\s*KaiTi,\s*serif/i);
   await expect(attributesSection.locator('[data-field-key="attr:title"]')).toHaveValue('Launch title');
   await expect(advancedSection.locator('[data-field-key="style:font-size"]')).toHaveValue('3rem');
+  await expect(advancedSection.locator('[data-field-key="style:font-family"]')).toHaveValue('KaiTi, serif');
+  await expect(advancedSection.locator('[data-field-key="style:opacity"]')).toHaveValue('0.92');
 
   await attributesSection.locator('[data-field-key="attr:title"]').fill('Unsaved title');
   await advancedSection.locator('[data-field-key="style:font-size"]').fill('1.5rem');
+  await advancedSection.locator('[data-field-key="style:font-family"]').fill('FangSong, serif');
   await page.getByRole('button', { name: 'Reset' }).click();
 
   await expect(attributesSection.locator('[data-field-key="attr:title"]')).toHaveValue('Launch title');
   await expect(advancedSection.locator('[data-field-key="style:font-size"]')).toHaveValue('3rem');
+  await expect(advancedSection.locator('[data-field-key="style:font-family"]')).toHaveValue('KaiTi, serif');
 });
 
 test('keeps html-only editing working when no manifest is loaded', async ({ page }) => {
