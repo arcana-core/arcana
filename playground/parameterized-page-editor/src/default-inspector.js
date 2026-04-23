@@ -133,6 +133,26 @@ function isTextLikeElement(tagName) {
   return TEXT_LIKE_TAGS.has(tagName);
 }
 
+function hasElementChildren(element) {
+  if (typeof element.childElementCount === 'number') {
+    return element.childElementCount > 0;
+  }
+
+  if (element.children && typeof element.children.length === 'number') {
+    return element.children.length > 0;
+  }
+
+  return false;
+}
+
+function isPlainTextContainer(element, tagName) {
+  if (isLinkElement(tagName) || isImageElement(tagName) || isTextLikeElement(tagName)) {
+    return false;
+  }
+
+  return !hasElementChildren(element);
+}
+
 function formatStyleValue(value, emptyFallback) {
   if (!value) {
     return { value: emptyFallback, muted: true };
@@ -229,6 +249,11 @@ function deriveContentFields(element, tagName) {
   }
 
   if (isTextLikeElement(tagName)) {
+    const text = getTextContent(element);
+    return [createEditableTextField('text', 'Text', text, 'No text content detected.', 'textarea')];
+  }
+
+  if (isPlainTextContainer(element, tagName)) {
     const text = getTextContent(element);
     return [createEditableTextField('text', 'Text', text, 'No text content detected.', 'textarea')];
   }
@@ -492,7 +517,7 @@ export function applyInspectorValues(element, values) {
   const tagName = getTagName(element);
   const errors = [];
 
-  if (typeof values.text === 'string' && (isLinkElement(tagName) || isTextLikeElement(tagName))) {
+  if (typeof values.text === 'string' && (isLinkElement(tagName) || isTextLikeElement(tagName) || isPlainTextContainer(element, tagName))) {
     setTextContent(element, values.text);
   }
 

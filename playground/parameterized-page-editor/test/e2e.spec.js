@@ -11,6 +11,7 @@ const INSPECTOR_HTML = `
       <h1 class="hero-title">Arcana Editor</h1>
       <a class="hero-link" href="/pricing" target="_blank">See pricing</a>
       <img class="hero-image" src="/hero.png" alt="Hero image" width="640" height="360">
+      <div class="start-subtitle">明宫残卷</div>
       <div class="hero-shell"><span>Nested content</span></div>
     </section>
   </body>
@@ -240,6 +241,22 @@ test('derives container fields', async ({ page }) => {
   await expect(styleSection).not.toContainText('Alt');
 });
 
+test('derives editable text for plain-text div containers', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+  const contentSection = page.locator('#panel-root details[data-section-key="content"][open]');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('div.start-subtitle').click();
+
+  await expect(page.locator('#status-output')).toContainText('Selected: div.start-subtitle');
+  await expect(contentSection.locator('[data-field-key="text"]')).toHaveValue('明宫残卷');
+});
+
 test('surfaces manifest errors after selection', async ({ page }) => {
   await page.goto(server.url + '/index.html');
 
@@ -333,6 +350,22 @@ test('applies link href, image alt, and class name edits directly to the preview
   await page.locator('[data-field-key="classNames"]').fill('hero-shell shell-updated');
   await page.getByRole('button', { name: 'Apply' }).click();
   await expect(page.frameLocator('#preview-frame').locator('div.hero-shell')).toHaveAttribute('class', 'hero-shell shell-updated');
+});
+
+test('applies text edits to plain-text div containers', async ({ page }) => {
+  await page.goto(server.url + '/index.html');
+
+  await page.getByLabel('HTML file').setInputFiles({
+    name: 'inspector.html',
+    mimeType: 'text/html',
+    buffer: Buffer.from(INSPECTOR_HTML),
+  });
+
+  await page.frameLocator('#preview-frame').locator('div.start-subtitle').click();
+  await page.locator('[data-field-key="text"]').fill('紫禁疑云');
+  await page.getByRole('button', { name: 'Apply' }).click();
+
+  await expect(page.frameLocator('#preview-frame').locator('div.start-subtitle')).toHaveText('紫禁疑云');
 });
 
 test('expands advanced editing, applies advanced and attribute fields, and reset reloads live dom values', async ({ page }) => {

@@ -12,6 +12,7 @@ function createElementStub({
   className = '',
   id = '',
   attributes = [],
+  childElementCount = 0,
 }) {
   const attributeMap = new Map(attributes.map((attribute) => [attribute.name, attribute.value]));
   const styleMap = new Map();
@@ -21,8 +22,12 @@ function createElementStub({
     textContent,
     className,
     id,
+    childElementCount,
     get classList() {
       return element.className.split(/\s+/).filter(Boolean);
+    },
+    get children() {
+      return { length: childElementCount };
     },
     get attributes() {
       return Array.from(attributeMap.entries()).map(([name, value]) => ({ name, value }));
@@ -268,6 +273,7 @@ test('deriveInspectorModel derives generic container fields without invented con
     tagName: 'div',
     className: 'hero-shell',
     id: 'shell',
+    childElementCount: 1,
     attributes: [
       { name: 'id', value: 'shell' },
       { name: 'class', value: 'hero-shell' },
@@ -280,6 +286,22 @@ test('deriveInspectorModel derives generic container fields without invented con
   assert.deepEqual(sectionLabels(model, 'layout'), ['Display', 'Visibility', 'Spacing']);
   assert.deepEqual(sectionLabels(model, 'style'), ['Background', 'Inline style', 'Class names']);
   assert.equal(model.sections.attributes[0].label, 'Id');
+});
+
+test('deriveInspectorModel exposes text editing for plain-text div containers', () => {
+  const element = createElementStub({
+    tagName: 'div',
+    className: 'start-subtitle',
+    textContent: '明宫残卷',
+    attributes: [
+      { name: 'class', value: 'start-subtitle' },
+    ],
+  });
+  const model = deriveInspectorModel(element, createViewStub({}));
+
+  assert.deepEqual(sectionLabels(model, 'content'), ['Text']);
+  assert.equal(model.sections.content[0].editable, true);
+  assert.equal(model.sections.content[0].value, '明宫残卷');
 });
 
 test('deriveInspectorModel excludes internal and common attributes while exposing safe editable attribute and advanced style fields', () => {
@@ -443,6 +465,23 @@ test('applyInspectorValues applies editable attribute and advanced style fields 
   assert.equal(element.style.getPropertyValue('font-size'), '2rem');
   assert.equal(element.style.getPropertyValue('line-height'), '1.4');
   assert.equal(element.style.getPropertyValue('letter-spacing'), '0.08em');
+});
+
+test('applyInspectorValues updates plain-text div containers through the shared text field', () => {
+  const element = createElementStub({
+    tagName: 'div',
+    className: 'start-subtitle',
+    textContent: '明宫残卷',
+    attributes: [
+      { name: 'class', value: 'start-subtitle' },
+    ],
+  });
+
+  applyInspectorValues(element, {
+    text: '紫禁疑云',
+  });
+
+  assert.equal(element.textContent, '紫禁疑云');
 });
 
 test('deriveCuratedInspectorModel only returns matching supported fields ordered by manifest ui.order', () => {
