@@ -9,6 +9,9 @@ const macConfig = {
   gatekeeperAssess: false,
   entitlements: 'entitlements.mac.plist',
   entitlementsInherit: 'entitlements.mac.inherit.plist',
+  extraResources: [
+    { from: '../../cutpilot-client/desktop/resources/bin', to: 'bin' },
+  ],
 };
 
 if (!enableCodeSign) {
