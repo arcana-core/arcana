@@ -5,6 +5,7 @@ import { ensureDir, nowMs } from './util.js';
 import { readEventsSince } from './event-store.js';
 import { getState, patchState } from './state-store.js';
 import { runArcanaTask } from '../cron/arcana-task.js';
+import { normalizeChatAttachments } from './chat-attachments.js';
 
 function buildLogPath(agentId, sessionKey){
   const base = arcanaHomePath('gateway-v2', 'logs');
@@ -26,18 +27,62 @@ async function loadNewEvents({ agentId, sessionKey }){
   return { state, lastSeenTs, events };
 }
 
-function selectLatestMessageEvent(events){
-  const messageEvents = events.filter((e) => e && e.type === 'message');
-  if (!messageEvents.length) return { messageEvents, replyToEventId: null };
+function sortMessageEvents(events){
+  return events.slice().sort((a, b) => {
+    const ta = Number(a && a.tsMs || 0);
+    const tb = Number(b && b.tsMs || 0);
+    if (ta !== tb) return ta - tb;
+    const ea = String(a && a.eventId || '');
+    const eb = String(b && b.eventId || '');
+    return ea.localeCompare(eb);
+  });
+}
 
-  let latest = messageEvents[0];
-  for (const ev of messageEvents){
-    const t = Number(ev && ev.tsMs || 0);
-    const cur = Number(latest && latest.tsMs || 0);
-    if (t > cur) latest = ev;
+function renderMergedUserText(messageEvents){
+  const sorted = sortMessageEvents(Array.isArray(messageEvents) ? messageEvents : []);
+  const texts = sorted
+    .map((event) => {
+      const text = event && event.data && event.data.text != null ? String(event.data.text) : '';
+      return text.trim();
+    })
+    .filter(Boolean);
+
+  if (!texts.length) return '';
+  if (texts.length === 1) return texts[0];
+  return texts.join('\n\n[Follow-up]\n');
+}
+
+function selectPendingMessageBatch(events){
+  const messageEvents = events.filter((e) => e && e.type === 'message');
+  if (!messageEvents.length) {
+    return {
+      messageEvents: [],
+      latestMessageEvent: null,
+      mergedText: '',
+      mergedAttachments: [],
+      replyToEventId: null,
+      processedThroughTs: 0,
+    };
   }
+
+  const sorted = sortMessageEvents(messageEvents);
+  const latest = sorted[sorted.length - 1];
+  const mergedAttachments = sorted.flatMap((event) => normalizeChatAttachments(event && event.data && event.data.attachments));
+  const latestTs = Number(latest && latest.tsMs || 0) || 0;
+  const processedThroughTs = events.reduce((acc, ev) => {
+    const ts = Number(ev && ev.tsMs || 0);
+    if (ts > latestTs) return acc;
+    return ts > acc ? ts : acc;
+  }, 0);
   const replyToEventId = latest && latest.eventId ? String(latest.eventId || '') : null;
-  return { messageEvents, replyToEventId };
+  return {
+    messageEvents: sorted,
+    latestMessageEvent: latest,
+    mergedText: renderMergedUserText(sorted),
+    mergedAttachments,
+    replyToEventId,
+    processedThroughTs,
+  };
 }
 
 function computeNextLastSeenTs(events, lastSeenTs){
@@ -58,6 +103,19 @@ function computeBackoffMs(errorCount){
   const delta = (Math.random() * 2 * jitter) - jitter;
   const v = Math.max(0, Math.round(raw + delta));
   return v;
+}
+
+function normalizeErrorMessage(value){
+  try {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (value && typeof value.message === 'string' && value.message.trim()) return value.message.trim();
+    if (value && typeof value.code === 'string' && value.code.trim()) return value.code.trim();
+    if (value != null) {
+      const s = String(value).trim();
+      if (s) return s;
+    }
+  } catch {}
+  return 'arcana_task_failed';
 }
 
 async function updateReactorState({ agentId, sessionKey, state, lastSeenTs, sessionId }){
@@ -101,42 +159,64 @@ export const reactorRunner = {
         expectedVersion: state.version,
         mutator: (value) => ({ ...(value || {}), lastSeenTs: nextTs }),
       });
-      return { ok: true, ran: false, lastSeenTs: nextTs, outputs: [], nextWakeDelayMs: null };
+      return { ok: true, completed: true, ran: false, lastSeenTs: nextTs, outputs: [], nextWakeDelayMs: null };
     }
 
-    const { messageEvents, replyToEventId } = selectLatestMessageEvent(events);
+    const {
+      messageEvents,
+      latestMessageEvent,
+      mergedText,
+      mergedAttachments,
+      replyToEventId,
+      processedThroughTs,
+    } = selectPendingMessageBatch(events);
     const newLastSeenTs = computeNextLastSeenTs(events, lastSeenTs);
 
-    if (!messageEvents.length){
+    if (!latestMessageEvent){
       await updateReactorState({ agentId, sessionKey, state, lastSeenTs: newLastSeenTs, sessionId: null });
-      return { ok: true, ran: false, lastSeenTs: newLastSeenTs, outputs: [], nextWakeDelayMs: null };
+      return { ok: true, completed: true, ran: false, lastSeenTs: newLastSeenTs, outputs: [], nextWakeDelayMs: null };
     }
 
-    // Use the most recent message's policy (open|restricted) when available
+    // Use the most recent message's policy (open|restricted) when available.
     let execPolicy = undefined;
     try {
-      const lastMsg = messageEvents[messageEvents.length - 1];
-      const rawPol = lastMsg && lastMsg.data && lastMsg.data.policy ? String(lastMsg.data.policy) : '';
+      const rawPol = latestMessageEvent && latestMessageEvent.data && latestMessageEvent.data.policy ? String(latestMessageEvent.data.policy) : '';
       const p = rawPol.trim().toLowerCase();
       if (p === 'open' || p === 'restricted') execPolicy = p;
     } catch {}
 
-    const userText = messageEvents
-      .map((e) => {
-        const d = e && e.data;
-        const t = d && d.text;
-        return t ? String(t) : '';
-      })
-      .filter((t) => t)
-      .join('\n');
+    const attachments = normalizeChatAttachments(mergedAttachments);
+    const userText = String(mergedText || '').trim() || (attachments.length ? 'See attached image.' : '');
 
     if (!userText){
-      await updateReactorState({ agentId, sessionKey, state, lastSeenTs: newLastSeenTs, sessionId: null });
-      return { ok: true, ran: false, lastSeenTs: newLastSeenTs, outputs: [], nextWakeDelayMs: null };
+      const nextSeenTs = processedThroughTs > 0 ? processedThroughTs : newLastSeenTs;
+      await updateReactorState({ agentId, sessionKey, state, lastSeenTs: nextSeenTs, sessionId: null });
+      return { ok: true, completed: true, ran: false, lastSeenTs: nextSeenTs, outputs: [], nextWakeDelayMs: null };
     }
 
     const logPath = buildLogPath(agentId, sessionKey);
     await ensureDir(dirname(logPath));
+    const messageEventId = latestMessageEvent && latestMessageEvent.eventId ? String(latestMessageEvent.eventId || '') : '';
+    const retryingSameEvent = !!(
+      messageEventId
+      && state
+      && state.value
+      && typeof state.value.activeEventId === 'string'
+      && String(state.value.activeEventId || '') === messageEventId
+    );
+
+    try {
+      await patchState({
+        agentId,
+        sessionKey,
+        scope: 'reactor',
+        expectedVersion: state.version,
+        mutator: (value) => ({
+          ...(value || {}),
+          activeEventId: messageEventId || null,
+        }),
+      });
+    } catch {}
 
     const result = await runArcanaTask({
       prompt: userText,
@@ -145,15 +225,27 @@ export const reactorRunner = {
       logPath,
       agentId,
       execPolicy,
+      retryingEventId: retryingSameEvent ? messageEventId : '',
+      attachments,
     });
 
     const sessionId = result && result.sessionId;
     const assistantText = result && result.assistantText ? String(result.assistantText || '') : '';
 
-    // Decide whether to advance lastSeenTs based on run result
+    // Only consume the inbox message when we actually produced a visible assistant result.
+    // For `ok + no output`, keep the merged batch pending so wake-agent retries the same turn.
     const ranOk = !!(result && result.ok);
-    const advanceLastSeen = ranOk; // do NOT advance on error
-    const nextLastSeenTs = advanceLastSeen ? newLastSeenTs : lastSeenTs;
+    const hasAssistantOutput = !!assistantText;
+    const advanceLastSeen = ranOk && hasAssistantOutput; // do NOT advance on error or no-output recovery turns
+    const consumeThroughTs = processedThroughTs > 0
+      ? processedThroughTs
+      : (
+        messageEvents.reduce((acc, event) => {
+          const ts = Number(event && event.tsMs || 0);
+          return ts > acc ? ts : acc;
+        }, 0) || lastSeenTs
+      );
+    const nextLastSeenTs = advanceLastSeen ? consumeThroughTs : lastSeenTs;
 
     // Persist reactor state with error tracking and lastSeenTs/sessionId
     const prevErrorCount = Number(state && state.value && state.value.errorCount || 0) || 0;
@@ -169,6 +261,7 @@ export const reactorRunner = {
           ...(value || {}),
           lastSeenTs: nextLastSeenTs,
           sessionId: sessionId != null ? sessionId : ((value && value.sessionId) || null),
+          activeEventId: advanceLastSeen ? null : (messageEventId || ((value && value.activeEventId) || null)),
           lastRunAtMs: now,
           errorCount: newErrorCount,
           lastErrorAtMs: ranOk ? null : now,
@@ -197,13 +290,17 @@ export const reactorRunner = {
 
     return {
       ok: ranOk,
+      completed: !!(result && result.completed),
+      aborted: !!(result && result.aborted),
       ran: true,
       lastSeenTs: nextLastSeenTs,
+      processedThroughTs: consumeThroughTs,
       sessionId: sessionId || null,
       outputs,
       nextWakeDelayMs,
       // Pass-through error fields if present so engine can log/broadcast
       error: result && typeof result.error !== 'undefined' ? result.error : undefined,
+      errorMessage: ranOk ? '' : normalizeErrorMessage(result && (result.errorMessage || result.error)),
       errorStack: result && typeof result.errorStack === 'string' ? result.errorStack : undefined,
     };
   },

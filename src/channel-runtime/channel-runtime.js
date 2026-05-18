@@ -129,6 +129,7 @@ export class ChannelRuntime {
     // Hook points
     this.onLocalReply = typeof opts.onLocalReply === "function" ? opts.onLocalReply : async () => {};
     this.onExecuteTurn = typeof opts.onExecuteTurn === "function" ? opts.onExecuteTurn : null;
+    this.onExecuteTurnError = typeof opts.onExecuteTurnError === "function" ? opts.onExecuteTurnError : async () => {};
     this.onExecuteSteer = typeof opts.onExecuteSteer === "function" ? opts.onExecuteSteer : async () => {};
     this.onExecuteAbort = typeof opts.onExecuteAbort === "function" ? opts.onExecuteAbort : async () => {};
     this.log = typeof opts.log === "function" ? opts.log : () => {};
@@ -211,6 +212,25 @@ export class ChannelRuntime {
     const picked = st.steerTarget || null;
     st.steerTarget = null;
     return picked || defaultMsg;
+  }
+
+  async _handleTurnError(msg, prompt, batch, error) {
+    this.log("turn_failed", {
+      channel: this.channel,
+      sessionId: msg?.sessionId || "",
+      messageId: msg?.messageId || "",
+      err: error?.message || String(error),
+    });
+    try {
+      await this.onExecuteTurnError(msg, prompt, batch, error);
+    } catch (hookErr) {
+      this.log("turn_error_hook_failed", {
+        channel: this.channel,
+        sessionId: msg?.sessionId || "",
+        messageId: msg?.messageId || "",
+        err: hookErr?.message || String(hookErr),
+      });
+    }
   }
 
   _startDrain(sessionId) {
@@ -303,7 +323,11 @@ export class ChannelRuntime {
       const buffered = st.buffer.slice(0);
       st.buffer = [];
       const prompt = this.buildPromptEnvelope({ msg: m0, bufferedLines: buffered, batch: [m0] });
-      await this.onExecuteTurn(m0, prompt, [m0]);
+      try {
+        await this.onExecuteTurn(m0, prompt, [m0]);
+      } catch (err) {
+        await this._handleTurnError(m0, prompt, [m0], err);
+      }
       return { action: "ran" };
     }
 
@@ -328,7 +352,11 @@ export class ChannelRuntime {
       st.buffer = [];
 
       const prompt = this.buildPromptEnvelope({ msg: last, bufferedLines: buffered, batch });
-      await this.onExecuteTurn(last, prompt, batch);
+      try {
+        await this.onExecuteTurn(last, prompt, batch);
+      } catch (err) {
+        await this._handleTurnError(last, prompt, batch, err);
+      }
     }
   }
 }

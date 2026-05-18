@@ -2,10 +2,11 @@ import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import CodexRunner from "../subagents/codex-runner.js";
+import { getToolDisabledState as getDefaultToolDisabledState } from "../tool-permissions.js";
 import { resolveWorkspaceRoot, normalizeAllowedPaths } from "../workspace-guard.js";
 
 // Codex tool (external agent). Codex performs edits; Arcana never applies patches itself.
-export function createCodexSubagentTool() {
+export function createCodexSubagentTool(options = {}) {
   const Params = Type.Object({
     task: Type.String({ description: "Main instruction for Codex." }),
     plan: Type.Optional(
@@ -29,6 +30,9 @@ export function createCodexSubagentTool() {
   const CODEX_DETECT_TTL_MS = 60000;
   let hasLocalCodexCached = null;
   let hasLocalCodexCachedAt = 0;
+  const getToolDisabledState = typeof options.getToolDisabledState === "function"
+    ? options.getToolDisabledState
+    : getDefaultToolDisabledState;
 
   function hasLocalCodex() {
     const now = Date.now();
@@ -69,6 +73,22 @@ export function createCodexSubagentTool() {
     parameters: Params,
     async execute(_id, args) {
       const startedAt = Date.now();
+      const disabledState = getToolDisabledState("codex", {
+        agentHomeRoot: options.agentHomeRoot,
+      });
+      if (disabledState && disabledState.disabled) {
+        const text = disabledState.text || 'Tool "codex" is disabled.';
+        return {
+          content: [{ type: "text", text }],
+          details: {
+            ok: false,
+            error: disabledState.error || "tool_disabled",
+            reason: disabledState.reason || "disabled_by_agent_config",
+            tool: disabledState.toolName || "codex",
+          },
+        };
+      }
+
       const root = resolveWorkspaceRoot();
       const allowed = normalizeAllowedPaths(
         Array.isArray(args.allowedPaths) && args.allowedPaths.length

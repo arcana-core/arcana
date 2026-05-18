@@ -36,7 +36,7 @@ function truncateTail(content){
   return { content: out.join("\n"), truncated:true, truncatedBy, totalLines, totalBytes, outputLines: out.length, outputBytes: bytes, lastLinePartial };
 }
 
-export async function runBash({ command, timeoutSec }){
+export async function runBash({ command, timeoutSec, cwd }){
   const shell = process.env.SHELL || "bash";
   const isBashLike = /bash|zsh|fish|sh/.test(String(shell||""));
   const args = isBashLike ? ["-lc", command] : ["-c", command];
@@ -46,7 +46,7 @@ export async function runBash({ command, timeoutSec }){
   let timedOut = false;
 
   const child = spawn(shell, args, {
-    cwd: process.cwd(),
+    cwd: String(cwd || "").trim() || process.cwd(),
     env: process.env,
     stdio: ["ignore","pipe","pipe"],
     detached: true,
@@ -83,4 +83,3 @@ export async function runBash({ command, timeoutSec }){
 }
 
 export default { runBash };
-

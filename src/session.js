@@ -1,4 +1,4 @@
-import { createAgentSession, DefaultResourceLoader, createReadTool, createGrepTool, createFindTool, createLsTool, initTheme } from '@mariozechner/pi-coding-agent';
+import { createAgentSession, DefaultResourceLoader, createReadTool, createGrepTool, createFindTool, createLsTool, initTheme, formatSkillsForPrompt, parseFrontmatter } from '@mariozechner/pi-coding-agent';
 import { getModel } from '@mariozechner/pi-ai';
 import { loadArcanaPlugins } from './plugin-loader.js';
 import { startServicesOnce } from './services/manager.js';
@@ -16,7 +16,7 @@ import { join, dirname, extname, basename } from 'node:path';
 import { resolveArcanaHome, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, writeFileSync, promises as fsp } from 'node:fs';
-import { buildArcanaSkillsPrompt, loadArcanaSkills } from './skills.js';
+import { loadArcanaSkills } from './skills.js';
 import { loadSkillTools } from './skill-tools.js';
 import { ensureArcanaSkillsWatcher } from './skills-watch.js';
 import { emit, getContext } from './event-bus.js';
@@ -25,8 +25,24 @@ import { resolveAgentHomeRoot } from './agent-guard.js';
 import { buildAgentBootstrapContext } from './agent-bootstrap-context.js';
 import * as globPkg from 'glob';
 import { createSecretsContext } from './secrets/index.js';
+import { loadToolRouting, resolveToolRoute } from './tool-routing.js';
 
 const globSync = (...args) => (globPkg.globSync ?? globPkg.sync)(...args);
+const ARCANA_LOCAL_PROXY_DEBUG = (() => {
+  try {
+    const raw = String(process.env.ARCANA_LOCAL_PROXY_DEBUG || '').trim().toLowerCase();
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  } catch {
+    return false;
+  }
+})();
+
+function localProxyDebugLog(...args){
+  if (!ARCANA_LOCAL_PROXY_DEBUG) return;
+  try {
+    console.log('[arcana:session:local-proxy:debug]', ...args);
+  } catch {}
+}
 
 // pi-coding-agent exports a global `theme` Proxy used by multiple renderers (including
 // some headless/export utilities). In headless Arcana environments (gateway/whiteboard),
@@ -39,9 +55,290 @@ function ensurePiThemeInitialized(){
   try { initTheme(undefined, false); } catch {}
 }
 
+export function normalizeInjectedLocalToolDefinitions(input){
+  if (!Array.isArray(input)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of input){
+    if (!item || typeof item !== 'object') continue;
+    const name = String(item.name || '').trim();
+    if (!name) continue;
+    const normalizedKey = name.toLowerCase();
+    if (seen.has(normalizedKey)) continue;
+    seen.add(normalizedKey);
+    const description = typeof item.description === 'string' ? item.description.trim() : '';
+    const parameters = item.parameters && typeof item.parameters === 'object' ? item.parameters : null;
+    out.push({
+      name,
+      ...(description ? { description } : {}),
+      ...(parameters ? { parameters } : {}),
+    });
+  }
+  return out;
+}
+
+export function summarizeInjectedLocalToolDefinitionsForDebug(input){
+  const definitions = normalizeInjectedLocalToolDefinitions(input);
+  const parameterKeysByTool = {};
+  let describedCount = 0;
+  let parameterizedCount = 0;
+  for (const definition of definitions){
+    if (definition.description) describedCount += 1;
+    const keys = definition.parameters && typeof definition.parameters === 'object' && definition.parameters.properties && typeof definition.parameters.properties === 'object'
+      ? Object.keys(definition.parameters.properties).slice(0, 8)
+      : [];
+    if (keys.length) parameterizedCount += 1;
+    parameterKeysByTool[definition.name] = keys;
+  }
+  return {
+    count: definitions.length,
+    names: definitions.map((definition) => definition.name),
+    describedCount,
+    parameterizedCount,
+    parameterKeysByTool,
+  };
+}
+
+export function buildInjectedLocalToolsSystemPrompt(input){
+  const definitions = normalizeInjectedLocalToolDefinitions(input);
+  if (!definitions.length) return '';
+
+  const lines = [
+    'Client injected tools are available in this session.',
+    'Use them when they match the task instead of claiming the capability is unavailable.',
+    '',
+    'Injected tools:',
+  ];
+
+  for (const definition of definitions){
+    const description = definition.description || 'No description provided.';
+    lines.push(`- ${definition.name}: ${description}`);
+    const properties = definition.parameters && typeof definition.parameters === 'object' && definition.parameters.properties && typeof definition.parameters.properties === 'object'
+      ? Object.keys(definition.parameters.properties)
+      : [];
+    if (properties.length){
+      lines.push(`  Parameters: ${properties.join(', ')}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+export function normalizeLocalBootstrapFiles(input){
+  if (!Array.isArray(input)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of input){
+    if (!item || typeof item !== 'object') continue;
+    const name = String(item.name || '').trim();
+    const filePath = String(item.path || '').trim();
+    const content = typeof item.content === 'string' ? item.content : '';
+    if (!name || !filePath || !content) continue;
+    const key = `${name.toLowerCase()}::${filePath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const mtimeMs = Number(item.mtimeMs || 0);
+    out.push({
+      name,
+      path: filePath,
+      content,
+      ...(Number.isFinite(mtimeMs) && mtimeMs > 0 ? { mtimeMs } : {}),
+    });
+  }
+  return out;
+}
+
+function localSkillNameFromBootstrapFile(file){
+  try {
+    if (!file || typeof file !== 'object') return '';
+    const candidates = [file.path, file.name]
+      .map((value) => String(value || '').trim().split('\\').join('/'))
+      .filter(Boolean);
+    for (const candidate of candidates){
+      const normalized = candidate.replace(/^\/+/, '');
+      const match = normalized.match(/(?:^|\/)skills\/([^/]+)\/SKILL\.md$/i);
+      if (!match) continue;
+      const skill = String(match[1] || '').trim();
+      if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(skill)) return skill;
+    }
+  } catch {}
+  return '';
+}
+
+function localSkillDescriptionFromContent(content){
+  try {
+    const lines = String(content || '').split(/\r?\n/);
+    for (const line of lines){
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '---' || trimmed.startsWith('#')) continue;
+      return trimmed.slice(0, 240);
+    }
+  } catch {}
+  return '';
+}
+
+export function loadLocalBootstrapSkills({ files } = {}){
+  if (!Array.isArray(files) || !files.length) return [];
+  const byName = new Map();
+  for (const file of files){
+    const skill = localSkillNameFromBootstrapFile(file);
+    const content = typeof file?.content === 'string' ? file.content : '';
+    const filePath = String(file?.path || '').trim();
+    if (!skill || !content) continue;
+    if (!filePath.startsWith('/')) continue;
+    try {
+      const { frontmatter } = parseFrontmatter(content);
+      const fmName = String(frontmatter?.name || '').trim();
+      const name = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(fmName) ? fmName : skill;
+      const description = String(frontmatter?.description || '').trim() || localSkillDescriptionFromContent(content);
+      byName.set(name, {
+        name,
+        description,
+        filePath,
+        tools: [],
+        arcanaLocalClientSkill: true,
+      });
+    } catch {
+      byName.set(skill, {
+        name: skill,
+        description: localSkillDescriptionFromContent(content),
+        filePath,
+        tools: [],
+        arcanaLocalClientSkill: true,
+      });
+    }
+  }
+  return Array.from(byName.values());
+}
+
+function mergeSkillLists(...lists){
+  const byName = new Map();
+  for (const list of lists){
+    for (const skill of Array.isArray(list) ? list : []){
+      const name = String(skill && skill.name || '').trim();
+      if (!name) continue;
+      byName.set(name, { ...skill, name });
+    }
+  }
+  return Array.from(byName.values());
+}
+
+function buildSkillsPromptFromLoadedSkills(skills, cfg){
+  try {
+    let visible = Array.isArray(skills) ? skills : [];
+    try {
+      const disabledArr = cfg && cfg.skills && Array.isArray(cfg.skills.disabled) ? cfg.skills.disabled : [];
+      if (disabledArr && disabledArr.length){
+        const disabled = new Set(disabledArr.map((item) => String(item || '').trim()).filter(Boolean));
+        if (disabled.size) visible = visible.filter((skill) => !disabled.has(String(skill && skill.name || '').trim()));
+      }
+    } catch {}
+    const prompt = formatSkillsForPrompt(visible);
+    return prompt && prompt.trim().length > 0 ? prompt : '';
+  } catch {
+    return '';
+  }
+}
+
+export async function materializeLocalSkillBootstrapFiles(){
+  return [];
+}
+
+function normalizePortablePath(value){
+  return String(value || '').trim().split('\\').join('/').replace(/\/+$/, '');
+}
+
+function isAbsolutePortablePath(value){
+  const raw = String(value || '').trim();
+  return raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw);
+}
+
+function isClearlyServerOrVirtualPath(value){
+  const raw = String(value || '').trim();
+  return !raw || raw.startsWith('~') || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(raw);
+}
+
+function isUnderPortableRoot(pathValue, rootValue){
+  const target = normalizePortablePath(pathValue);
+  const root = normalizePortablePath(rootValue);
+  if (!target || !root) return false;
+  return target === root || target.startsWith(root + '/');
+}
+
+function pathArgumentForLocalRouting(toolName, args = {}){
+  const name = String(toolName || '').trim().toLowerCase();
+  const obj = args && typeof args === 'object' ? args : {};
+  if (name === 'read' || name === 'ls' || name === 'grep' || name === 'find' || name === 'apply_file_patch'){
+    return Object.prototype.hasOwnProperty.call(obj, 'path') ? obj.path : '.';
+  }
+  return undefined;
+}
+
+function shouldRoutePathToolToLocal({ toolName, args, clientReadableRoots } = {}){
+  const rawPath = pathArgumentForLocalRouting(toolName, args);
+  if (rawPath === undefined) return null;
+  const pathValue = String(rawPath || '').trim();
+  if (!pathValue || pathValue === '.') return true;
+  if (!isAbsolutePortablePath(pathValue)){
+    return !isClearlyServerOrVirtualPath(pathValue);
+  }
+  const roots = Array.isArray(clientReadableRoots) ? clientReadableRoots : [];
+  return roots.some((root) => isUnderPortableRoot(pathValue, root));
+}
+
+export function decideToolExecutionMode({ tool, route, args, clientReadableRoots, hasLocalToolProxyInvoke, enforceToolRouting } = {}){
+  const isInjectedLocalProxyTool = !!(tool && tool.arcanaInjectedLocalProxy === true);
+
+  if (isInjectedLocalProxyTool){
+    if (hasLocalToolProxyInvoke) return 'proxied_local';
+    return enforceToolRouting ? 'deny' : 'local_exec';
+  }
+
+  if (route && route.execution === 'local'){
+    const pathLocal = shouldRoutePathToolToLocal({
+      toolName: tool && tool.name,
+      args,
+      clientReadableRoots,
+    });
+    if (hasLocalToolProxyInvoke && pathLocal !== false) return 'proxied_local';
+    if (pathLocal === false) return 'local_exec';
+    if (enforceToolRouting){
+      if (route.fallback === 'deny') return 'deny';
+      if (route.fallback === 'queue') return 'queue_not_available';
+    }
+  }
+
+  return 'local_exec';
+}
+
+export function shouldEnableServerManagedBash({ execPolicy, injectedLocalToolDefinitions } = {}){
+  const hasInjectedLocalBash = Array.isArray(injectedLocalToolDefinitions)
+    && injectedLocalToolDefinitions.some((item) => String(item && item.name || '').trim().toLowerCase() === 'bash');
+  if (hasInjectedLocalBash) return false;
+  return String(execPolicy || '').trim().toLowerCase() === 'open';
+}
+
+function hasInjectedLocalBashTool(injectedLocalToolDefinitions){
+  return Array.isArray(injectedLocalToolDefinitions)
+    && injectedLocalToolDefinitions.some((item) => String(item && item.name || '').trim().toLowerCase() === 'bash');
+}
+
 function arcanaPkgRoot(){
   const here = fileURLToPath(new URL('.', import.meta.url)); // arcana/src/
   return join(here, '..'); // arcana/
+}
+
+export function resolveToolDaemonWorkspaceRoot({ toolDaemonWorkspaceRoot, pkgRoot } = {}){
+  const explicit = String(
+    toolDaemonWorkspaceRoot ||
+    process.env.ARCANA_TOOL_DAEMON_WORKSPACE_ROOT ||
+    process.env.ARCANA_TOOL_DAEMON_ROOT ||
+    '',
+  ).trim();
+  if (explicit) return explicit;
+  const pkg = String(pkgRoot || '').trim();
+  if (pkg) return pkg;
+  return process.cwd();
 }
 
 function readIfExists(p){ try{ if (existsSync(p)) return readFileSync(p, 'utf-8'); } catch{} return ''; }
@@ -77,6 +374,37 @@ function pickFallbackModel(provider){
 		};
 	}
 	return null;
+}
+
+function inferGenericModelInput(provider, id){
+  const providerNorm = String(provider || '').trim().toLowerCase();
+  const modelId = String(id || '').trim().toLowerCase();
+  if (!modelId) return ['text'];
+
+  const isMultimodalOpenAIFamily =
+    /^gpt-5([.-]|$)/.test(modelId) ||
+    /^gpt-4o([.-]|$)/.test(modelId) ||
+    /^gpt-4\.1([.-]|$)/.test(modelId) ||
+    /^chatgpt-4o([.-]|$)/.test(modelId) ||
+    modelId.includes('vision');
+
+  if (providerNorm === 'openai' || providerNorm === 'openai-compatible' || providerNorm === 'azure-openai-responses'){
+    return isMultimodalOpenAIFamily ? ['text', 'image'] : ['text'];
+  }
+
+  if (providerNorm === 'anthropic'){
+    return modelId.startsWith('claude') ? ['text', 'image'] : ['text'];
+  }
+
+  if (providerNorm === 'google' || providerNorm === 'google-gemini-cli' || providerNorm === 'google-vertex'){
+    return modelId.includes('gemini') ? ['text', 'image'] : ['text'];
+  }
+
+  if (providerNorm === 'xai'){
+    return modelId.startsWith('grok') ? ['text', 'image'] : ['text'];
+  }
+
+  return ['text'];
 }
 
 function normalizeOpenAIBase(base){
@@ -142,6 +470,53 @@ export async function createArcanaSession(opts={}){
   const bootstrapContextMode = String(opts.bootstrapContextMode || "").trim().toLowerCase();
   const workspaceRoot = opts.workspaceRoot || opts.cwd || process.cwd();
   const workspaceRootNormalized = String(workspaceRoot || '').split('\\').join('/');
+  const injectedLocalToolDefinitions = normalizeInjectedLocalToolDefinitions(opts && opts.localToolDefinitions);
+  const injectedLocalBootstrapFiles = normalizeLocalBootstrapFiles(opts && opts.localBootstrapFiles);
+  const injectedLocalToolsPrompt = buildInjectedLocalToolsSystemPrompt(injectedLocalToolDefinitions);
+  const injectedLocalToolsDebug = summarizeInjectedLocalToolDefinitionsForDebug(injectedLocalToolDefinitions);
+  const pkgRoot = arcanaPkgRoot();
+  const repoRoot = dirname(pkgRoot);
+  const toolRouting = loadToolRouting({
+    workspaceRoot,
+    // Default routing file lives in the Arcana repo root.
+    repoRoot: pkgRoot,
+    overrides: opts.toolRouting,
+  });
+  const localToolProxyInvoke = (opts && typeof opts.localToolProxyInvoke === 'function')
+    ? opts.localToolProxyInvoke
+    : null;
+  localProxyDebugLog('createArcanaSession local tool setup', {
+    agentId: String(opts && opts.agentId || '').trim() || null,
+    workspaceRoot: workspaceRootNormalized || null,
+    hasLocalToolProxyInvoke: !!localToolProxyInvoke,
+    injectedLocalTools: injectedLocalToolsDebug,
+  });
+  const enforceToolRouting = opts && opts.enforceToolRouting === true;
+  const normalizeToolAllowlist = (input) => {
+    if (!Array.isArray(input)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const item of input){
+      if (typeof item !== 'string') continue;
+      const normalized = item.trim().toLowerCase();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      out.push(normalized);
+    }
+    return out;
+  };
+  const normalizeToolName = (name) => String(name || '').trim().toLowerCase();
+  const normalizedToolAllowlist = normalizeToolAllowlist(opts && opts.toolAllowlist);
+  const hasToolAllowlist = normalizedToolAllowlist.length > 0;
+  const toolAllowlistSet = hasToolAllowlist ? new Set(normalizedToolAllowlist) : null;
+  const isToolAllowed = (toolName) => {
+    if (!hasToolAllowlist) return true;
+    return toolAllowlistSet.has(normalizeToolName(toolName));
+  };
+  const filterToolsByAllowlist = (tools) => {
+    if (!hasToolAllowlist) return tools;
+    return (Array.isArray(tools) ? tools : []).filter((tool) => isToolAllowed(tool && tool.name));
+  };
   let agentHomeRoot = opts.agentHomeRoot;
   if (!agentHomeRoot){
     try {
@@ -157,6 +532,9 @@ export async function createArcanaSession(opts={}){
     try { agentId = basename(String(agentHomeRoot || '').replace(/[\/\\]+$/, '')); } catch {}
   }
   if (!agentId) agentId = 'default';
+  const clientReadableRoots = localToolProxyInvoke
+    ? [workspaceRoot, agentHomeRoot].map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
 
   const globalCfg = loadArcanaConfig();
 
@@ -241,13 +619,61 @@ export async function createArcanaSession(opts={}){
     }
   }
 
+  function routeBlockedResult(toolName, route, mode){
+    const tool = String(toolName || '').trim() || 'unknown_tool';
+    const reason = mode === 'queue' ? 'queue_not_available' : 'route_denied';
+    const code = mode === 'queue' ? 'TOOL_ROUTE_QUEUE_NOT_AVAILABLE' : 'TOOL_ROUTE_DENIED';
+    const text = mode === 'queue'
+      ? `${tool} is routed to local execution, but queue fallback is not available in this session.`
+      : `${tool} is routed to local execution and denied because no local proxy invoker is configured.`;
+    return {
+      content: [{ type: 'text', text }],
+      details: {
+        ok: false,
+        error: reason,
+        code,
+        tool,
+        route,
+      }
+    };
+  }
+
   function wrapToolWithSecrets(tool){
     if (!tool || typeof tool.execute !== 'function') return tool;
     const exec = tool.execute.bind(tool);
+    const route = resolveToolRoute(toolRouting, tool.name);
     return {
       ...tool,
+      route,
       async execute(callId, args, signal, onUpdate, ctx){
         const ctxWithSecrets = { ...(ctx || {}), secrets };
+        const busCtx = getContext();
+        const sessionId = String(
+          (ctxWithSecrets && (ctxWithSecrets.sessionId || ctxWithSecrets.session_id)) ||
+          (busCtx && (busCtx.sessionId || busCtx.session_id)) ||
+          '',
+        ).trim();
+        const sessionKey = String(
+          (ctxWithSecrets && (ctxWithSecrets.sessionKey || ctxWithSecrets.session_key)) ||
+          (busCtx && (busCtx.sessionKey || busCtx.session_key)) ||
+          '',
+        ).trim();
+        const ctxAgentId = String(
+          (ctxWithSecrets && ctxWithSecrets.agentId) ||
+          (busCtx && busCtx.agentId) ||
+          '',
+        ).trim();
+        localProxyDebugLog('tool route decision', {
+          tool: String(tool.name || '').trim() || 'unknown_tool',
+          callId: String(callId || '').trim() || null,
+          execution: route && route.execution ? String(route.execution) : null,
+          fallback: route && route.fallback ? String(route.fallback) : null,
+          hasLocalInvoker: !!localToolProxyInvoke,
+          enforceToolRouting: !!enforceToolRouting,
+          agentId: ctxAgentId || null,
+          sessionKey: sessionKey || null,
+          sessionId: sessionId || null,
+        });
         let wrappedOnUpdate = onUpdate;
         if (typeof onUpdate === 'function'){
           wrappedOnUpdate = function(partial){
@@ -255,6 +681,52 @@ export async function createArcanaSession(opts={}){
             return onUpdate(normalized);
           };
         }
+        const executionMode = decideToolExecutionMode({
+          tool,
+          route,
+          args,
+          clientReadableRoots,
+          hasLocalToolProxyInvoke: !!localToolProxyInvoke,
+          enforceToolRouting,
+        });
+        if (executionMode === 'proxied_local'){
+          localProxyDebugLog('tool route branch', {
+            tool: String(tool.name || '').trim() || 'unknown_tool',
+            callId: String(callId || '').trim() || null,
+            branch: 'proxied_local',
+          });
+          const proxied = await localToolProxyInvoke({
+            toolName: tool.name,
+            callId,
+            args,
+            signal,
+            onUpdate: wrappedOnUpdate,
+            ctx: ctxWithSecrets,
+            route,
+          });
+          return normalizeToolResult(proxied);
+        }
+        if (executionMode === 'deny'){
+          localProxyDebugLog('tool route branch', {
+            tool: String(tool.name || '').trim() || 'unknown_tool',
+            callId: String(callId || '').trim() || null,
+            branch: 'deny',
+          });
+          return normalizeToolResult(routeBlockedResult(tool.name, route, 'deny'));
+        }
+        if (executionMode === 'queue_not_available'){
+          localProxyDebugLog('tool route branch', {
+            tool: String(tool.name || '').trim() || 'unknown_tool',
+            callId: String(callId || '').trim() || null,
+            branch: 'queue_not_available',
+          });
+          return normalizeToolResult(routeBlockedResult(tool.name, route, 'queue'));
+        }
+        localProxyDebugLog('tool route branch', {
+          tool: String(tool.name || '').trim() || 'unknown_tool',
+          callId: String(callId || '').trim() || null,
+          branch: 'local_exec',
+        });
         const result = await exec(callId, args, signal, wrappedOnUpdate, ctxWithSecrets);
         return normalizeToolResult(result);
       }
@@ -286,6 +758,34 @@ export async function createArcanaSession(opts={}){
     } catch {
       return Array.isArray(allSkills) ? allSkills : [];
     }
+  }
+
+  function getDisabledToolNamesForConfig(cfg){
+    const disabled = new Set();
+    try {
+      const disabledArr = cfg && cfg.tools && Array.isArray(cfg.tools.disabled) ? cfg.tools.disabled : [];
+      for (const raw of disabledArr){
+        if (typeof raw !== 'string') continue;
+        const name = raw.trim();
+        if (!name) continue;
+        disabled.add(name);
+      }
+    } catch {}
+    return disabled;
+  }
+
+  function collectToolNames(tools){
+    const out = [];
+    const seen = new Set();
+    try {
+      for (const tool of tools || []){
+        const name = String(tool && tool.name || '').trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        out.push(name);
+      }
+    } catch {}
+    return out;
   }
 
   const providerName = (cfg && cfg.provider) ? String(cfg.provider).trim() : '';
@@ -419,7 +919,11 @@ export async function createArcanaSession(opts={}){
       api,
       baseUrl,
       reasoning: src.reasoning != null ? !!src.reasoning : !!(baseTemplate && baseTemplate.reasoning),
-      input: Array.isArray(src.input) && src.input.length ? src.input : (baseTemplate && Array.isArray(baseTemplate.input) && baseTemplate.input.length ? baseTemplate.input : ['text']),
+      input: Array.isArray(src.input) && src.input.length
+        ? src.input
+        : (baseTemplate && Array.isArray(baseTemplate.input) && baseTemplate.input.length
+          ? baseTemplate.input
+          : inferGenericModelInput(provNorm, modelId)),
       cost: src.cost && typeof src.cost === 'object' ? src.cost : (baseTemplate && baseTemplate.cost) || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: typeof src.contextWindow === 'number' ? src.contextWindow : (baseTemplate && typeof baseTemplate.contextWindow === 'number' ? baseTemplate.contextWindow : 200000),
       maxTokens: typeof src.maxTokens === 'number' ? src.maxTokens : (baseTemplate && typeof baseTemplate.maxTokens === 'number' ? baseTemplate.maxTokens : 8192),
@@ -691,13 +1195,17 @@ export async function createArcanaSession(opts={}){
 
   // Create tool-daemon client and proxy tools. We always register a proxy 'bash'
   // tool, but activation is controlled by execPolicy via setActiveToolsByName.
-  const toolDaemon = new ToolDaemonClient({ workspaceRoot });
+  const toolDaemonWorkspaceRoot = resolveToolDaemonWorkspaceRoot({
+    toolDaemonWorkspaceRoot: opts.toolDaemonWorkspaceRoot,
+    pkgRoot,
+  });
+  const toolDaemon = new ToolDaemonClient({ workspaceRoot: toolDaemonWorkspaceRoot });
   const webRender = createProxyWebRenderTool(toolDaemon);
   const webExtract = createProxyWebExtractTool(toolDaemon);
   const webSearchProxy = createProxyWebSearchTool(toolDaemon);
   const bashProxy = createProxyBashTool(toolDaemon);
   // Start core workspace services once per process. This runs before plugins.
-  try { await startServicesOnce(); } catch {}
+  try { await startServicesOnce({ workspaceRoot: toolDaemonWorkspaceRoot }); } catch {}
 
   const { tools: pluginTools, pluginFiles, errors: pluginErrors } = await loadArcanaPlugins(workspaceRoot);
   const filteredPlugins = (pluginTools||[]).filter((t)=> t && !['web_render','web_extract','web_search','bash'].includes(t.name));
@@ -707,11 +1215,9 @@ export async function createArcanaSession(opts={}){
   const memoryTools = createMemoryTools();
   const agentMemoryFsTools = createAgentMemoryFsTools();
   const cronTool = createCronTool();
-  const pkgRoot = arcanaPkgRoot();
   if (!process.env.ARCANA_PKG_ROOT){
     try { process.env.ARCANA_PKG_ROOT = pkgRoot; } catch {}
   }
-  const repoRoot = dirname(pkgRoot);
 
   // Seed $ARCANA_HOME/APPEND_SYSTEM.md on first session creation.
   try {
@@ -748,22 +1254,47 @@ export async function createArcanaSession(opts={}){
     agentBootstrap = buildAgentBootstrapContext(agentHomeRoot, { minimal: minimalAgentBootstrap }) || agentBootstrap;
   } catch {}
 
+  const injectedBootstrapContextNames = new Set(
+    injectedLocalBootstrapFiles
+      .filter((item) => !localSkillNameFromBootstrapFile(item))
+      .map((item) => item.name)
+  );
+  const injectedBootstrapContextFiles = injectedLocalBootstrapFiles
+    .filter((item) => !localSkillNameFromBootstrapFile(item))
+    .map((item) => ({
+      path: item.path,
+      content: item.content,
+    }));
+  if (injectedBootstrapContextFiles.length) {
+    const retainedContextFiles = Array.isArray(agentBootstrap.contextFiles)
+      ? agentBootstrap.contextFiles.filter((item) => !injectedBootstrapContextNames.has(basename(String(item && item.path || ''))))
+      : [];
+    agentBootstrap = {
+      ...agentBootstrap,
+      contextFiles: [...injectedBootstrapContextFiles, ...retainedContextFiles],
+      hasSoul: agentBootstrap.hasSoul || injectedBootstrapContextNames.has('SOUL.md'),
+    };
+  }
+
   let hasSoulHint = false;
   try {
-    if (!minimalAgentBootstrap && agentHomeRoot && existsSync(join(agentHomeRoot, 'SOUL.md'))){
+    if (!minimalAgentBootstrap && (agentBootstrap.hasSoul || injectedBootstrapContextNames.has('SOUL.md') || (agentHomeRoot && existsSync(join(agentHomeRoot, 'SOUL.md'))))){
       hasSoulHint = true;
     }
   } catch {}
 
   // Skill-scoped tools (preload definitions; activation controlled by per-agent toggles)
-  let arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+  const localBootstrapSkills = loadLocalBootstrapSkills({ files: injectedLocalBootstrapFiles });
+  let serverArcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+  let arcanaSkills = mergeSkillLists(serverArcanaSkills, localBootstrapSkills);
   arcanaSkills = filterDisabledSkillsForConfig(arcanaSkills, cfg);
   let skillTools = []; let skillToolMap = new Map();
   try {
-    const res = await loadSkillTools(arcanaSkills, { agentHomeRoot });
+    const res = await loadSkillTools(filterDisabledSkillsForConfig(serverArcanaSkills, cfg), { agentHomeRoot });
     skillTools = res.tools || [];
     skillToolMap = res.skillToolNamesBySkill || new Map();
   } catch {}
+  let enableServerManagedBash = true;
   const buildCustomTools = () => ([
     notebook,
     ...memoryTools,
@@ -776,14 +1307,22 @@ export async function createArcanaSession(opts={}){
     webRender,
     webExtract,
     webSearchProxy,
-    bashProxy,
+    ...(enableServerManagedBash ? [bashProxy] : []),
   ]);
-
-  const customTools = buildCustomTools();
+  const injectedLocalTools = injectedLocalToolDefinitions.map((definition) => ({
+    name: definition.name,
+    description: definition.description || '',
+    parameters: definition.parameters || { type: 'object', properties: {}, additionalProperties: true },
+    arcanaInjectedLocalProxy: true,
+    async execute(callId, args, signal, onUpdate, ctx){
+      return { content: [{ type: 'text', text: '' }], details: { injectedLocalProxy: true, tool: definition.name } };
+    },
+  }));
+  const hasInjectedLocalBash = hasInjectedLocalBashTool(injectedLocalToolDefinitions);
 
   // Compute skills prompt early so the resource loader can append it
-  let skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
-  const loader = new DefaultResourceLoader({
+  let skillsPrompt = buildSkillsPromptFromLoadedSkills(arcanaSkills, cfg);
+	  const loader = new DefaultResourceLoader({
     cwd: workspaceRoot,
     agentDir: agentHomeRoot,
     agentsFilesOverride: (base)=>{
@@ -798,6 +1337,9 @@ export async function createArcanaSession(opts={}){
           return p.startsWith(workspaceRootNormalized + "/");
         });
       }
+      if (injectedBootstrapContextNames.size){
+        baseFiles = baseFiles.filter((f) => !injectedBootstrapContextNames.has(basename(String(f && f.path || ''))));
+      }
       const merged = [...baseFiles];
       const seen = new Set();
       for (const f of baseFiles){
@@ -810,8 +1352,8 @@ export async function createArcanaSession(opts={}){
       }
       return { agentsFiles: merged };
     },
-    appendSystemPromptOverride: (base)=>{
-      const extras = [];
+	    appendSystemPromptOverride: (base)=>{
+	      const extras = [];
 
       // Workspace override: repo-local .pi/APPEND_SYSTEM.md
       try {
@@ -831,12 +1373,13 @@ export async function createArcanaSession(opts={}){
         }
         if (baseAppend) extras.push(baseAppend);
       } catch {}
-      const soulLine = hasSoulHint
-        ? "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."
-        : "";
-      if (soulLine) extras.push(soulLine);
-      // Append skills prompt after APPEND_SYSTEM.md blocks and SOUL hint
-      if (skillsPrompt && skillsPrompt.trim()) extras.push(skillsPrompt);
+	      const soulLine = hasSoulHint
+	        ? "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."
+	        : "";
+	      if (soulLine) extras.push(soulLine);
+	      if (injectedLocalToolsPrompt) extras.push(injectedLocalToolsPrompt);
+	      // Append skills prompt after APPEND_SYSTEM.md blocks and SOUL hint
+	      if (skillsPrompt && skillsPrompt.trim()) extras.push(skillsPrompt);
       const mergedSp = [...(base||[])];
       for (const sText of extras){ if (sText && !mergedSp.includes(sText)) mergedSp.push(sText); }
       return mergedSp;
@@ -851,19 +1394,22 @@ export async function createArcanaSession(opts={}){
       onChange: () => {
         (async () => {
           try {
-            skillsPrompt = buildArcanaSkillsPrompt({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
-            arcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+            serverArcanaSkills = loadArcanaSkills({ workspaceRoot, agentHomeRoot, cfg, pkgRoot, repoRoot });
+            arcanaSkills = mergeSkillLists(serverArcanaSkills, localBootstrapSkills);
             arcanaSkills = filterDisabledSkillsForConfig(arcanaSkills, cfg);
+            skillsPrompt = buildSkillsPromptFromLoadedSkills(arcanaSkills, cfg);
             try {
-              const res = await loadSkillTools(arcanaSkills, { agentHomeRoot });
+              const res = await loadSkillTools(filterDisabledSkillsForConfig(serverArcanaSkills, cfg), { agentHomeRoot });
               skillTools = res.tools || [];
               skillToolMap = res.skillToolNamesBySkill || new Map();
             } catch {}
 
-            const nextCustomTools = buildCustomTools();
-            const wrappedCustomTools = nextCustomTools.map((t) => wrapToolWithSecrets(t));
+	            const nextCustomTools = filterToolsByAllowlist(buildCustomTools());
+	            const wrappedBaseTools = baseTools.map((t) => wrapToolWithSecrets(t));
+	            const wrappedCustomTools = nextCustomTools.map((t) => wrapToolWithSecrets(t));
+	            const wrappedInjectedLocalTools = injectedLocalTools.map((t) => wrapToolWithSecrets(t));
 
-            if (createdSession && typeof createdSession.reload === 'function') {
+	            if (createdSession && typeof createdSession.reload === 'function') {
               try {
                 let prevActive = [];
                 try {
@@ -873,32 +1419,41 @@ export async function createArcanaSession(opts={}){
                   }
                 } catch {}
 
-                createdSession._customTools = wrappedCustomTools;
+	                createdSession._customTools = [...wrappedBaseTools, ...wrappedCustomTools, ...wrappedInjectedLocalTools];
+                  localProxyDebugLog('skills watcher reload tool inventory', {
+                    agentId,
+                    injectedLocalTools: injectedLocalToolsDebug,
+                    customToolCount: nextCustomTools.length,
+                    totalCustomToolCount: createdSession._customTools.length,
+                  });
                 await createdSession.reload();
 
                 try {
-                    if (typeof createdSession.setActiveToolsByName === 'function') {
-                      const seen = new Set();
-                      const nextActive = [];
-                      const bashName = (bashProxy && bashProxy.name) || 'bash';
+                  if (typeof createdSession.setActiveToolsByName === 'function') {
+                    const seen = new Set();
+                    const nextActive = [];
+                    const bashName = (bashProxy && bashProxy.name) || 'bash';
+                    const disabledTools = getDisabledToolNamesForConfig(cfg);
 
-                      for (const name of prevActive || []) {
-                        if (typeof name !== 'string') continue;
-                        const trimmed = name.trim();
-                        if (!trimmed) continue;
-                        if (execPolicy !== 'open' && trimmed === bashName) continue;
-                        if (seen.has(trimmed)) continue;
-                        seen.add(trimmed);
-                        nextActive.push(trimmed);
-                      }
-
-                      if (execPolicy === 'open' && !seen.has(bashName)) {
-                        seen.add(bashName);
-                        nextActive.push(bashName);
-                      }
-
-                      createdSession.setActiveToolsByName(nextActive);
+                    for (const name of prevActive || []) {
+                      if (typeof name !== 'string') continue;
+                      const trimmed = name.trim();
+                      if (!trimmed) continue;
+                      if (!isToolAllowed(trimmed)) continue;
+                      if (disabledTools.has(trimmed)) continue;
+                      if (!enableServerManagedBash && !hasInjectedLocalBash && trimmed === bashName) continue;
+                      if (seen.has(trimmed)) continue;
+                      seen.add(trimmed);
+                      nextActive.push(trimmed);
                     }
+
+                    if ((hasInjectedLocalBash || enableServerManagedBash) && isToolAllowed(bashName) && !disabledTools.has(bashName) && !seen.has(bashName)) {
+                      seen.add(bashName);
+                      nextActive.push(bashName);
+                    }
+
+                    createdSession.setActiveToolsByName(nextActive);
+                  }
                 } catch {}
               } catch {}
             } else {
@@ -926,25 +1481,38 @@ export async function createArcanaSession(opts={}){
   // Backwards compatibility: allow env var when opts.execPolicy is not provided
   const rawPolicy = String(opts.execPolicy || process.env.ARCANA_EXEC_POLICY || '').trim().toLowerCase();
   const execPolicy = rawPolicy === 'open' ? 'open' : 'restricted';
+  enableServerManagedBash = shouldEnableServerManagedBash({
+    execPolicy,
+    injectedLocalToolDefinitions,
+  });
+  const customTools = filterToolsByAllowlist(buildCustomTools());
 
   // Workspace-guarded built-in tools. All operations call ensureReadAllowed(path).
+  const detectReadImageMimeType = async (p) => {
+    const e = extname(String(p)).toLowerCase();
+    if (e === '.png') return 'image/png';
+    if (e === '.jpg' || e === '.jpeg') return 'image/jpeg';
+    if (e === '.gif') return 'image/gif';
+    if (e === '.webp') return 'image/webp';
+    return null;
+  };
   const baseReadTool = createReadTool(workspaceRoot, {
+    autoResizeImages: false,
     operations: {
       access: async (p) => { await fsp.access(ensureReadAllowed(p)); },
       readFile: async (p) => fsp.readFile(ensureReadAllowed(p)),
       // Lightweight image type detection based on file extension.
-      detectImageMimeType: async (p) => {
-        const e = extname(String(p)).toLowerCase();
-        if (e === '.png') return 'image/png';
-        if (e === '.jpg' || e === '.jpeg') return 'image/jpeg';
-        if (e === '.gif') return 'image/gif';
-        if (e === '.webp') return 'image/webp';
-        return null;
-      }
+      detectImageMimeType: detectReadImageMimeType
     }
   });
 
-  const readTool = baseReadTool;
+  const readTool = {
+    ...baseReadTool,
+    description: 'Read the contents of a file. Text files are read directly. Image files (jpg, jpeg, png, gif, webp) are returned as image tool results so the model can inspect them in the same turn. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.',
+    async execute(toolCallId, params, signal, onUpdate) {
+      return baseReadTool.execute(toolCallId, params, signal, onUpdate);
+    }
+  };
 
   const grepTool = createGrepTool(workspaceRoot, {
     operations: {
@@ -981,31 +1549,38 @@ export async function createArcanaSession(opts={}){
   // Register only read/grep/find/ls as base tools. We purposely exclude built-in
   // bash/edit/write. 'bash' is available via our proxy in customTools and can be
   // enabled by policy at runtime.
-  const baseTools = [readTool, grepTool, findTool, lsTool];
+  const baseTools = filterToolsByAllowlist([readTool, grepTool, findTool, lsTool]);
+  localProxyDebugLog('createArcanaSession tool inventory', {
+    agentId,
+    injectedLocalTools: injectedLocalToolsDebug,
+    customToolCount: customTools.length,
+    availableToolCount: collectToolNames([...baseTools, ...customTools, ...injectedLocalTools]).length,
+  });
+  const availableToolNames = collectToolNames([...baseTools, ...customTools, ...injectedLocalTools]);
 
   const wrappedBaseTools = baseTools.map((t) => wrapToolWithSecrets(t));
   const wrappedCustomTools = customTools.map((t) => wrapToolWithSecrets(t));
+  const wrappedInjectedLocalTools = injectedLocalTools.map((t) => wrapToolWithSecrets(t));
+  // pi-coding-agent's `tools` option only selects active built-in tool names.
+  // Inject wrapped base tools via `customTools` so Arcana wrappers intercept execution.
+  const sessionCustomTools = [...wrappedBaseTools, ...wrappedCustomTools, ...wrappedInjectedLocalTools];
 
   const created = await createAgentSession({
     cwd: workspaceRoot,
-    tools: wrappedBaseTools,
-    customTools: wrappedCustomTools,
+    tools: [],
+    customTools: sessionCustomTools,
     model,
     resourceLoader: loader,
     ...(thinkingLevel ? { thinkingLevel } : {}),
   });
 
   createdSession = created && created.session ? created.session : null;
-  // Enable pi-agent-core's built-in auto-compaction so that context (including
-  // accumulated image base64 data from tool results) is automatically summarized
-  // and trimmed when approaching the token limit.  This prevents the request
-  // payload from growing unbounded and triggering proxy/gateway body-size errors.
-  //
-  // Auto-retry remains DISABLED — Arcana handles all retry logic at the gateway
-  // layer (with prelude rebuilding, overflow compaction, back-off, etc.).
+  // Keep internal auto-compaction disabled. Arcana owns compaction policy at the
+  // gateway layer so compaction stays visible and consistent with session prelude
+  // rebuilding instead of happening as a hidden runtime side effect.
   try {
     if (createdSession && typeof createdSession.setAutoCompactionEnabled === 'function'){
-      createdSession.setAutoCompactionEnabled(true);
+      createdSession.setAutoCompactionEnabled(false);
     }
   } catch {}
   try {
@@ -1126,28 +1701,17 @@ export async function createArcanaSession(opts={}){
   // Apply initial execution policy to active tool names so chat2 sessions
   // honor the requested policy without an extra server-side toggle.
   try {
-    const baseNames = baseTools
-      .map((t) => t && t.name)
-      .filter((n) => typeof n === 'string' && n.length > 0);
-
-    const customNames = customTools
-      .map((t) => t && t.name)
-      .filter((n) => typeof n === 'string' && n.length > 0);
-
+    const disabledTools = getDisabledToolNamesForConfig(cfg);
     const desired = new Set();
-
-    // Always enable base tools (read/grep/find/ls)
-    for (const n of baseNames) desired.add(n);
-
-    // Enable all custom tools (including skill tools) by default
-    for (const n of customNames) {
+    for (const n of availableToolNames) {
       if (!n) continue;
+      if (disabledTools.has(n)) continue;
       desired.add(n);
     }
 
     // Apply bash enablement based on execution policy
     const bashName = (bashProxy && bashProxy.name) || 'bash';
-    if (execPolicy === 'open') desired.add(bashName);
+    if ((hasInjectedLocalBash || enableServerManagedBash) && isToolAllowed(bashName) && !disabledTools.has(bashName)) desired.add(bashName);
     else desired.delete(bashName);
 
     created.session?.setActiveToolsByName?.(Array.from(desired));
@@ -1156,7 +1720,7 @@ export async function createArcanaSession(opts={}){
   const visibleSkillNames = arcanaSkills.map(s=>s.name).filter(Boolean);
   const toolNames = created.session?.getActiveToolNames ? created.session.getActiveToolNames() : baseTools.map(t=>t?.name).filter(Boolean);
 
-  return { session: created.session, model, toolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost: toolDaemon, skillToolMap };
+  return { session: created.session, model, toolNames, availableToolNames, pluginFiles, pluginErrors, skillNames: visibleSkillNames, skillsCount: visibleSkillNames.length, toolHost: toolDaemon, skillToolMap };
 }
 
 export default { createArcanaSession };

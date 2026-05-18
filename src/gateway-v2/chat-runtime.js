@@ -1,10 +1,11 @@
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promises as fsp, readFileSync } from 'node:fs';
 import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
 import { arcanaHomePath } from '../arcana-home.js';
-import { resolveWorkspaceRoot } from '../workspace-guard.js';
+import { resolveWorkspaceRoot, ensureReadAllowed } from '../workspace-guard.js';
 import { getSessionIdForKey } from '../session-key-store.js';
-import { createArcanaSession } from '../session.js';
+import { createArcanaSession, summarizeInjectedLocalToolDefinitionsForDebug } from '../session.js';
 import { ensureSessionId } from '../cron/arcana-task.js';
 import { runWithContext, emit } from '../event-bus.js';
 import { loadArcanaConfig, loadAgentConfig } from '../config.js';
@@ -20,16 +21,510 @@ import {
   trimUserMessage,
   estimateTokensFromText,
   compactSessionByUserTurns,
-  compactSession,
 } from '../context-manager.js';
 import { buildErrorStack } from '../util/error.js';
 import { nowMs, ensureDir } from './util.js';
 import { persistToolMetaToDisk, persistToolResultToDisk, scheduleAppendToolStream } from '../tool-output-store.js';
 import { thinkingStart, appendThinkingDelta, thinkingEnd } from '../thinking-output-store.js';
-import { mergeStreamingText } from '../streaming-text.js';
+import { mergeStreamingText, mergeTextBlocks } from '../streaming-text.js';
+import { normalizeChatAttachments, extractAttachmentImages, attachmentsToMediaRefs } from './chat-attachments.js';
 
-// Long-lived chat sessions keyed by agentId|sessionId|policy|workspaceRoot
+// Long-lived chat sessions keyed by agentId|sessionKey|sessionId|policy|workspaceRoot|agentHomeRoot
 const chatSessions = new Map();
+let localProxyWsHub = null;
+const pendingLocalToolCalls = new Map();
+const recentResolvedLocalToolCalls = new Map();
+const RECENT_LOCAL_TOOL_RESULT_TTL_MS = 10 * 60 * 1000;
+const ARCANA_LOCAL_PROXY_DEBUG = (() => {
+  try {
+    const raw = String(process.env.ARCANA_LOCAL_PROXY_DEBUG || '').trim().toLowerCase();
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  } catch {
+    return false;
+  }
+})();
+
+const ARCANA_CHAT_CONTEXT_DEBUG = (() => {
+  try {
+    const raw = String(process.env.ARCANA_CHAT_CONTEXT_DEBUG || '').trim().toLowerCase();
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  } catch {
+    return false;
+  }
+})();
+
+function localProxyDebugLog(...args){
+  if (!ARCANA_LOCAL_PROXY_DEBUG) return;
+  try {
+    console.log('[arcana:chat-runtime:local-proxy:debug]', ...args);
+  } catch {}
+}
+
+function rememberResolvedLocalToolCall(callId){
+  try {
+    const key = String(callId || '').trim();
+    if (!key) return;
+    const cutoff = nowMs() - RECENT_LOCAL_TOOL_RESULT_TTL_MS;
+    for (const [id, ts] of recentResolvedLocalToolCalls.entries()) {
+      if (Number(ts) < cutoff) recentResolvedLocalToolCalls.delete(id);
+    }
+    recentResolvedLocalToolCalls.set(key, nowMs());
+  } catch {}
+}
+
+function wasRecentlyResolvedLocalToolCall(callId){
+  try {
+    const key = String(callId || '').trim();
+    if (!key) return false;
+    const ts = Number(recentResolvedLocalToolCalls.get(key));
+    if (!Number.isFinite(ts)) return false;
+    if (nowMs() - ts > RECENT_LOCAL_TOOL_RESULT_TTL_MS) {
+      recentResolvedLocalToolCalls.delete(key);
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function chatContextDebugLog(...args){
+  if (!ARCANA_CHAT_CONTEXT_DEBUG) return;
+  try {
+    console.log('[arcana:chat-runtime:context:debug]', ...args);
+  } catch {}
+}
+
+function createLocalToolCallId(){
+  try {
+    const ts = Date.now().toString(36);
+    const rand = Math.random().toString(36).slice(2, 10);
+    return 'ltp_' + ts + '_' + rand;
+  } catch {
+    return 'ltp_' + String(Date.now());
+  }
+}
+
+export function attachLocalToolProxyHub(hub){
+  localProxyWsHub = hub || null;
+}
+
+export function normalizeWorkspaceRootOverride(rawWorkspaceRoot){
+  try {
+    let value = String(rawWorkspaceRoot || '').trim();
+    if (!value) return '';
+    if (value.startsWith('file://')) value = fileURLToPath(value);
+    if (!isAbsolute(value)) return '';
+    return resolve(value);
+  } catch {
+    return '';
+  }
+}
+
+export function normalizeAgentHomeRootOverride(rawAgentHomeRoot){
+  try {
+    let value = String(rawAgentHomeRoot || '').trim();
+    if (!value) return '';
+    if (value.startsWith('file://')) value = fileURLToPath(value);
+    if (!isAbsolute(value)) return '';
+    return resolve(value);
+  } catch {
+    return '';
+  }
+}
+
+export function handleLocalToolProxyMessage(msg){
+  try {
+    if (!msg || typeof msg !== 'object') return false;
+    if (String(msg.type || '') === 'local_tool_heartbeat') {
+      return handleLocalToolProxyHeartbeat(msg);
+    }
+    if (String(msg.type || '') !== 'local_tool_result') return false;
+    const callId = String(msg.callId || '').trim();
+    if (!callId) {
+      localProxyDebugLog('local_tool_result unmatched', { reason: 'missing_callId' });
+      return false;
+    }
+    const pending = pendingLocalToolCalls.get(callId);
+    if (!pending) {
+      if (wasRecentlyResolvedLocalToolCall(callId)) {
+        localProxyDebugLog('local_tool_result duplicate_resolved', {
+          callId,
+          sessionKey: String(msg.sessionKey || '').trim() || null,
+          agentId: String(msg.agentId || '').trim() || null,
+        });
+        return true;
+      }
+      localProxyDebugLog('local_tool_result unmatched', {
+        reason: 'pending_miss',
+        callId,
+        sessionKey: String(msg.sessionKey || '').trim() || null,
+        agentId: String(msg.agentId || '').trim() || null,
+      });
+      return false;
+    }
+
+    const msgSessionKey = String(msg.sessionKey || '').trim();
+    if (pending.sessionKey && msgSessionKey && msgSessionKey !== pending.sessionKey) {
+      pendingLocalToolCalls.delete(callId);
+      try { if (pending.timeout) clearTimeout(pending.timeout); } catch {}
+      const err = new Error('local_tool_proxy_session_mismatch');
+      err.code = 'local_tool_proxy_session_mismatch';
+      err.callId = callId;
+      err.expectedSessionKey = pending.sessionKey;
+      err.receivedSessionKey = msgSessionKey;
+      try { pending.reject(err); } catch {}
+      localProxyDebugLog('local_tool_result unmatched', {
+        reason: 'session_mismatch',
+        callId,
+        expectedSessionKey: pending.sessionKey,
+        receivedSessionKey: msgSessionKey,
+      });
+      return true;
+    }
+    const msgAgentId = String(msg.agentId || '').trim();
+    if (pending.agentId && msgAgentId && msgAgentId !== pending.agentId) {
+      pendingLocalToolCalls.delete(callId);
+      try { if (pending.timeout) clearTimeout(pending.timeout); } catch {}
+      const err = new Error('local_tool_proxy_agent_mismatch');
+      err.code = 'local_tool_proxy_agent_mismatch';
+      err.callId = callId;
+      err.expectedAgentId = pending.agentId;
+      err.receivedAgentId = msgAgentId;
+      try { pending.reject(err); } catch {}
+      localProxyDebugLog('local_tool_result unmatched', {
+        reason: 'agent_mismatch',
+        callId,
+        expectedAgentId: pending.agentId,
+        receivedAgentId: msgAgentId,
+      });
+      return true;
+    }
+
+    pendingLocalToolCalls.delete(callId);
+    rememberResolvedLocalToolCall(callId);
+    try { if (pending.timeout) clearTimeout(pending.timeout); } catch {}
+    try {
+      pending.resolve(msg);
+    } catch {}
+    localProxyDebugLog('local_tool_result matched', {
+      callId,
+      sessionKey: msgSessionKey || pending.sessionKey || null,
+      agentId: msgAgentId || pending.agentId || null,
+      ok: msg.ok !== false,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function handleLocalToolProxyHeartbeat(msg){
+  try {
+    if (!msg || typeof msg !== 'object') return false;
+    if (String(msg.type || '') !== 'local_tool_heartbeat') return false;
+    const callId = String(msg.callId || '').trim();
+    if (!callId) return false;
+    const pending = pendingLocalToolCalls.get(callId);
+    if (!pending) {
+      localProxyDebugLog('local_tool_heartbeat unmatched', { callId });
+      return false;
+    }
+    const msgSessionKey = String(msg.sessionKey || '').trim();
+    if (pending.sessionKey && msgSessionKey && msgSessionKey !== pending.sessionKey) {
+      localProxyDebugLog('local_tool_heartbeat session_mismatch', {
+        callId,
+        expectedSessionKey: pending.sessionKey,
+        receivedSessionKey: msgSessionKey,
+      });
+      return true;
+    }
+    const msgAgentId = String(msg.agentId || '').trim();
+    if (pending.agentId && msgAgentId && msgAgentId !== pending.agentId) {
+      localProxyDebugLog('local_tool_heartbeat agent_mismatch', {
+        callId,
+        expectedAgentId: pending.agentId,
+        receivedAgentId: msgAgentId,
+      });
+      return true;
+    }
+    pending.lastHeartbeatMs = nowMs();
+    pending.heartbeatCount = (Number(pending.heartbeatCount) || 0) + 1;
+    try {
+      emitCanonicalToolExecutionUpdate({
+        agentId: pending.agentId || msgAgentId || DEFAULT_AGENT_ID,
+        sessionKey: pending.sessionKey || msgSessionKey,
+        sessionId: pending.sessionId || '',
+        toolCallId: callId,
+        toolName: pending.toolName || String(msg.tool || '').trim(),
+        update: {
+          type: 'heartbeat',
+          heartbeatCount: pending.heartbeatCount,
+          tsMs: Number.isFinite(Number(msg.tsMs)) ? Number(msg.tsMs) : nowMs(),
+        },
+      });
+    } catch {}
+    localProxyDebugLog('local_tool_heartbeat matched', {
+      callId,
+      tool: pending.toolName || null,
+      heartbeatCount: pending.heartbeatCount,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function cancelLocalToolProxyCallsForClient({ agentId, sessionKey, clientId, reason } = {}){
+  const targetAgentId = String(agentId || '').trim();
+  const targetSessionKey = String(sessionKey || '').trim();
+  const targetClientId = String(clientId || '').trim();
+  let cancelled = 0;
+  for (const [callId, pending] of Array.from(pendingLocalToolCalls.entries())) {
+    const pendingAgentId = String(pending && pending.agentId || '').trim();
+    const pendingSessionKey = String(pending && pending.sessionKey || '').trim();
+    const pendingClientId = String(pending && pending.clientId || '').trim();
+    if (targetAgentId && pendingAgentId && pendingAgentId !== targetAgentId) continue;
+    if (targetSessionKey && pendingSessionKey && pendingSessionKey !== targetSessionKey) continue;
+    if (targetClientId && pendingClientId && pendingClientId !== targetClientId) continue;
+    pendingLocalToolCalls.delete(callId);
+    try { if (pending.timeout) clearTimeout(pending.timeout); } catch {}
+    const err = new Error('local_tool_proxy_client_disconnected');
+    err.code = 'local_tool_proxy_client_disconnected';
+    err.callId = callId;
+    err.toolName = pending && pending.toolName ? pending.toolName : '';
+    err.sessionKey = pendingSessionKey;
+    err.agentId = pendingAgentId;
+    err.clientId = pendingClientId;
+    err.reason = String(reason || 'client_disconnected');
+    try { pending.reject(err); } catch {}
+    cancelled += 1;
+    localProxyDebugLog('local_tool_request cancelled_on_disconnect', {
+      callId,
+      tool: err.toolName || null,
+      sessionKey: pendingSessionKey || null,
+      agentId: pendingAgentId || null,
+      clientId: pendingClientId || null,
+      reason: err.reason,
+    });
+  }
+  return cancelled;
+}
+
+function emitCanonicalToolExecutionStart({ agentId, sessionKey, sessionId, toolCallId, toolName, args } = {}){
+  try {
+    const event = {
+      type: 'tool_execution_start',
+      source: 'local_tool_proxy',
+      toolCallId,
+      callId: toolCallId,
+      toolName,
+      args: args || {},
+    };
+    emit(withSessionStreamRouting(event, {
+      sessionId,
+      sessionKey,
+      agentId,
+    }));
+    try {
+      persistToolMetaToDisk({
+        agentId,
+        sessionId,
+        toolCallId,
+        toolName,
+        args: args || {},
+      });
+    } catch {}
+    return true;
+  } catch {}
+  return false;
+}
+
+function emitCanonicalToolExecutionUpdate({ agentId, sessionKey, sessionId, toolCallId, toolName, update } = {}){
+  try {
+    const event = {
+      type: 'tool_execution_update',
+      source: 'local_tool_proxy',
+      toolCallId,
+      callId: toolCallId,
+      toolName,
+      update: update || {},
+    };
+    emit(withSessionStreamRouting(event, { sessionId, sessionKey, agentId }));
+    return true;
+  } catch {}
+  return false;
+}
+
+function emitCanonicalToolExecutionEnd({ agentId, sessionKey, sessionId, toolCallId, toolName, args, resultMsg, error } = {}){
+  try {
+    const hasError = !!error || !!(resultMsg && resultMsg.ok === false);
+    const event = {
+      type: 'tool_execution_end',
+      source: 'local_tool_proxy',
+      toolCallId,
+      callId: toolCallId,
+      toolName,
+      args: args || {},
+      isError: hasError,
+    };
+    if (resultMsg && Object.prototype.hasOwnProperty.call(resultMsg, 'result')) {
+      event.result = resultMsg.result;
+    } else if (resultMsg != null) {
+      event.result = resultMsg;
+    }
+    if (hasError) {
+      const rawError = error || (resultMsg && (resultMsg.error || resultMsg.message)) || 'local_tool_proxy_error';
+      event.error = rawError instanceof Error
+        ? { message: rawError.message, code: rawError.code || undefined }
+        : rawError;
+    }
+    const routed = withSessionStreamRouting(event, {
+      sessionId,
+      sessionKey,
+      agentId,
+    });
+    emit(routed);
+    try {
+      persistToolResultToDisk({
+        agentId,
+        sessionId,
+        event: routed,
+      });
+    } catch {}
+    return true;
+  } catch {}
+  return false;
+}
+
+export async function requestLocalToolExecution({ agentId, sessionKey, sessionId, toolName, args, route, timeoutMs } = {}){
+  if (!localProxyWsHub || typeof localProxyWsHub.broadcast !== 'function'){
+    throw new Error('local_tool_proxy_unavailable');
+  }
+
+  const callId = createLocalToolCallId();
+  const effectiveTimeoutMs = normalizeLocalToolProxyTimeoutMs(timeoutMs);
+  const transportPayload = {
+    type: 'local_tool_request',
+    callId,
+    agentId: String(agentId || DEFAULT_AGENT_ID),
+    sessionKey: String(sessionKey || '').trim(),
+    tool: String(toolName || '').trim(),
+    args: (args && typeof args === 'object') ? args : {},
+    route: route != null ? route : null,
+    timeoutMs: effectiveTimeoutMs,
+    tsMs: nowMs(),
+  };
+  localProxyDebugLog('local_tool_request dispatch', {
+    callId,
+    tool: transportPayload.tool,
+    sessionKey: transportPayload.sessionKey || null,
+    agentId: transportPayload.agentId || null,
+    timeoutMs: effectiveTimeoutMs,
+  });
+
+  let resultMsg;
+  const toolExecutionContext = {
+    agentId: transportPayload.agentId,
+    sessionKey: transportPayload.sessionKey,
+    sessionId: String(sessionId || '').trim(),
+    toolCallId: transportPayload.callId,
+    toolName: transportPayload.tool,
+    args: transportPayload.args || {},
+  };
+  emitCanonicalToolExecutionStart(toolExecutionContext);
+  try {
+    resultMsg = await new Promise((resolve, reject) => {
+      const timeout = effectiveTimeoutMs > 0
+        ? setTimeout(() => {
+          try { pendingLocalToolCalls.delete(callId); } catch {}
+          const err = new Error('local_tool_proxy_timeout');
+          err.code = 'local_tool_proxy_timeout';
+          err.callId = callId;
+          err.toolName = transportPayload.tool;
+          err.sessionKey = transportPayload.sessionKey || '';
+          reject(err);
+        }, effectiveTimeoutMs)
+        : null;
+      pendingLocalToolCalls.set(callId, {
+        resolve,
+        reject,
+        timeout,
+        toolName: transportPayload.tool,
+        createdAtMs: nowMs(),
+        lastHeartbeatMs: null,
+        heartbeatCount: 0,
+        sessionKey: String(sessionKey || '').trim(),
+        agentId: String(agentId || DEFAULT_AGENT_ID),
+        sessionId: String(sessionId || '').trim(),
+        clientId: route && route.clientId != null ? String(route.clientId || '').trim() : '',
+      });
+      try {
+        const delivered = localProxyWsHub.broadcast(transportPayload);
+        if (typeof delivered === 'number' && delivered <= 0){
+          try { pendingLocalToolCalls.delete(callId); } catch {}
+          try { clearTimeout(timeout); } catch {}
+          const err = new Error('local_tool_proxy_no_client');
+          err.code = 'local_tool_proxy_no_client';
+          err.callId = callId;
+          err.toolName = transportPayload.tool;
+          err.sessionKey = transportPayload.sessionKey || '';
+          reject(err);
+        }
+      } catch (err) {
+        pendingLocalToolCalls.delete(callId);
+        try { clearTimeout(timeout); } catch {}
+        reject(err instanceof Error ? err : new Error(String(err || 'local_tool_proxy_send_failed')));
+      }
+    });
+    localProxyDebugLog('local_tool_request completion', {
+      callId,
+      tool: transportPayload.tool,
+      sessionKey: transportPayload.sessionKey || null,
+      agentId: transportPayload.agentId || null,
+      ok: !resultMsg || resultMsg.ok !== false,
+    });
+  } catch (err) {
+    emitCanonicalToolExecutionEnd({ ...toolExecutionContext, resultMsg: null, error: err });
+    localProxyDebugLog('local_tool_request error', {
+      callId,
+      tool: transportPayload.tool,
+      sessionKey: transportPayload.sessionKey || null,
+      agentId: transportPayload.agentId || null,
+      error: String((err && err.message) || err || 'local_tool_proxy_error'),
+    });
+    throw err;
+  }
+
+  if (!resultMsg || typeof resultMsg !== 'object'){
+    emitCanonicalToolExecutionEnd({ ...toolExecutionContext, resultMsg, error: null });
+    return resultMsg;
+  }
+  emitCanonicalToolExecutionEnd({ ...toolExecutionContext, resultMsg, error: null });
+  if (resultMsg.ok === false){
+    const errorCode = resultMsg.error;
+    const errorText = String(
+      resultMsg.message ||
+      (
+        resultMsg.error &&
+        typeof resultMsg.error === 'object' &&
+        resultMsg.error.message
+      ) ||
+      resultMsg.error ||
+      'local_tool_proxy_error'
+    );
+    const err = new Error(errorText);
+    if (errorCode != null) err.code = errorCode;
+    if (Object.prototype.hasOwnProperty.call(resultMsg, 'details')) err.details = resultMsg.details;
+    err.resultMsg = resultMsg;
+    if (Object.prototype.hasOwnProperty.call(resultMsg, 'error')) err.error = resultMsg.error;
+    throw err;
+  }
+  if (Object.prototype.hasOwnProperty.call(resultMsg, 'result')){
+    return resultMsg.result;
+  }
+  return resultMsg;
+}
 
 // Invalidate cached chat sessions so provider changes take effect immediately.
 // If `agentId` is provided, only sessions for that agent are evicted; otherwise all.
@@ -69,6 +564,9 @@ const MAX_PROMPT_LOG_CHARS = 8000;
 const MAX_PROMPT_LOG_CHARS_FULL = 2 * 1024 * 1024;
 const MAX_DIAGNOSTIC_ITEMS = 16;
 const MAX_DIAGNOSTIC_STRING_CHARS = 512;
+const DEFAULT_LOCAL_TOOL_PROXY_TIMEOUT_MS = 0;
+const MIN_LOCAL_TOOL_PROXY_TIMEOUT_MS = 100;
+const MAX_LOCAL_TOOL_PROXY_TIMEOUT_MS = 10 * 60 * 1000;
 
 function truthyEnv(name){
   try {
@@ -153,6 +651,15 @@ function asciiSafeBody(text){
   } catch {
     return String(text || '');
   }
+}
+
+function normalizeLocalToolProxyTimeoutMs(value){
+  const raw = value != null && value !== ''
+    ? value
+    : process.env.ARCANA_LOCAL_PROXY_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_LOCAL_TOOL_PROXY_TIMEOUT_MS;
+  return Math.min(MAX_LOCAL_TOOL_PROXY_TIMEOUT_MS, Math.max(MIN_LOCAL_TOOL_PROXY_TIMEOUT_MS, Math.floor(parsed)));
 }
 
 function sanitizeId(s){
@@ -267,47 +774,283 @@ function normalizeAgentId(raw){
   }
 }
 
-function buildChatKey({ agentId, sessionId, policy, workspaceRoot }){
+function buildChatKey({ agentId, sessionKey, sessionId, policy, workspaceRoot, agentHomeRoot }){
   try {
     const aid = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
+    const sKey = String(sessionKey || '').trim() || '';
     const sid = String(sessionId || 'default').trim() || 'default';
     const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
     const ws = String(workspaceRoot || '').trim() || '';
-    return aid + '|' + sid + '|' + pol + '|' + ws;
+    const home = String(agentHomeRoot || '').trim() || '';
+    return aid + '|' + sKey + '|' + sid + '|' + pol + '|' + ws + '|' + home;
   } catch {
-    return 'default|default|restricted|';
+    return 'default||default|restricted||';
   }
 }
 
-async function ensureChatSession({ sessionId, agentId, policy }){
+function stableStringify(value){
+  const seen = new Set();
+  const walk = (input) => {
+    if (input === null) return 'null';
+    const t = typeof input;
+    if (t === 'string') return JSON.stringify(input);
+    if (t === 'number'){
+      if (Number.isFinite(input)) return String(input);
+      return JSON.stringify(String(input));
+    }
+    if (t === 'boolean') return input ? 'true' : 'false';
+    if (t === 'bigint') return JSON.stringify(input.toString() + 'n');
+    if (t === 'undefined') return '"__undefined__"';
+    if (t === 'function') return '"__function__"';
+    if (t === 'symbol') return JSON.stringify(String(input));
+    if (Array.isArray(input)){
+      return '[' + input.map((entry) => walk(entry)).join(',') + ']';
+    }
+    if (input && t === 'object'){
+      if (seen.has(input)) return '"__circular__"';
+      seen.add(input);
+      const keys = Object.keys(input).sort();
+      const parts = [];
+      for (const key of keys){
+        const val = input[key];
+        if (typeof val === 'undefined') continue;
+        parts.push(JSON.stringify(key) + ':' + walk(val));
+      }
+      seen.delete(input);
+      return '{' + parts.join(',') + '}';
+    }
+    return JSON.stringify(input);
+  };
+  return walk(value);
+}
+
+function buildToolRoutingSignature(toolRouting){
+  try {
+    if (!toolRouting) return '';
+    return stableStringify(toolRouting);
+  } catch {
+    return '';
+  }
+}
+
+function normalizeToolAllowlist(toolAllowlist){
+  if (!Array.isArray(toolAllowlist)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of toolAllowlist){
+    if (typeof item !== 'string') continue;
+    const name = item.trim().toLowerCase();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  out.sort();
+  return out;
+}
+
+function buildToolAllowlistSignature(toolAllowlist){
+  try {
+    const normalized = normalizeToolAllowlist(toolAllowlist);
+    if (!normalized.length) return '';
+    return stableStringify(normalized);
+  } catch {
+    return '';
+  }
+}
+
+export function buildLocalToolDefinitionsSignature(localToolDefinitions){
+  try {
+    if (!Array.isArray(localToolDefinitions) || !localToolDefinitions.length) return '';
+    const normalized = [];
+    const seen = new Set();
+    for (const item of localToolDefinitions){
+      if (!item || typeof item !== 'object') continue;
+      const name = String(item.name || '').trim().toLowerCase();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      const description = typeof item.description === 'string' ? item.description.trim() : '';
+      const parameters = item.parameters && typeof item.parameters === 'object' ? item.parameters : null;
+      normalized.push({
+        name,
+        ...(description ? { description } : {}),
+        ...(parameters ? { parameters } : {}),
+      });
+    }
+    if (!normalized.length) return '';
+    normalized.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    return stableStringify(normalized);
+  } catch {
+    return '';
+  }
+}
+
+export function buildLocalAgentSignature(localAgentSignature){
+  try {
+    const value = String(localAgentSignature || '').trim();
+    return value ? value.slice(0, 256) : '';
+  } catch {
+    return '';
+  }
+}
+
+export function estimateProjectedPromptTokens({ liveContextTokens, preludeText, promptMessage } = {}){
+  try {
+    const promptText = '[Current Question]\n' + String(promptMessage || '');
+    const promptTokens = estimateTokensFromText(promptText);
+    const liveNum = Number(liveContextTokens);
+    const liveTokens = Number.isFinite(liveNum) && liveNum > 0 ? Math.floor(liveNum) : 0;
+    if (liveTokens > 0){
+      return {
+        tokens: liveTokens + promptTokens,
+        baseTokens: liveTokens,
+        promptTokens,
+        source: 'live_context_plus_prompt',
+      };
+    }
+
+    const baseTokens = estimateTokensFromText(String(preludeText || ''));
+    return {
+      tokens: baseTokens + promptTokens,
+      baseTokens,
+      promptTokens,
+      source: 'prelude_plus_prompt',
+    };
+  } catch {
+    return {
+      tokens: 0,
+      baseTokens: 0,
+      promptTokens: 0,
+      source: 'unknown',
+    };
+  }
+}
+
+async function ensureChatSession({ sessionId, sessionKey, agentId, policy, workspaceRoot, agentHomeRoot, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature }){
   const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
   const sid = String(sessionId || '').trim();
+  const sessionKeyNormalized = String(sessionKey || '').trim();
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
+  const localToolProxyEnabled = !!localToolProxy;
+  const toolRoutingSignature = buildToolRoutingSignature(toolRouting);
+  const normalizedToolAllowlist = normalizeToolAllowlist(toolAllowlist);
+  const toolAllowlistSignature = buildToolAllowlistSignature(normalizedToolAllowlist);
+  const localToolDefinitionsSignature = buildLocalToolDefinitionsSignature(localToolDefinitions);
+  const effectiveLocalAgentSignature = buildLocalAgentSignature(localAgentSignature);
+  const localToolDefinitionsDebug = summarizeInjectedLocalToolDefinitionsForDebug(localToolDefinitions);
 
-  // Resolve workspaceRoot from session store when possible
-  let ws = '';
+  // Resolve workspaceRoot from explicit request first, then session store.
+  let ws = normalizeWorkspaceRootOverride(workspaceRoot);
   let sessionObj = null;
   try {
     if (sid) sessionObj = ssLoad(sid, { agentId: effectiveAgentId });
   } catch {}
   try {
-    if (sessionObj && sessionObj.workspace) ws = String(sessionObj.workspace || '');
+    if (!ws && sessionObj && sessionObj.workspaceRoot) ws = String(sessionObj.workspaceRoot || '');
+    if (!ws && sessionObj && sessionObj.workspace) ws = String(sessionObj.workspace || '');
   } catch {}
   if (!ws){
     try { ws = resolveWorkspaceRoot(); } catch { ws = process.cwd(); }
   }
-  const agentHomeDir = arcanaHomePath('agents', effectiveAgentId);
-  const key = buildChatKey({ agentId: effectiveAgentId, sessionId: sid || 'default', policy: pol, workspaceRoot: ws });
+  const agentHomeDir = normalizeAgentHomeRootOverride(agentHomeRoot) || arcanaHomePath('agents', effectiveAgentId);
+  const key = buildChatKey({
+    agentId: effectiveAgentId,
+    sessionKey: sessionKeyNormalized,
+    sessionId: sid || 'default',
+    policy: pol,
+    workspaceRoot: ws,
+    agentHomeRoot: agentHomeDir,
+  });
   const existing = chatSessions.get(key);
   if (existing && existing.session){
-    return existing;
+    const existingLocalToolProxyEnabled = !!existing.localToolProxyEnabled;
+    const existingToolRoutingSignature = (typeof existing.toolRoutingSignature === 'string') ? existing.toolRoutingSignature : '';
+    const existingToolAllowlistSignature = (typeof existing.toolAllowlistSignature === 'string') ? existing.toolAllowlistSignature : '';
+    const existingLocalToolDefinitionsSignature = (typeof existing.localToolDefinitionsSignature === 'string') ? existing.localToolDefinitionsSignature : '';
+    const existingLocalAgentSignature = (typeof existing.localAgentSignature === 'string') ? existing.localAgentSignature : '';
+    const localToolProxyChanged = existingLocalToolProxyEnabled !== localToolProxyEnabled;
+    const toolRoutingChanged = existingToolRoutingSignature !== toolRoutingSignature;
+    const toolAllowlistChanged = existingToolAllowlistSignature !== toolAllowlistSignature;
+    const localToolDefinitionsChanged = existingLocalToolDefinitionsSignature !== localToolDefinitionsSignature;
+    const localAgentChanged = existingLocalAgentSignature !== effectiveLocalAgentSignature;
+    const compatible = (
+      !localToolProxyChanged &&
+      !toolRoutingChanged &&
+      !toolAllowlistChanged &&
+      !localToolDefinitionsChanged &&
+      !localAgentChanged
+    );
+    localProxyDebugLog('ensureChatSession cache check', {
+      agentId: effectiveAgentId,
+      sessionKey: sessionKeyNormalized || null,
+      sessionId: sid || 'default',
+      agentHomeRoot: agentHomeDir,
+      compatible,
+      localToolProxyEnabled,
+      existingLocalToolProxyEnabled,
+      toolRoutingChanged,
+      toolAllowlistChanged,
+      localToolDefinitionsChanged,
+      localAgentChanged,
+      localToolDefinitions: localToolDefinitionsDebug,
+    });
+    if (compatible){
+      if (sessionKeyNormalized){
+        try { existing.sessionKey = sessionKeyNormalized; } catch {}
+      }
+      return existing;
+    }
+
+    // Requested tool routing/proxy config changed; evict stale cached session.
+    try { existing.toolHost && existing.toolHost.cancelActiveCall && existing.toolHost.cancelActiveCall(); } catch {}
+    try {
+      if (existing.session && typeof existing.session.abort === 'function'){
+        const p = existing.session.abort();
+        if (p && typeof p.catch === 'function') await p.catch(() => {});
+      }
+    } catch {}
+    try { chatSessions.delete(key); } catch {}
+    localProxyDebugLog('ensureChatSession stale eviction', {
+      agentId: effectiveAgentId,
+      sessionKey: sessionKeyNormalized || null,
+      sessionId: sid || 'default',
+      reason: 'local_proxy_tool_routing_or_allowlist_changed',
+      localToolProxyChanged,
+      toolRoutingChanged,
+      toolAllowlistChanged,
+      localToolDefinitionsChanged,
+      localAgentChanged,
+      localToolDefinitions: localToolDefinitionsDebug,
+    });
   }
 
   let created = null;
+  const localToolProxyInvoke = localToolProxyEnabled
+    ? async ({ toolName, args, route } = {}) => {
+      return await requestLocalToolExecution({
+        agentId: effectiveAgentId,
+        sessionKey: sessionKeyNormalized,
+        sessionId: sid || 'default',
+        toolName,
+        args,
+        route,
+      });
+    }
+    : undefined;
   await runWithContext(
     { sessionId: sid || 'default', agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws },
     async () => {
-      created = await createArcanaSession({ workspaceRoot: ws, agentHomeRoot: agentHomeDir, execPolicy: pol, agentId: effectiveAgentId });
+      created = await createArcanaSession({
+        workspaceRoot: ws,
+        agentHomeRoot: agentHomeDir,
+        execPolicy: pol,
+        agentId: effectiveAgentId,
+        enforceToolRouting: true,
+        toolAllowlist: normalizedToolAllowlist,
+        localToolDefinitions: Array.isArray(localToolDefinitions) ? localToolDefinitions : [],
+        localBootstrapFiles: Array.isArray(localBootstrapFiles) ? localBootstrapFiles : [],
+        ...(localToolProxyInvoke ? { localToolProxyInvoke } : {}),
+        ...(toolRouting ? { toolRouting } : {}),
+      });
     },
   );
   if (!created || !created.session){
@@ -321,9 +1064,25 @@ async function ensureChatSession({ sessionId, agentId, policy }){
     agentHomeDir,
     workspaceRoot: ws,
     sessionId: sid || 'default',
+    sessionKey: sessionKeyNormalized,
+    localToolProxyEnabled,
+    toolRoutingSignature,
+    toolAllowlistSignature,
+    localToolDefinitionsSignature,
+    localAgentSignature: effectiveLocalAgentSignature,
     skillToolMap: created.skillToolMap || new Map(),
   };
 
+  localProxyDebugLog('ensureChatSession created', {
+    agentId: effectiveAgentId,
+    sessionKey: sessionKeyNormalized || null,
+    sessionId: sid || 'default',
+    agentHomeRoot: agentHomeDir,
+    localToolProxyEnabled,
+    toolAllowlistCount: normalizedToolAllowlist.length,
+    localAgentSignature: effectiveLocalAgentSignature,
+    localToolDefinitions: localToolDefinitionsDebug,
+  });
   attachChatEventBridge(record, sid || 'default');
   chatSessions.set(key, record);
   return record;
@@ -630,35 +1389,6 @@ function isCompletionErrorReason(reason){
     return false;
   }
 }
-
-function isRetryableCompletionError(err, finishReason, stopReason){
-  try {
-    // Non-retryable completion reasons  check first
-    for (const r of [finishReason, stopReason]){
-      if (!r) continue;
-      const s = String(r).toLowerCase();
-      if (s.includes('content_filter') || s.includes('content-filter') || s.includes('blocked')) return false;
-    }
-    // Retryable completion reasons
-    for (const r of [finishReason, stopReason]){
-      if (!r) continue;
-      const s = String(r).toLowerCase();
-      if (s.includes('overloaded') || s.includes('rate_limit') || s.includes('rate-limit') || s.includes('timeout')) return true;
-    }
-    // Check exception
-    if (err){
-      const status = typeof err.status === 'number' ? err.status : (typeof err.statusCode === 'number' ? err.statusCode : 0);
-      if (status === 429 || (status >= 500 && status <= 599)) return true;
-      const msg = String(err.message || err || '').toLowerCase();
-      if (msg.includes('overloaded') || msg.includes('rate_limit') || msg.includes('rate-limit') || msg.includes('timeout') || msg.includes('econnreset') || msg.includes('econnrefused') || msg.includes('socket hang up') || msg.includes('fetch failed')) return true;
-      // Generic 'error' finishReason + thrown exception  likely transient
-      for (const r of [finishReason, stopReason]){
-        if (r && String(r).toLowerCase() === 'error') return true;
-      }
-    }
-    return false;
-  } catch { return false; }
-}
 function _getCompressionThresholdTokens(agentHomeDir) {
   try {
     const globalCfg = loadArcanaConfig();
@@ -679,6 +1409,85 @@ function _getCompressionThresholdTokens(agentHomeDir) {
     }
     return null;
   } catch { return null; }
+}
+
+function _getCompressionEnabled(agentHomeDir) {
+  try {
+    const globalCfg = loadArcanaConfig();
+    const agentCfg = loadAgentConfig(agentHomeDir);
+    const resolveValue = (cfg) => {
+      if (!cfg || typeof cfg !== 'object') return undefined;
+      if (!Object.prototype.hasOwnProperty.call(cfg, 'history_compression_enabled')) return undefined;
+      return cfg.history_compression_enabled;
+    };
+    const raw = resolveValue(agentCfg) ?? resolveValue(globalCfg);
+    if (typeof raw === 'boolean') return raw;
+    if (raw != null) {
+      const s = String(raw).trim().toLowerCase();
+      if (s) {
+        if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') return false;
+        if (s === '1' || s === 'true' || s === 'yes' || s === 'on') return true;
+      }
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+function _getCompressionKeepUserTurns(agentHomeDir) {
+  try {
+    const globalCfg = loadArcanaConfig();
+    const agentCfg = loadAgentConfig(agentHomeDir);
+    const resolveValue = (cfg) => {
+      if (!cfg || typeof cfg !== 'object') return undefined;
+      if (!Object.prototype.hasOwnProperty.call(cfg, 'history_compression_keep_user_turns')) return undefined;
+      return cfg.history_compression_keep_user_turns;
+    };
+    const raw = resolveValue(agentCfg) ?? resolveValue(globalCfg);
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    return 10;
+  } catch {
+    return 10;
+  }
+}
+
+function _getLiveContextTokensForCompression(sess, historyObj, keepRecentUserTurns, promptMessage) {
+  try {
+    const agentMessages = sess && sess.agent && sess.agent.state && Array.isArray(sess.agent.state.messages)
+      ? sess.agent.state.messages
+      : [];
+    if (agentMessages.length > 0 && sess && typeof sess.getContextUsage === 'function') {
+      const ctxUsage = sess.getContextUsage();
+      const tokens = Number(ctxUsage && ctxUsage.tokens);
+      if (Number.isFinite(tokens) && tokens > 0) {
+        return estimateProjectedPromptTokens({
+          liveContextTokens: tokens,
+          promptMessage,
+        });
+      }
+    }
+
+    const summaryTextRaw = historyObj && typeof historyObj.summary === 'string' ? historyObj.summary : '';
+    const summaryText = String(summaryTextRaw || '').trim();
+    let preludeText = '';
+    if (summaryText && keepRecentUserTurns > 0) {
+      preludeText = buildSessionPrelude(
+        historyObj,
+        DEFAULT_CONTEXT_POLICY,
+        { keepRecentUserTurns },
+      ) || '';
+    } else {
+      preludeText = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY) || '';
+    }
+    return estimateProjectedPromptTokens({
+      preludeText,
+      promptMessage,
+    });
+  } catch {
+    return estimateProjectedPromptTokens({ promptMessage: '' });
+  }
 }
 
 function isContextOverflowError(err, finishReason, stopReason, errorMessage){
@@ -726,6 +1535,120 @@ function isContextOverflowError(err, finishReason, stopReason, errorMessage){
     return false;
   } catch { return false; }
 }
+
+function getEventToolCallId(ev){
+  try {
+    const direct = String((ev && (ev.toolCallId || ev.callId || ev.id)) || '').trim();
+    return direct || '';
+  } catch {
+    return '';
+  }
+}
+
+export function withSessionStreamRouting(event, { sessionId, sessionKey, agentId } = {}){
+  if (!event || typeof event !== 'object') return event;
+  const out = { ...event };
+  const sid = String(sessionId || '').trim();
+  const skey = String(sessionKey || '').trim();
+  const aid = String(agentId || '').trim();
+  if (sid && !String(out.sessionId || '').trim()) out.sessionId = sid;
+  if (skey && !String(out.sessionKey || '').trim()) out.sessionKey = skey;
+  if (aid && !String(out.agentId || '').trim()) out.agentId = aid;
+  return out;
+}
+
+async function compactInternalHistoryAndRebuildPrelude({
+  session,
+  sessionId,
+  sessionKey,
+  agentId,
+  workspaceRoot,
+  agentHomeDir,
+  message,
+  keepRecentUserTurns,
+  reason,
+}) {
+  const keepTurnsNum = Number(keepRecentUserTurns);
+  const keepTurns = Number.isFinite(keepTurnsNum) && keepTurnsNum > 0 ? Math.floor(keepTurnsNum) : 0;
+  if (!keepTurns) return '';
+  chatContextDebugLog('compaction:start', {
+    sessionId,
+    agentId,
+    reason: String(reason || ''),
+    keepRecentUserTurns: keepTurns,
+  });
+
+  const compactResult = await compactSessionByUserTurns({
+    sessionId,
+    agentId,
+    workspaceRoot,
+    agentHomeDir,
+    keepRecentUserTurns: keepTurns,
+    policy: DEFAULT_CONTEXT_POLICY,
+    broadcast(ev){
+      try {
+        if (!ev || typeof ev !== 'object') return;
+        emit({ ...ev, sessionId, agentId, sessionKey });
+      } catch {}
+    },
+    reason: String(reason || ''),
+  });
+  chatContextDebugLog('compaction:result', {
+    sessionId,
+    agentId,
+    reason: String(reason || ''),
+    keepRecentUserTurns: keepTurns,
+    compacted: !!(compactResult && compactResult.compacted === true),
+  });
+  if (!compactResult || compactResult.compacted !== true){
+    return '';
+  }
+
+  try {
+    if (session && typeof session.newSession === 'function'){
+      const p = session.newSession();
+      if (p && typeof p.then === 'function') await p;
+    } else {
+      const agent = session && session.agent ? session.agent : null;
+      if (agent && typeof agent.replaceMessages === 'function'){
+        agent.replaceMessages([]);
+      }
+    }
+  } catch {}
+
+  let hist = null;
+  try { hist = ssLoad(sessionId, { agentId }); } catch {}
+  try {
+    if (hist && Array.isArray(hist.messages) && hist.messages.length){
+      const lastIdx = hist.messages.length - 1;
+      const last = hist.messages[lastIdx];
+      if (last && last.role === 'user'){
+        const lastText = String(last.text || '').trim();
+        const msgTrim = String(message || '').trim();
+        if (lastText && msgTrim && lastText === msgTrim){
+          hist.messages = hist.messages.slice(0, -1);
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    const rebuiltPrelude = buildSessionPrelude(hist, DEFAULT_CONTEXT_POLICY, { keepRecentUserTurns: keepTurns }) || '';
+    chatContextDebugLog('compaction:rebuilt-prelude', {
+      sessionId,
+      agentId,
+      reason: String(reason || ''),
+      keepRecentUserTurns: keepTurns,
+      preludeChars: rebuiltPrelude.length,
+      summaryChars: hist && typeof hist.summary === 'string' ? hist.summary.length : 0,
+      storedMessages: hist && Array.isArray(hist.messages) ? hist.messages.length : 0,
+    });
+    return rebuiltPrelude;
+  } catch {
+    return '';
+  }
+}
+
 function buildDiagnosticsPayload({ record, finishReason, stopReason, completionErrorReason, assistantMessageMeta, diagnosticEvents }){
   try {
     const diag = {};
@@ -819,9 +1742,9 @@ function attachChatEventBridge(record, sessionId){
         outLines.push(line);
         continue;
       }
-      if (trimmed.startsWith('MEDIA:')){
-        const idx = line.indexOf('MEDIA:');
-        const raw = idx >= 0 ? line.slice(idx + 6) : '';
+      const mediaMatch = trimmed.match(/^(?:[-*+]\s+|\d+[.)]\s+)?MEDIA\s*[:：]\s*(.*)$/);
+      if (mediaMatch){
+        const raw = mediaMatch[1] || '';
         const ref = normalizeMediaRef(raw);
         if (ref) mediaRefs.push(ref);
         continue;
@@ -829,6 +1752,19 @@ function attachChatEventBridge(record, sessionId){
       outLines.push(line);
     }
     return { text: outLines.join('\n'), mediaRefs };
+  }
+
+  function dedupeNormalizedMediaRefs(refs){
+    const seen = new Set();
+    const out = [];
+    const arr = Array.isArray(refs) ? refs : [];
+    for (const raw of arr){
+      const ref = normalizeMediaRef(raw);
+      if (!ref || seen.has(ref)) continue;
+      seen.add(ref);
+      out.push(ref);
+    }
+    return out;
   }
 
   const mediaRefsSeen = new Set();
@@ -849,21 +1785,31 @@ function attachChatEventBridge(record, sessionId){
         const cur = sess.__turnIndexBySession.get(key);
         const next = (typeof cur === 'number' && cur >= 0) ? (cur + 1) : 0;
         sess.__turnIndexBySession.set(key, next);
-        try { emit({ type: 'turn_start', sessionId, agentId }); } catch {}
+        try { emit(withSessionStreamRouting({ type: 'turn_start' }, { sessionId, sessionKey, agentId })); } catch {}
         return;
       }
 
       if (t === 'turn_end'){
         const key = String(sessionId || 'default');
         const idx = (sess.__turnIndexBySession && sess.__turnIndexBySession.get) ? sess.__turnIndexBySession.get(key) : undefined;
-        try { emit({ type: 'turn_end', sessionId, agentId }); } catch {}
+        try { record.__arcana_turnEndCount = (Number(record.__arcana_turnEndCount) || 0) + 1; } catch {}
+        try { emit(withSessionStreamRouting({ type: 'turn_end' }, { sessionId, sessionKey, agentId })); } catch {}
         return;
       }
 
-      const base = ev && typeof ev === 'object' && !ev.sessionId ? { ...ev, sessionId } : ev;
+      const eventToolCallId = getEventToolCallId(ev);
+      const baseRaw = withSessionStreamRouting(ev, { sessionId, sessionKey, agentId });
+      const base = (
+        baseRaw &&
+        typeof baseRaw === 'object' &&
+        eventToolCallId &&
+        !String(baseRaw.toolCallId || '').trim()
+      )
+        ? { ...baseRaw, toolCallId: eventToolCallId }
+        : baseRaw;
 
       if (t === 'tool_execution_start'){
-        try { persistToolMetaToDisk({ agentId, sessionId, toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
+        try { persistToolMetaToDisk({ agentId, sessionId, toolCallId: eventToolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
         try { emit(base); } catch {}
 
         // Best-effort auto-activation of skill-scoped tools when reading a SKILL.md
@@ -952,7 +1898,7 @@ function attachChatEventBridge(record, sessionId){
             const stream = String(raw.stream || '').toLowerCase();
             const chunkVal = raw.chunk;
             if ((stream === 'stdout' || stream === 'stderr') && typeof chunkVal === 'string'){
-              try { scheduleAppendToolStream({ agentId, sessionId, toolCallId: ev.toolCallId, stream, chunk: chunkVal }); } catch {}
+              try { scheduleAppendToolStream({ agentId, sessionId, toolCallId: eventToolCallId, stream, chunk: chunkVal }); } catch {}
             }
           }
         } catch {}
@@ -969,7 +1915,12 @@ function attachChatEventBridge(record, sessionId){
           }
         } catch {}
         try { emit(payload); } catch {}
-        try { persistToolResultToDisk({ agentId, sessionId, event: ev }); } catch {}
+        try {
+          const eventForDisk = (ev && typeof ev === 'object' && eventToolCallId && !String(ev.toolCallId || '').trim())
+            ? { ...ev, toolCallId: eventToolCallId }
+            : ev;
+          persistToolResultToDisk({ agentId, sessionId, event: eventForDisk });
+        } catch {}
         return;
       }
 
@@ -997,28 +1948,29 @@ function attachChatEventBridge(record, sessionId){
       }
 
       if (t === 'error'){
-        const payload = base && typeof base === 'object' ? { ...base, agentId } : { type: 'error', sessionId, agentId };
+        const payload = withSessionStreamRouting(base && typeof base === 'object' ? base : { type: 'error' }, { sessionId, sessionKey, agentId });
         try { emit(payload); } catch {}
         return;
       }
 
       if (t === 'message_update' && ev.message && ev.message.role === 'assistant'){
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-        const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+        const rawText = mergeTextBlocks(blocks);
         assistantRawText = mergeStreamingText(assistantRawText, rawText);
         const extracted = extractMediaFromAssistantText(assistantRawText);
         const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
         const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
         if (cleanText && cleanText !== lastAssistantTextEmitted){
           lastAssistantTextEmitted = cleanText;
-          try { emit({ type: 'assistant_text', text: cleanText, sessionId, agentId }); } catch {}
+          try { record.__arcana_lastAssistantTextEmitted = cleanText; } catch {}
+          try { emit(withSessionStreamRouting({ type: 'assistant_text', text: cleanText }, { sessionId, sessionKey, agentId })); } catch {}
         }
         if (mediaRefs.length){
           for (const raw of mediaRefs){
             const ref = normalizeMediaRef(raw);
             if (!ref || mediaRefsSeen.has(ref)) continue;
             mediaRefsSeen.add(ref);
-            try { emit({ type: 'assistant_image', url: ref, mime: 'image/*', sessionId, agentId }); } catch {}
+            try { emit(withSessionStreamRouting({ type: 'assistant_image', url: ref, mime: 'image/*' }, { sessionId, sessionKey, agentId })); } catch {}
           }
         }
       }
@@ -1026,24 +1978,26 @@ function attachChatEventBridge(record, sessionId){
       if (t === 'message_end' && ev.message && ev.message.role === 'assistant'){
         try {
           const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-          const rawText = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+          const rawText = mergeTextBlocks(blocks);
           assistantRawText = mergeStreamingText(assistantRawText, rawText);
           const extracted = extractMediaFromAssistantText(assistantRawText);
           const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
-          const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+          const mediaRefs = dedupeNormalizedMediaRefs((extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : []);
           if (cleanText && cleanText !== lastAssistantTextEmitted){
             lastAssistantTextEmitted = cleanText;
-            try { emit({ type: 'assistant_text', text: cleanText, sessionId, agentId }); } catch {}
+            try { record.__arcana_lastAssistantTextEmitted = cleanText; } catch {}
+            try { emit(withSessionStreamRouting({ type: 'assistant_text', text: cleanText }, { sessionId, sessionKey, agentId })); } catch {}
           }
-          if (cleanText){
-            try { ssAppend(sessionId, { role: 'assistant', text: cleanText, agentId }); } catch {}
+          if (cleanText || mediaRefs.length){
+            try { record.__arcana_lastAssistantTextPersisted = cleanText; } catch {}
+            try { ssAppend(sessionId, { role: 'assistant', text: cleanText, agentId, mediaRefs }); } catch {}
           }
           if (mediaRefs.length){
             for (const raw of mediaRefs){
               const ref = normalizeMediaRef(raw);
               if (!ref || mediaRefsSeen.has(ref)) continue;
               mediaRefsSeen.add(ref);
-              try { emit({ type: 'assistant_image', url: ref, mime: 'image/*', sessionId, agentId }); } catch {}
+              try { emit(withSessionStreamRouting({ type: 'assistant_image', url: ref, mime: 'image/*' }, { sessionId, sessionKey, agentId })); } catch {}
             }
           }
         } catch {}
@@ -1088,48 +2042,192 @@ function attachChatEventBridge(record, sessionId){
   };
 }
 
-async function runPromptWithSteer({ record, sessionId, sessionKey, message, prelude, isSteer }){
+function sessionAlreadyHasAssistantText(sessionId, agentId, text){
+  try {
+    const expected = String(text || '').trim();
+    if (!expected) return false;
+    const obj = ssLoad(sessionId, { agentId });
+    const messages = Array.isArray(obj && obj.messages) ? obj.messages : [];
+    for (let i = messages.length - 1; i >= 0; i -= 1){
+      const msg = messages[i];
+      if (!msg || msg.role !== 'assistant') continue;
+      if (String(msg.text || '').trim() === expected) return true;
+      return false;
+    }
+  } catch {}
+  return false;
+}
+
+export function ensureAssistantTextDelivered({ record, sessionId, sessionKey, agentId, text } = {}){
+  const finalText = String(text || '');
+  if (!finalText.trim()) return false;
+  let delivered = false;
+  try {
+    if (String(record && record.__arcana_lastAssistantTextEmitted || '') !== finalText){
+      emit(withSessionStreamRouting({ type: 'assistant_text', text: finalText }, { sessionId, sessionKey, agentId }));
+      if (record) record.__arcana_lastAssistantTextEmitted = finalText;
+      delivered = true;
+    }
+  } catch {}
+  try {
+    if (!sessionAlreadyHasAssistantText(sessionId, agentId, finalText)){
+      ssAppend(sessionId, { role: 'assistant', text: finalText, agentId });
+      if (record) record.__arcana_lastAssistantTextPersisted = finalText;
+      delivered = true;
+    }
+  } catch {}
+  return delivered;
+}
+
+export function emitUserMessageDelivered({ sessionId, sessionKey, agentId, text, mediaRefs } = {}){
+  try {
+    const event = {
+      type: 'user_message',
+      text: String(text || ''),
+    };
+    if (Array.isArray(mediaRefs) && mediaRefs.length) event.mediaRefs = mediaRefs;
+    emit(withSessionStreamRouting(event, { sessionId, sessionKey, agentId }));
+    return true;
+  } catch {}
+  return false;
+}
+
+export function ensureTurnEndDelivered({ record, sessionId, sessionKey, agentId, turnEndCountBefore, force } = {}){
+  try {
+    const before = Number(turnEndCountBefore) || 0;
+    const after = Number(record && record.__arcana_turnEndCount) || 0;
+    if (!force && after > before) return false;
+    emit(withSessionStreamRouting({ type: 'turn_end' }, { sessionId, sessionKey, agentId }));
+    if (record) record.__arcana_turnEndCount = after + 1;
+    return true;
+  } catch {}
+  return false;
+}
+
+function detectUserPromptImageMime(filePath){
+  try {
+    const lower = String(filePath || '').trim().toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    if (lower.endsWith('.webp')) return 'image/webp';
+  } catch {}
+  return '';
+}
+
+async function extractUserPromptImages(message, ctx, attachments){
+  const rawMessage = String(message || '');
+  const attachmentImages = extractAttachmentImages(attachments);
+  if (!rawMessage) return { cleanedMessage: '', images: attachmentImages };
+
+  const lines = rawMessage.split(/\r?\n/);
+  const keptLines = [];
+  const imageRefs = [];
+
+  for (const line of lines){
+    const trimmedLine = String(line || '').trim();
+    let matchedPrefix = false;
+    let imageRef = '';
+
+    if (/^image\s*:/i.test(trimmedLine)){
+      matchedPrefix = true;
+      imageRef = trimmedLine.replace(/^image\s*:/i, '').trim();
+    } else if (trimmedLine.startsWith('看图:')){
+      matchedPrefix = true;
+      imageRef = trimmedLine.slice('看图:'.length).trim();
+    }
+
+    if (!matchedPrefix){
+      keptLines.push(line);
+      continue;
+    }
+
+    if (!imageRef){
+      const err = new Error('Image reference is missing a file path');
+      err.code = 'INVALID_IMAGE_REFERENCE';
+      throw err;
+    }
+
+    imageRefs.push(imageRef);
+  }
+
+  if (!imageRefs.length){
+    return { cleanedMessage: rawMessage, images: attachmentImages };
+  }
+
+  const images = [];
+  for (const imageRef of imageRefs){
+    const filePath = ctx
+      ? await runWithContext(ctx, () => ensureReadAllowed(imageRef))
+      : ensureReadAllowed(imageRef);
+    const mimeType = detectUserPromptImageMime(filePath);
+    if (!mimeType){
+      const err = new Error('Unsupported image type: ' + imageRef);
+      err.code = 'UNSUPPORTED_IMAGE_TYPE';
+      throw err;
+    }
+    const data = await fsp.readFile(filePath);
+    images.push({ type: 'image', data: data.toString('base64'), mimeType });
+  }
+  if (attachmentImages.length) {
+    images.push(...attachmentImages);
+  }
+
+  return {
+    cleanedMessage: keptLines.join('\n'),
+    images,
+  };
+}
+
+async function runPromptWithSteer({ record, sessionId, sessionKey, message, prelude, isSteer, attachments }){
   const sess = record.session;
   const toolHost = record.toolHost;
   const agentId = record.agentId;
   const agentHomeDir = record.agentHomeDir;
   const workspaceRoot = record.workspaceRoot;
   const model = record.model || null;
+  const ctx = { sessionId, sessionKey, agentId, agentHomeRoot: agentHomeDir, workspaceRoot };
+  const { cleanedMessage, images } = await extractUserPromptImages(message, ctx, attachments);
+  const promptMessage = cleanedMessage || (images.length ? 'See attached image.' : '');
 
   // Only inject prelude when pi-agent-core has no internal context.
   // Once the agent has processed at least one turn, it keeps its own
   // tool-call history — injecting the prelude again would double-count.
   let usePrelude = '';
+  let internalMessageCount = 0;
   try {
     const agentMessages = sess.agent && sess.agent.state && sess.agent.state.messages;
+    internalMessageCount = Array.isArray(agentMessages) ? agentMessages.length : 0;
     if (!agentMessages || agentMessages.length === 0) {
       usePrelude = prelude || '';
     }
   } catch {
     usePrelude = prelude || '';
   }
-  let payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+  chatContextDebugLog('turn:start', {
+    sessionId,
+    agentId,
+    internalMessageCount,
+    injectedPrelude: !!usePrelude,
+    preludeChars: usePrelude.length,
+    messageChars: String(message || '').length,
+    isSteer: !!isSteer,
+  });
+  let payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + promptMessage;
   let dynamicPrelude = prelude || '';
   let overflowRetries = 0;
   const usageHelper = sess.__arcana_chat_usage;
   if (usageHelper) usageHelper.reset();
-
-  const ctx = { sessionId, sessionKey, agentId, agentHomeRoot: agentHomeDir, workspaceRoot };
+  const compressionKeepUserTurns = _getCompressionKeepUserTurns(agentHomeDir);
 
   if (isSteer){
     try { toolHost && toolHost.cancelActiveCall && toolHost.cancelActiveCall(); } catch {}
-    await runWithContext(ctx, () => sess.prompt(payloadMsg, { streamingBehavior: 'steer', expandPromptTemplates: true }));
+    const promptOpts = { streamingBehavior: 'steer', expandPromptTemplates: true };
+    if (images.length) promptOpts.images = images;
+    await runWithContext(ctx, () => sess.prompt(payloadMsg, promptOpts));
     try { emit({ type: 'steer_enqueued', sessionId, agentId, text: message }); } catch {}
     return { ok: true, mode: 'steer', text: '' };
   }
-
-  // --- Retry configuration ---
-  const _retryMaxRaw = Number(process.env.ARCANA_COMPLETION_MAX_RETRIES);
-  const _retryMax = (Number.isFinite(_retryMaxRaw) && _retryMaxRaw >= 0) ? _retryMaxRaw : 0;
-  const maxAttempts = _retryMax + 1; // total attempts per completion (default 1)
-  const defaultRetryDelayMs = 5000;
-  const _retryDelayRaw = Number(process.env.ARCANA_COMPLETION_RETRY_DELAY_MS);
-  const retryDelayMs = (Number.isFinite(_retryDelayRaw) && _retryDelayRaw >= 0) ? Math.max(_retryDelayRaw, defaultRetryDelayMs) : defaultRetryDelayMs;
 
   let lastAssistantText = '';
   let out = '';
@@ -1144,7 +2242,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   let assistantMessageMeta = null;
   let promptError = null;
 
-  for (let _attempt = 1; _attempt <= maxAttempts; _attempt++){
+  for (;;){
     // Reset tracking vars for each attempt
     lastAssistantText = ''; out = ''; thinkingChars = 0; toolCalls = 0;
     assistantBlockTypes.clear(); finishReason = ''; stopReason = '';
@@ -1152,7 +2250,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     promptError = null;
     lastErrorMessage = '';
     // Build payload for this attempt (may be updated on overflow retries)
-    payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+    payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + promptMessage;
 
     // --- Pre-prompt context overflow prevention ---
     // The sessions-store threshold check (in handleUserMessage) only measures text summaries,
@@ -1161,57 +2259,56 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     try {
       if (sess && typeof sess.getContextUsage === 'function') {
         const ctxUsage = sess.getContextUsage();
-        if (ctxUsage && ctxUsage.tokens != null && ctxUsage.contextWindow > 0) {
+        if (ctxUsage && ctxUsage.tokens != null) {
           const configuredThreshold = _getCompressionThresholdTokens(agentHomeDir) || 100000;
-          const windowThreshold = Math.floor(ctxUsage.contextWindow * 0.8);
-          const effectiveThreshold = Math.min(configuredThreshold, windowThreshold);
-
-          if (ctxUsage.tokens > effectiveThreshold) {
-            try {
-              await compactSession({
-                sessionId,
-                agentId,
-                workspaceRoot,
-                agentHomeDir,
-                keepRecentMessages: 10,
-                policy: DEFAULT_CONTEXT_POLICY,
-                broadcast(ev) {
-                  try {
-                    if (!ev || typeof ev !== 'object') return;
-                    emit({ ...ev, sessionId, agentId, sessionKey });
-                  } catch {}
-                },
-                reason: 'pre_prompt_context_overflow',
-              });
-            } catch {}
-
-            try {
-              const agent = sess && sess.agent ? sess.agent : null;
-              if (agent && typeof agent.replaceMessages === 'function') {
-                agent.replaceMessages([]);
+          const projected = estimateProjectedPromptTokens({
+            liveContextTokens: ctxUsage.tokens,
+            preludeText: usePrelude,
+            promptMessage,
+          });
+          chatContextDebugLog('turn:context-usage', {
+            sessionId,
+            agentId,
+            phase: 'pre_prompt',
+            tokens: Number(ctxUsage.tokens || 0) || 0,
+            projectedTokens: Number(projected && projected.tokens || 0) || 0,
+            baseTokens: Number(projected && projected.baseTokens || 0) || 0,
+            promptTokens: Number(projected && projected.promptTokens || 0) || 0,
+            source: String(projected && projected.source || ''),
+            contextWindow: Number(ctxUsage.contextWindow || 0) || 0,
+            configuredThreshold,
+            internalMessageCount: (() => {
+              try {
+                const msgs = sess.agent && sess.agent.state && Array.isArray(sess.agent.state.messages)
+                  ? sess.agent.state.messages
+                  : [];
+                return msgs.length;
+              } catch {
+                return 0;
               }
-            } catch {}
-
-            let hist = null;
-            try { hist = ssLoad(sessionId, { agentId }); } catch {}
-            try {
-              if (hist && Array.isArray(hist.messages) && hist.messages.length) {
-                const lastIdx = hist.messages.length - 1;
-                const last = hist.messages[lastIdx];
-                if (last && last.role === 'user') {
-                  const lastText = String(last.text || '').trim();
-                  const msgTrim = String(message || '').trim();
-                  if (lastText && msgTrim && lastText === msgTrim) {
-                    hist.messages = hist.messages.slice(0, -1);
-                  }
-                }
-              }
-            } catch {}
-
-            dynamicPrelude = buildSessionPrelude(hist, DEFAULT_CONTEXT_POLICY) || '';
+            })(),
+          });
+          if (projected.tokens > configuredThreshold && compressionKeepUserTurns > 0) {
+            dynamicPrelude = await compactInternalHistoryAndRebuildPrelude({
+              session: sess,
+              sessionId,
+              sessionKey,
+              agentId,
+              workspaceRoot,
+              agentHomeDir,
+              message,
+              keepRecentUserTurns: compressionKeepUserTurns,
+              reason: 'pre_prompt_threshold',
+            });
             usePrelude = dynamicPrelude || '';
-            payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
-
+            chatContextDebugLog('turn:prelude-updated', {
+              sessionId,
+              agentId,
+              phase: 'pre_prompt_threshold',
+              injectedPrelude: !!usePrelude,
+              preludeChars: usePrelude.length,
+            });
+            payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + promptMessage;
           }
         }
       }
@@ -1276,7 +2373,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
 
         if (t === 'message_update' && ev.message && ev.message.role === 'assistant'){
           const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
-          const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+          const text = mergeTextBlocks(blocks);
           if (text){
             out = mergeStreamingText(out, text);
             sawAssistantText = true;
@@ -1286,7 +2383,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         if (t === 'message_end' && ev.message && ev.message.role === 'assistant'){
           const msg = ev.message;
           const blocks = Array.isArray(msg.content) ? msg.content : [];
-          const text = blocks.filter((c) => c && c.type === 'text').map((c) => c.text || '').join('');
+          const text = mergeTextBlocks(blocks);
           if (text){
             out = mergeStreamingText(out, text);
             lastAssistantText = out;
@@ -1326,6 +2423,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       // pass a safe fallback so we queue instead of throwing. 'followUp' is ignored
       // when not streaming, and avoids HTTP 500 "Agent is already processing" races.
       const promptOpts = { expandPromptTemplates: true };
+      if (images.length) promptOpts.images = images;
       try { if (sess && sess.isStreaming) Object.assign(promptOpts, { streamingBehavior: 'followUp' }); } catch {}
       if (_idlePromise){
         await Promise.race([
@@ -1375,86 +2473,43 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       : 3;
     if (isContextOverflowError(promptError, finishReason, stopReason, lastErrorMessage) && overflowRetries < overflowMax) {
       try {
-        const steps = (DEFAULT_CONTEXT_POLICY && Array.isArray(DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps) && DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps.length)
-          ? DEFAULT_CONTEXT_POLICY.keepRecentRetrySteps
-          : [20, 10, 6];
-        const step = steps[Math.min(overflowRetries, steps.length - 1)];
+        if (compressionKeepUserTurns <= 0){
+          break;
+        }
 
-        await compactSession({
+        dynamicPrelude = await compactInternalHistoryAndRebuildPrelude({
+          session: sess,
           sessionId,
+          sessionKey,
           agentId,
           workspaceRoot,
           agentHomeDir,
-          keepRecentMessages: step,
-          policy: DEFAULT_CONTEXT_POLICY,
-          broadcast(ev){
-            try {
-              if (!ev || typeof ev !== 'object') return;
-              emit({ ...ev, sessionId, agentId, sessionKey });
-            } catch {}
-          },
+          message,
+          keepRecentUserTurns: compressionKeepUserTurns,
           reason: 'overflow',
         });
-
-        // Clear pi-agent-core's in-memory messages so the next prompt starts fresh.
-        // The prelude will be rebuilt from the (now-compacted) sessions-store.
-        try {
-          const agent = sess && sess.agent ? sess.agent : null;
-          if (agent && typeof agent.replaceMessages === 'function'){
-            agent.replaceMessages([]);
-          }
-        } catch {}
-
-        // Reload history and drop trailing duplicate user message
-        let hist = null;
-        try { hist = ssLoad(sessionId, { agentId }); } catch {}
-        try {
-          if (hist && Array.isArray(hist.messages) && hist.messages.length){
-            const lastIdx = hist.messages.length - 1;
-            const last = hist.messages[lastIdx];
-            if (last && last.role === 'user'){
-              const lastText = String(last.text || '').trim();
-              const msgTrim = String(message || '').trim();
-              if (lastText && msgTrim && lastText === msgTrim){
-                hist.messages = hist.messages.slice(0, -1);
-              }
-            }
-          }
-        } catch {}
-
-        // Build a tighter prelude for retry
-        const retryPolicy = { ...(DEFAULT_CONTEXT_POLICY || {}), preludeMaxMessages: step };
-        dynamicPrelude = buildSessionPrelude(hist, retryPolicy) || '';
         usePrelude = dynamicPrelude || '';
-        payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + message;
+        chatContextDebugLog('turn:prelude-updated', {
+          sessionId,
+          agentId,
+          phase: 'overflow_retry',
+          injectedPrelude: !!usePrelude,
+          preludeChars: usePrelude.length,
+          overflowRetries: overflowRetries + 1,
+        });
+        payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + promptMessage;
 
         overflowRetries += 1;
 
         // Reset usage helper before retry
         if (usageHelper) usageHelper.reset();
 
-        // Do not consume transient retry budget for overflow compaction
-        _attempt -= 1;
         continue;
       } catch {
-        // If compaction/reset fails, fall through to transient retry logic below.
+        // If compaction/reset fails, fall through to normal error handling below.
       }
     }
-
-    // Transient retry logic
-    const _retryable = isRetryableCompletionError(promptError, finishReason, stopReason);
-    if (!_retryable || _attempt >= maxAttempts) break; // final failure or non-retryable
-
-    try {
-      const _logRetries = truthyEnv("ARCANA_COMPLETION_LOG_RETRIES");
-      if (_logRetries){
-        console.warn("[arcana:gateway-v2] completion retry attempt=%d/%d delay=%dms reason=%s", _attempt, maxAttempts, retryDelayMs, promptError ? String(promptError.message || promptError).slice(0, 200) : _completionErr);
-      }
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-
-    // Reset usage helper for next attempt
-    if (usageHelper) usageHelper.reset();
+    break;
   }
   const usage = sess.__arcana_chat_usage ? sess.__arcana_chat_usage.snapshot() : { contextTokens: 0, outputTokens: 0, totalTokens: 0 };
   let sessionTokensTotal = 0;
@@ -1578,7 +2633,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     } catch {}
     try {
       const msgWithLog = logPath ? (msg + ' (log: ' + logPath + ')') : msg;
-      emit({ type: 'error', sessionId, agentId, message: msgWithLog, stack });
+      emit(withSessionStreamRouting({ type: 'error', message: msgWithLog, stack }, { sessionId, sessionKey, agentId }));
     } catch {}
     return { ok: false, mode: 'turn', error: msg, text: lastAssistantText || out, logPath };
   }
@@ -1678,13 +2733,13 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       const msgCore = core || (reasonShort || completionErrorReason || '');
       const msg = 'completion_error: ' + msgCore;
       const msgWithLog = logPath ? (msg + ' (log: ' + logPath + ')') : msg;
-      emit({ type: 'error', sessionId, agentId, message: msgWithLog });
+      emit(withSessionStreamRouting({ type: 'error', message: msgWithLog }, { sessionId, sessionKey, agentId }));
     } catch {}
     const errCore = core || (reasonShort || completionErrorReason || '');
     return { ok: false, mode: 'turn', error: 'completion_error: ' + errCore, text: lastAssistantText || out, logPath };
   }
 
-  if (!finalText && !sawAssistantText && toolCalls === 0 && assistantBlockTypes.size === 0){
+  if (!finalText && !sawAssistantText){
     try {
       const lp = buildChatLogPath(agentId, sessionKey, sessionId);
       const headerLines = [
@@ -1717,30 +2772,63 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
       await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
       logPath = lp;
-      warning = 'empty_completion';
+      warning = (toolCalls > 0 || assistantBlockTypes.size > 0)
+        ? 'empty_completion_after_tools'
+        : 'empty_completion';
       try {
-        const msg = 'empty_completion' + (logPath ? ' (log: ' + logPath + ')' : '');
-        emit({ type: 'warning', sessionId, agentId, code: 'empty_completion', message: msg });
+        const msg = String(warning) + (logPath ? ' (log: ' + logPath + ')' : '');
+        emit(withSessionStreamRouting({ type: 'warning', code: String(warning), message: msg }, { sessionId, sessionKey, agentId }));
       } catch {}
     } catch {}
   }
 
+  const responseUsage = usage && (usage.totalTokens > 0 || usage.contextTokens > 0 || usage.outputTokens > 0)
+    ? {
+      inputTokens: usage.contextTokens,
+      outputTokens: usage.outputTokens,
+      totalTokens: usage.totalTokens,
+      lastCallInputTokens: usage.lastCallContextTokens || 0,
+      lastCallTotalTokens: usage.lastCallTotalTokens || 0,
+      ...(usageModelLabel ? { model: usageModelLabel } : {}),
+    }
+    : null;
+
   if (warning){
-    return { ok: true, mode: 'turn', text: '', warning, logPath };
+    if (warning === 'empty_completion_after_tools'){
+      try {
+        const msg = 'completion_error: ' + warning + (logPath ? ' (log: ' + logPath + ')' : '');
+        emit(withSessionStreamRouting({ type: 'error', message: msg }, { sessionId, sessionKey, agentId }));
+      } catch {}
+      return { ok: false, mode: 'turn', error: warning, text: '', warning, logPath, usage: responseUsage };
+    }
+    return { ok: true, mode: 'turn', text: '', warning, logPath, usage: responseUsage };
   }
-  return { ok: true, mode: 'turn', text: finalText };
+  return { ok: true, mode: 'turn', text: finalText, usage: responseUsage };
 }
 
-export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId, text: rawText, policy: rawPolicy, title, sync }){
+export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId, workspaceRoot: rawWorkspaceRoot, agentHomeRoot: rawAgentHomeRoot, text: rawText, policy: rawPolicy, title, sync, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, attachments: rawAttachments }){
   const agentId = normalizeAgentId(rawAgentId || DEFAULT_AGENT_ID);
   const policy = String(rawPolicy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   const trimmed = trimUserMessage(String(rawText || '').trim(), DEFAULT_CONTEXT_POLICY);
-  if (!trimmed){
+  const attachments = normalizeChatAttachments(rawAttachments);
+  if (!trimmed && !attachments.length){
     return { ok: false, error: 'missing_text' };
   }
+  const promptText = trimmed || 'See attached image.';
+  localProxyDebugLog('runChatMessage ingress', {
+    agentId,
+    sessionKey: String(sessionKey || '').trim() || null,
+    sessionId: String(rawSessionId || '').trim() || null,
+    agentHomeRoot: normalizeAgentHomeRootOverride(rawAgentHomeRoot) || null,
+    localToolProxyEnabled: !!localToolProxy,
+    toolAllowlistCount: Array.isArray(toolAllowlist) ? toolAllowlist.length : 0,
+    localAgentSignature: buildLocalAgentSignature(localAgentSignature),
+    localToolDefinitions: summarizeInjectedLocalToolDefinitionsForDebug(localToolDefinitions),
+    attachmentCount: attachments.length,
+  });
 
-  const ws = resolveWorkspaceRoot();
-  const agentHomeDir = arcanaHomePath('agents', agentId);
+  const ws = normalizeWorkspaceRootOverride(rawWorkspaceRoot) || resolveWorkspaceRoot();
+  const agentHomeDir = normalizeAgentHomeRootOverride(rawAgentHomeRoot) || arcanaHomePath('agents', agentId);
   const ensuredId = await ensureSessionId({ sessionId: rawSessionId, sessionKey, title: title || 'Arcana Web', agentId, workspaceRoot: ws });
   const sessionId = String(ensuredId || '').trim();
   if (!sessionId){
@@ -1767,85 +2855,61 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
     }
   }
 
-  // Optional history compaction based on configured thresholds, before appending
+  let record;
+  try {
+    record = await ensureChatSession({
+      sessionId,
+      sessionKey,
+      agentId,
+      policy,
+      workspaceRoot: ws,
+      agentHomeRoot: agentHomeDir,
+      toolRouting,
+      localToolProxy,
+      toolAllowlist,
+      localToolDefinitions,
+      localBootstrapFiles,
+      localAgentSignature,
+    });
+  } catch (e) {
+    const code = String((e && e.code) || '').toUpperCase();
+    const message = String((e && e.message) || e || 'Failed to start chat session');
+    if (code === 'ARCANA_NO_MODEL_SELECTED'){
+      return { ok: false, error: 'no_model_selected', status: (typeof e.status === 'number' ? e.status : 400), message };
+    }
+    return { ok: false, error: 'turn_failed', status: (typeof e.status === 'number' ? e.status : 500), message };
+  }
+  const session = record.session;
+
+  // Optional history compaction based on the real prompt context footprint.
+  // If the session already has internal context, use its live token usage.
+  // Otherwise, estimate the prelude that will actually be injected for this turn.
   try {
     if (historyObj && Array.isArray(historyObj.messages) && historyObj.messages.length){
-      const globalCfg = loadArcanaConfig();
-      const agentCfg = loadAgentConfig(agentHomeDir);
-
-      function readCompressionKey(key){
-        let val;
-        try {
-          if (agentCfg && typeof agentCfg === 'object' && Object.prototype.hasOwnProperty.call(agentCfg, key)){
-            const raw = agentCfg[key];
-            if (raw != null){
-              if (typeof raw === 'string'){
-                if (raw.trim() !== '') val = raw;
-              } else {
-                val = raw;
-              }
-            }
-          }
-          if (val === undefined && globalCfg && typeof globalCfg === 'object' && Object.prototype.hasOwnProperty.call(globalCfg, key)){
-            const raw = globalCfg[key];
-            if (raw != null){
-              if (typeof raw === 'string'){
-                if (raw.trim() !== '') val = raw;
-              } else {
-                val = raw;
-              }
-            }
-          }
-        } catch {}
-        return val;
-      }
-
-      const enabledRaw = readCompressionKey('history_compression_enabled');
-      let historyCompressionEnabled = true;
-      if (typeof enabledRaw === 'boolean'){
-        historyCompressionEnabled = enabledRaw;
-      } else if (enabledRaw != null){
-        const s = String(enabledRaw).trim().toLowerCase();
-        if (s){
-          if (s === '0' || s === 'false' || s === 'no' || s === 'off' || s === 'none' || s === 'null') historyCompressionEnabled = false;
-          else if (s === '1' || s === 'true' || s === 'yes' || s === 'on') historyCompressionEnabled = true;
-        }
-      }
-
-      const thresholdDefault = 100000;
-      const thresholdRaw = readCompressionKey('history_compression_threshold_tokens');
-      let thresholdTokens = thresholdDefault;
-      const thresholdNum = Number(thresholdRaw);
-      if (Number.isFinite(thresholdNum) && thresholdNum > 0){
-        thresholdTokens = Math.floor(thresholdNum);
-      }
-
-      const keepDefault = 10;
-      const keepRaw = readCompressionKey('history_compression_keep_user_turns');
-      let keepTurnsConfig = keepDefault;
-      const keepNum = Number(keepRaw);
-      if (Number.isFinite(keepNum) && keepNum > 0){
-        keepTurnsConfig = Math.floor(keepNum);
-      }
+      const historyCompressionEnabled = _getCompressionEnabled(agentHomeDir);
+      const thresholdTokens = _getCompressionThresholdTokens(agentHomeDir) || 100000;
+      const keepTurnsConfig = _getCompressionKeepUserTurns(agentHomeDir);
 
       if (historyCompressionEnabled && keepTurnsConfig > 0){
         keepUserTurnsForPrelude = keepTurnsConfig;
       }
 
       if (historyCompressionEnabled && thresholdTokens > 0 && keepTurnsConfig > 0){
-        const summaryTextRaw = historyObj && typeof historyObj.summary === 'string' ? historyObj.summary : '';
-        const summaryText = String(summaryTextRaw || '').trim();
-
-        let estimatedTokens = 0;
-        if (summaryText){
-          const preludeText = buildSessionPrelude(historyObj, DEFAULT_CONTEXT_POLICY, { keepRecentUserTurns: keepTurnsConfig }) || '';
-          estimatedTokens = estimateTokensFromText(preludeText);
-        } else {
-          const historyText = buildHistoryPreludeText(historyObj) || '';
-          estimatedTokens = estimateTokensFromText(historyText);
-        }
-
-        if (estimatedTokens > thresholdTokens){
+        const ctx = _getLiveContextTokensForCompression(session, historyObj, keepTurnsConfig, promptText);
+        chatContextDebugLog('turn:compression-check', {
+          sessionId,
+          agentId,
+          phase: 'run_chat_message',
+          source: String(ctx && ctx.source || ''),
+          baseTokens: Number(ctx && ctx.baseTokens || 0) || 0,
+          promptTokens: Number(ctx && ctx.promptTokens || 0) || 0,
+          tokens: Number(ctx && ctx.tokens || 0) || 0,
+          thresholdTokens,
+          keepRecentUserTurns: keepTurnsConfig,
+          storedMessages: Array.isArray(historyObj.messages) ? historyObj.messages.length : 0,
+          summaryChars: typeof historyObj.summary === 'string' ? historyObj.summary.length : 0,
+        });
+        if (ctx.tokens > thresholdTokens){
           let userTurns = 0;
           try {
             const msgs = Array.isArray(historyObj.messages) ? historyObj.messages : [];
@@ -1861,7 +2925,7 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
             }
 
             if (keepTurns > 0){
-              await compactSessionByUserTurns({
+              const compactResult = await compactSessionByUserTurns({
                 sessionId,
                 agentId,
                 workspaceRoot: ws,
@@ -1877,26 +2941,34 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
                 reason: 'threshold',
               });
 
-              try { historyObj = ssLoad(sessionId, { agentId }); } catch {}
+              if (compactResult && compactResult.compacted === true){
+                chatContextDebugLog('turn:compression-applied', {
+                  sessionId,
+                  agentId,
+                  phase: 'run_chat_message',
+                  reason: 'threshold',
+                  keepRecentUserTurns: keepTurns,
+                });
+                try {
+                  if (session && typeof session.newSession === 'function'){
+                    const p = session.newSession();
+                    if (p && typeof p.then === 'function') await p;
+                  } else {
+                    const agent = session && session.agent ? session.agent : null;
+                    if (agent && typeof agent.replaceMessages === 'function'){
+                      agent.replaceMessages([]);
+                    }
+                  }
+                } catch {}
+
+                try { historyObj = ssLoad(sessionId, { agentId }); } catch {}
+              }
             }
           }
         }
       }
     }
   } catch {}
-
-  let record;
-  try {
-    record = await ensureChatSession({ sessionId, agentId, policy });
-  } catch (e) {
-    const code = String((e && e.code) || '').toUpperCase();
-    const message = String((e && e.message) || e || 'Failed to start chat session');
-    if (code === 'ARCANA_NO_MODEL_SELECTED'){
-      return { ok: false, error: 'no_model_selected', status: (typeof e.status === 'number' ? e.status : 400), message };
-    }
-    return { ok: false, error: 'turn_failed', status: (typeof e.status === 'number' ? e.status : 500), message };
-  }
-  const session = record.session;
 
   // Build prelude before appending current user message
   let prelude;
@@ -1909,17 +2981,43 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
   }
 
   // Persist user message
-  ssAppend(sessionId, { role: 'user', text: trimmed, agentId });
+  const userMediaRefs = attachmentsToMediaRefs(attachments);
+  ssAppend(sessionId, { role: 'user', text: promptText, agentId, mediaRefs: userMediaRefs });
+  emitUserMessageDelivered({
+    sessionId,
+    sessionKey,
+    agentId,
+    text: promptText,
+    mediaRefs: userMediaRefs,
+  });
 
   const isSteer = !!(session && session.isStreaming);
-  const result = await runPromptWithSteer({ record, sessionId, sessionKey, message: trimmed, prelude, isSteer });
+  const turnEndCountBefore = Number(record && record.__arcana_turnEndCount) || 0;
+  const result = await runPromptWithSteer({ record, sessionId, sessionKey, message: promptText, prelude, isSteer, attachments });
+  if (!isSteer && result && result.ok !== false){
+    ensureAssistantTextDelivered({
+      record,
+      sessionId,
+      sessionKey,
+      agentId,
+      text: result.text || '',
+    });
+    ensureTurnEndDelivered({
+      record,
+      sessionId,
+      sessionKey,
+      agentId,
+      turnEndCountBefore,
+      force: true,
+    });
+  }
 
   if (!sync){
-    return { ok: result.ok !== false, mode: result.mode, sessionId, error: result.error, warning: result.warning, logPath: result.logPath };
+    return { ok: result.ok !== false, mode: result.mode, sessionId, text: result.text || '', error: result.error, warning: result.warning, logPath: result.logPath, usage: result.usage || null };
   }
 
   const assistantText = result.text || '';
-  return { ok: result.ok !== false, mode: result.mode, sessionId, text: assistantText, error: result.error, warning: result.warning, logPath: result.logPath };
+  return { ok: result.ok !== false, mode: result.mode, sessionId, text: assistantText, error: result.error, warning: result.warning, logPath: result.logPath, usage: result.usage || null };
 }
 
 export async function abortChat({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId }){
@@ -1968,7 +3066,7 @@ export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessio
   }
   if (!sessionId) return { ok: false, reason: 'missing_sessionId' };
   // Ensure a session record exists so reset works after restarts
-  try { await ensureChatSession({ sessionId, agentId, policy: 'restricted' }); } catch {}
+  try { await ensureChatSession({ sessionId, sessionKey, agentId, policy: 'restricted' }); } catch {}
 
   let cleared = false;
   for (const rec of chatSessions.values()){
@@ -2019,4 +3117,13 @@ export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessio
   return { ok: cleared };
 }
 
-export default { runChatMessage, abortChat, clearChatContext, invalidateChatSessions };
+export default {
+  runChatMessage,
+  abortChat,
+  clearChatContext,
+  invalidateChatSessions,
+  attachLocalToolProxyHub,
+  cancelLocalToolProxyCallsForClient,
+  handleLocalToolProxyMessage,
+  handleLocalToolProxyHeartbeat,
+};

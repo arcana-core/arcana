@@ -88,6 +88,14 @@ export class BrowserManager {
     return u;
   }
 
+  _workspaceRootFromHeaders(headers){
+    try {
+      const raw = String(headers && (headers["x-arcana-workspace-root"] || headers["X-Arcana-Workspace-Root"]) || "").trim();
+      if (raw) return raw;
+    } catch {}
+    return this.workspaceRoot;
+  }
+
   async start({ headers, headless=true, engine, forceRestart=false, webgl, proxy, profileKey, browserProfile, profile, driver, mcp }={}){
     const key = this._resolveProfileKey({ headers, proxy, profileKey, browserProfile, profile });
     const drv = this._normalizeDriver(driver, key);
@@ -279,7 +287,8 @@ export class BrowserManager {
       console.error("[web_render] Warning: quality is only used for jpeg screenshots and will be ignored for type png.");
     }
 
-    const absPath = path.isAbsolute(effectiveRelPath) ? effectiveRelPath : path.join(this.workspaceRoot, effectiveRelPath);
+    const outputRoot = this._workspaceRootFromHeaders(headers);
+    const absPath = path.isAbsolute(effectiveRelPath) ? effectiveRelPath : path.join(outputRoot, effectiveRelPath);
     try { await fs.promises.mkdir(path.dirname(absPath), { recursive: true }); } catch {}
 
     if (drv === "mcp"){

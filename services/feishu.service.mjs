@@ -90,51 +90,89 @@ function parseBool(value, defaultValue = false) {
   return defaultValue;
 }
 
-async function spawnBridge(ctx, cwd, scriptRel, feishuDomain, channel, arcanaServerUrl, requireMention) {
+function nextRestartDelayMs(attempt) {
+  const a = Math.max(0, Number(attempt) || 0);
+  return Math.min(30000, 1000 * Math.pow(2, Math.min(a, 5)));
+}
+
+async function startManagedBridge(ctx, cwd, scriptRel, feishuDomain, channel, arcanaServerUrl, requireMention, replyInThread) {
   const outPath = join(ctx.logDir, `bridge.${channel.agentId}.stdout.log`);
   const errPath = join(ctx.logDir, `bridge.${channel.agentId}.stderr.log`);
   const out = createWriteStream(outPath, { flags: 'a' });
   const err = createWriteStream(errPath, { flags: 'a' });
 
-  const child = spawn(process.execPath || 'node', [scriptRel], {
-    cwd,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ARCANA_SERVER_URL: arcanaServerUrl },
-    detached: false,
-  });
+  let child = null;
+  let stopping = false;
+  let restartAttempt = 0;
+  let restartTimer = null;
 
-  let ready = false;
-  try {
-    const json = JSON.stringify({
-      appId: channel.appId,
-      appSecret: channel.appSecret,
-      agentId: channel.agentId || '',
-      domain: feishuDomain,
-      encryptKey: channel.encryptKey || '',
-      verificationToken: channel.verificationToken || '',
-      requireMention,
+  const launch = () => {
+    if (stopping) return;
+
+    child = spawn(process.execPath || 'node', [scriptRel], {
+      cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ARCANA_SERVER_URL: arcanaServerUrl, ARCANA_WORKSPACE_ROOT: ctx.workspaceRoot },
+      detached: false,
     });
-    child.stdin.write(json + '\n');
-    child.stdin.end();
-    ready = true;
-  } finally {
-    if (!ready) {
-      try { child.stdin.end(); } catch {}
+
+    let ready = false;
+    try {
+      const json = JSON.stringify({
+        appId: channel.appId,
+        appSecret: channel.appSecret,
+        agentId: channel.agentId || '',
+        domain: feishuDomain,
+        encryptKey: channel.encryptKey || '',
+        verificationToken: channel.verificationToken || '',
+        requireMention,
+        replyInThread,
+      });
+      child.stdin.write(json + '\n');
+      child.stdin.end();
+      ready = true;
+    } finally {
+      if (!ready) {
+        try { child.stdin.end(); } catch {}
+      }
     }
-  }
 
-  child.stdout.on('data', (d) => { out.write(d); });
-  child.stderr.on('data', (d) => { err.write(d); });
-  child.on('close', (code, signal) => {
-    try { out.write('\n[bridge-exit] code=' + code + ' signal=' + signal + '\n'); } catch {}
-    closeStream(out);
-    closeStream(err);
-  });
-  child.on('error', (error) => {
-    try { err.write('[bridge-error] ' + (error?.stack || error?.message || String(error)) + '\n'); } catch {}
-  });
+    child.stdout.on('data', (d) => { out.write(d); });
+    child.stderr.on('data', (d) => { err.write(d); });
+    child.on('close', (code, signal) => {
+      try { out.write('\n[bridge-exit] code=' + code + ' signal=' + signal + '\n'); } catch {}
+      if (stopping) return;
+      restartAttempt += 1;
+      const delayMs = nextRestartDelayMs(restartAttempt);
+      try {
+        err.write('[bridge-restart] agent=' + (channel.agentId || 'default') + ' attempt=' + restartAttempt + ' delayMs=' + delayMs + '\n');
+      } catch {}
+      restartTimer = setTimeout(() => {
+        restartTimer = null;
+        launch();
+      }, delayMs);
+    });
+    child.on('error', (error) => {
+      try { err.write('[bridge-error] ' + (error?.stack || error?.message || String(error)) + '\n'); } catch {}
+    });
 
-  return { child, out, err };
+    restartAttempt = 0;
+  };
+
+  launch();
+
+  return {
+    stop() {
+      stopping = true;
+      if (restartTimer) {
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+      if (child) stopChild(child);
+      closeStream(out);
+      closeStream(err);
+    },
+  };
 }
 
 export async function start(ctx){
@@ -142,6 +180,7 @@ export async function start(ctx){
   const scriptRel = 'scripts/feishu-bridge.mjs';
   const arcanaServerUrl = (process.env.ARCANA_SERVER_URL || 'http://127.0.0.1:8787').trim();
   const requireMention = parseBool(process.env.FEISHU_GROUP_REQUIRE_MENTION, false);
+  const replyInThread = parseBool(process.env.FEISHU_REPLY_IN_THREAD, true);
 
   await fsp.mkdir(ctx.logDir, { recursive: true });
 
@@ -182,13 +221,11 @@ export async function start(ctx){
   const bridges = [];
   try {
     for (const channel of channelConfigs) {
-      bridges.push(await spawnBridge(ctx, cwd, scriptRel, feishuDomain, channel, arcanaServerUrl, requireMention));
+      bridges.push(await startManagedBridge(ctx, cwd, scriptRel, feishuDomain, channel, arcanaServerUrl, requireMention, replyInThread));
     }
   } catch (error) {
     for (const bridge of bridges) {
-      stopChild(bridge.child);
-      closeStream(bridge.out);
-      closeStream(bridge.err);
+      bridge.stop();
     }
     throw error;
   }
@@ -196,7 +233,7 @@ export async function start(ctx){
   return {
     async stop(){
       for (const bridge of bridges) {
-        stopChild(bridge.child);
+        bridge.stop();
       }
     }
   };

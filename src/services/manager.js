@@ -45,6 +45,12 @@ function serviceIdFromFilename(file) {
   return b.slice(0, b.length - e.length);
 }
 
+export function normalizeServiceId(id) {
+  const raw = String(id || "").trim();
+  if (raw === "tool-daemon") return "tool_daemon";
+  return raw;
+}
+
 function isBundledServicesEnabled() {
   try {
     const raw = String(process.env.ARCANA_ENABLE_BUNDLED_SERVICES || "").trim().toLowerCase();
@@ -194,13 +200,20 @@ async function stopOne(id, reason) {
   await appendLog(logFile, "stopping service id=" + id + " reason=" + (reason || ""));
   try {
     const res = s.stop();
-    if (res && typeof res.then === "function") await res;
+    if (res && typeof res.then === "function") {
+      const STOP_TIMEOUT = 5000;
+      const timeout = new Promise(function (_, rej) {
+        setTimeout(function () { rej(new Error("stop() timed out after " + STOP_TIMEOUT + "ms")); }, STOP_TIMEOUT);
+      });
+      await Promise.race([res, timeout]);
+    }
     s.status = "stopped";
     await appendLog(logFile, "stopped service id=" + id);
     return { ok: true };
   } catch (e) {
-    await appendLog(logFile, "error while stopping id=" + id + ": " + String(e && e.stack ? e.stack : e));
-    return { ok: false, error: "stop_failed" };
+    s.status = "stopped";
+    await appendLog(logFile, "stop error (force-marked stopped) id=" + id + ": " + String(e && e.stack ? e.stack : e));
+    return { ok: true, warning: String(e && e.message ? e.message : e) };
   }
 }
 
@@ -289,6 +302,7 @@ export async function startService({ id, workspaceRoot } = {}) {
   state.workspaceRoot = root;
   installHooksOnce();
 
+  id = normalizeServiceId(id);
   if (!id) throw new Error("service id required");
   if (state.services.has(id)) return getServicesStatus();
 
@@ -315,12 +329,14 @@ export async function startService({ id, workspaceRoot } = {}) {
 }
 
 export async function stopService({ id, reason } = {}) {
+  id = normalizeServiceId(id);
   if (!id) throw new Error("service id required");
   await stopOne(id, reason || "tool");
   return getServicesStatus();
 }
 
 export async function restartService({ id } = {}) {
+  id = normalizeServiceId(id);
   if (!id) throw new Error("service id required");
   const s = state.services.get(id);
   if (!s) throw new Error("unknown service: " + id);
@@ -354,6 +370,7 @@ export function getServicesStatus() {
 }
 
 export default {
+  normalizeServiceId,
   startServicesOnce,
   reloadServices,
   startService,

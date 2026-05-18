@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js';
 import { resolveWorkspaceRoot } from './workspace-guard.js';
 import { createSession, loadSession } from './sessions-store.js';
+import { loadSessionMeta, saveSessionMeta } from './session-meta-store.js';
 
 const DEFAULT_AGENT_ID = 'default';
 
@@ -118,6 +119,52 @@ function writeMapping(agentIdRaw, sessionKeyRaw, sessionIdRaw) {
   return payload;
 }
 
+function deriveSessionSource(sessionKeyRaw, titleRaw) {
+  const key = normalizeSessionKey(sessionKeyRaw);
+  const title = String(titleRaw || '').trim();
+  if (key) {
+    const lower = key.toLowerCase();
+    if (lower.startsWith('cp:')) return 'cutpilot';
+    if (lower.startsWith('wake-agent:')) return 'wake_agent';
+    if (lower.startsWith('livestream:')) return 'livestream';
+    if (lower.startsWith('voice_ingress')) return 'voice_ingress';
+    if (lower.startsWith('heartbeat:')) return 'heartbeat';
+  }
+  if (title === 'Heartbeat') return 'heartbeat';
+  if (title === 'Wake Agent') return 'wake_agent';
+  if (title === 'Arcana Web') return 'arcana_web';
+  return '';
+}
+
+function upsertSessionMeta({ agentId, sessionId, sessionKey, title, workspaceRoot } = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  const existing = loadSessionMeta(sid, { agentId }) || {};
+  const next = existing && typeof existing === 'object' ? { ...existing } : {};
+  let changed = false;
+
+  const key = normalizeSessionKey(sessionKey);
+  if (key && next.sessionKey !== key) {
+    next.sessionKey = key;
+    changed = true;
+  }
+
+  const ws = String(workspaceRoot || '').trim();
+  if (ws && next.workspaceRoot !== ws) {
+    next.workspaceRoot = ws;
+    changed = true;
+  }
+
+  const source = deriveSessionSource(sessionKey, title);
+  if (source && next.sessionSource !== source) {
+    next.sessionSource = source;
+    changed = true;
+  }
+
+  if (!changed) return true;
+  return saveSessionMeta(sid, next, { agentId });
+}
+
 export async function getSessionIdForKey({ agentId, sessionKey } = {}) {
   const mapping = readMapping(agentId, sessionKey);
   if (!mapping) return null;
@@ -128,6 +175,15 @@ export async function getSessionIdForKey({ agentId, sessionKey } = {}) {
 export async function setSessionIdForKey({ agentId, sessionKey, sessionId } = {}) {
   const payload = writeMapping(agentId, sessionKey, sessionId);
   if (!payload) return null;
+  try {
+    upsertSessionMeta({
+      agentId: payload.agentId,
+      sessionId: payload.sessionId,
+      sessionKey: payload.sessionKey,
+      title: '',
+      workspaceRoot: '',
+    });
+  } catch {}
   return {
     agentId: payload.agentId,
     sessionKey: payload.sessionKey,
@@ -151,6 +207,15 @@ export async function resolveSessionIdForKey({ agentId, sessionKey, title, works
   if (existingId) {
     const loaded = loadSession(existingId, { agentId: normAgentId });
     if (loaded && loaded.id) {
+      try {
+        upsertSessionMeta({
+          agentId: normAgentId,
+          sessionId: loaded.id,
+          sessionKey: key,
+          title,
+          workspaceRoot,
+        });
+      } catch {}
       return {
         agentId: normAgentId,
         sessionKey: key,
@@ -166,6 +231,15 @@ export async function resolveSessionIdForKey({ agentId, sessionKey, title, works
   const sid = created && created.id ? created.id : null;
   if (sid) {
     await setSessionIdForKey({ agentId: normAgentId, sessionKey: key, sessionId: sid });
+    try {
+      upsertSessionMeta({
+        agentId: normAgentId,
+        sessionId: sid,
+        sessionKey: key,
+        title: t,
+        workspaceRoot: ws,
+      });
+    } catch {}
   }
 
   return {

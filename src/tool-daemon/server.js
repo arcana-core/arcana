@@ -16,6 +16,14 @@ function json(res, code, obj){
 
 function notFound(res){ res.statusCode = 404; try { res.end("not_found"); } catch {} }
 
+function requestWorkspaceRoot(headers, fallback){
+  try {
+    const raw = String(headers && (headers["x-arcana-workspace-root"] || headers["X-Arcana-Workspace-Root"]) || "").trim();
+    if (raw) return raw;
+  } catch {}
+  return fallback;
+}
+
 export async function startToolDaemon({ workspaceRoot, port }){
   const { token } = await ensureToolDaemonAuth({ workspaceRoot });
   const bm = new BrowserManager({ workspaceRoot, maxProfiles: 6 });
@@ -24,7 +32,7 @@ export async function startToolDaemon({ workspaceRoot, port }){
     (async function(){
       try {
         // CORS for local dev convenience
-        try { res.setHeader("access-control-allow-origin", "*"); res.setHeader("access-control-allow-headers", "authorization, content-type, x-arcana-agent-id, x-arcana-session-id"); } catch {}
+        try { res.setHeader("access-control-allow-origin", "*"); res.setHeader("access-control-allow-headers", "authorization, content-type, x-arcana-agent-id, x-arcana-session-id, x-arcana-workspace-root"); } catch {}
         if (req.method === "OPTIONS"){ res.statusCode = 204; try { res.end(); } catch {} return; }
 
         let urlPathname = "/";
@@ -103,7 +111,7 @@ export async function startToolDaemon({ workspaceRoot, port }){
             const name = seg[2] || "";
             try {
               if (name === "bash"){
-                const resu = await runBash({ command: String(args.command||""), timeoutSec: Number(args.timeout||0) });
+                const resu = await runBash({ command: String(args.command||""), timeoutSec: Number(args.timeout||0), cwd: requestWorkspaceRoot(req.headers, workspaceRoot) });
                 if (resu.ok){ return finish(200, { content:[{ type:"text", text: resu.text }], details:{ ok:true, path: resu.path } }); }
                 const kind = resu.timeout ? "timeout" : "error";
                 return finish(200, { content:[{ type:"text", text: resu.text || resu.error || "bash failed" }], details:{ ok:false, error: kind } });

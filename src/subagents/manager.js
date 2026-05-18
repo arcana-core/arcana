@@ -2,8 +2,10 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { getContext } from '../event-bus.js';
 import { resolveWorkspaceRoot } from '../workspace-guard.js';
 import { emit as emitEvent } from '../event-bus.js';
+import { getToolDisabledState } from '../tool-permissions.js';
 
 function registryPath(){
   const root = resolveWorkspaceRoot();
@@ -42,11 +44,33 @@ export function listRuns(recentMinutes=60){
 }
 
 export function spawnSubagent({ task, label, allowedPaths, runTimeoutSeconds }){
+  const ctx = getContext?.() || null;
+  const disabledState = getToolDisabledState('codex', {
+    agentHomeRoot: ctx?.agentHomeRoot,
+  });
+  if (disabledState && disabledState.disabled) {
+    return {
+      status: 'blocked',
+      error: disabledState.error || 'tool_disabled',
+      reason: disabledState.reason || 'disabled_by_agent_config',
+      tool: disabledState.toolName || 'codex',
+      message: disabledState.text || 'Tool "codex" is disabled.',
+    };
+  }
+
   const runId = randomUUID();
   const childSessionKey = makeChildSessionKey();
   const root = resolveWorkspaceRoot();
   const childPath = resolve(join(root, 'arcana', 'src', 'subagents', 'embedded-child.js'));
-  const init = { task, label, allowedPaths, runId, childSessionKey };
+  const init = {
+    task,
+    label,
+    allowedPaths,
+    runId,
+    childSessionKey,
+    agentId: ctx?.agentId || '',
+    agentHomeRoot: ctx?.agentHomeRoot || '',
+  };
   const child = spawn(process.execPath, [childPath], {
     cwd: root,
     stdio: ['pipe','pipe','pipe'],

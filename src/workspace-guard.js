@@ -1,6 +1,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { resolve, sep, isAbsolute, dirname, join, basename } from "node:path";
 import { loadArcanaConfig } from "./config.js";
+import { resolveArcanaHome } from "./arcana-home.js";
 import { emit as emitEvent, getContext } from "./event-bus.js";
 
 // Workspace Guard
@@ -44,6 +45,26 @@ function canon(p) {
 
 function withTrailingSep(p) { return p.endsWith(sep) ? p : (p + sep); }
 
+function getReadableRoots() {
+  const workspaceRoot = resolveWorkspaceRoot();
+  const roots = [workspaceRoot];
+  try {
+    const arcanaHome = String(resolveArcanaHome() || "").trim();
+    if (arcanaHome) {
+      const normalized = canon(arcanaHome);
+      if (!roots.some((root) => root === normalized)) roots.push(normalized);
+    }
+  } catch {}
+  return roots;
+}
+
+function isUnderAny(roots, target) {
+  for (const root of roots) {
+    if (isUnder(root, target)) return true;
+  }
+  return false;
+}
+
 export function resolveWorkspaceRoot() {
   // 1) async-local context (per-session)
   try { const ctx = getContext?.(); if (ctx && ctx.workspaceRoot) return canon(ctx.workspaceRoot); } catch {}
@@ -71,10 +92,11 @@ export function ensureReadAllowed(p) {
   // Accept relative paths by resolving them against the workspace root (not cwd)
   const raw = String(p || "");
   const target = isAbsolute(raw) ? raw : resolve(root, raw);
-  const ok = isUnder(root, target);
+  const readableRoots = getReadableRoots();
+  const ok = isUnderAny(readableRoots, target);
   if (!ok) {
-    try { emitEvent({ type: "workspace_guard", action: "read_blocked", root, path: raw }); } catch {}
-    const err = new Error("Read forbidden: path is outside workspace root");
+    try { emitEvent({ type: "workspace_guard", action: "read_blocked", root, readableRoots, path: raw }); } catch {}
+    const err = new Error("Read forbidden: path is outside allowed read roots");
     err.code = "WORKSPACE_READ_FORBIDDEN";
     throw err;
   }

@@ -6,7 +6,9 @@ import createCodexSubagentTool from '../tools/codex-subagent.js';
 const initRaw = process.env.SUBAGENT_INIT || '{}';
 let init = {};
 try { init = JSON.parse(initRaw); } catch {}
-const codexTool = createCodexSubagentTool();
+const codexTool = createCodexSubagentTool({
+  agentHomeRoot: init.agentHomeRoot || '',
+});
 
 function writeEvent(ev){
   try { output.write(JSON.stringify(ev)+'\n'); } catch {}
@@ -23,7 +25,8 @@ rl.on('line', async (line)=>{
     const args = { task: init.task || 'continue', plan: msg.message || '', allowedPaths: init.allowedPaths || [], dryRun: false, sessionLabel: init.childSessionKey };
     try {
       const res = await codexTool.execute('child', args);
-      writeEvent({ type:'tool_result', tool:'codex', ok:true, details: res.details });
+      const ok = !!(res && res.details && res.details.ok);
+      writeEvent({ type:'tool_result', tool:'codex', ok, details: res.details });
     } catch (e){ writeEvent({ type:'tool_result', tool:'codex', ok:false, error: String(e && e.message || e) }); }
   }
 });

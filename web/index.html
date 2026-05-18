@@ -12,12 +12,11 @@
   <div class="layout">
       <div class="left" style="flex:0 0 42%;min-width:360px;max-width:640px;border-right:1px solid #e7e7e7;background:#f5f5f5;display:flex;position:relative;">
       <div class="sidebar-group">
-        <div id="agents-panel" class="agents-panel">
-          <div class="agents-header">Agents</div>
-          <div id="agents-list"></div>
-        </div>
         <div id="sidebar" class="sidebar" style="width:240px">
-          <div style="padding:8px"><button id="new-session" class="btn btn-secondary btn-sm" data-i18n="ui.newSession">新会话</button></div>
+          <div class="workspace-controls">
+            <select id="workspace-select" class="workspace-select"></select>
+            <button id="workspace-add-agent" class="btn btn-secondary btn-sm" type="button">添加 Agent / 群聊</button>
+          </div>
           <div id="session-list"></div>
         </div>
       </div>
@@ -32,8 +31,11 @@
         <div class="bubble" data-i18n="ui.welcome">欢迎使用 Arcana，对我说点什么吧～</div>
       </div>
     </main>
+    <div id="attachment-strip" class="attachment-strip"></div>
     <footer class="composer">
       <button class="icon" title="更多" data-i18n-title="ui.more">＋</button>
+      <input id="image-input" type="file" accept="image/*" multiple hidden />
+      <button id="insert-image" class="icon" type="button" title="插入图片" aria-label="插入图片">🖼</button>
       <textarea id="input" rows="1" placeholder="发送消息" data-i18n-placeholder="ui.inputPlaceholder"></textarea>
       <button
         id="stop"
@@ -106,6 +108,12 @@
               <input id="cfg-model-global" placeholder="model-id" />
               <div id="cfg-base-url-label-global" class="cfg-base-url-label">Base URL</div>
               <input id="cfg-base-url-global" class="cfg-base-url-input" placeholder="Custom endpoint" />
+              <div id="cfg-openai-api-version-label-global" class="cfg-openai-api-version-label">API Version</div>
+              <input id="cfg-openai-api-version-global" class="cfg-openai-api-version-input" placeholder="Optional api-version query param" />
+              <div id="cfg-azure-api-version-label-global" class="cfg-azure-only-label">API Version</div>
+              <input id="cfg-azure-api-version-global" class="cfg-azure-only-input" placeholder="2025-04-01-preview" />
+              <div id="cfg-azure-deployment-map-label-global" class="cfg-azure-only-label">Deployment Map</div>
+              <input id="cfg-azure-deployment-map-global" class="cfg-azure-only-input" placeholder="gpt-4.1-mini=my-deployment" />
               <div>API Key</div>
               <div style="display:flex;gap:8px;align-items:center;">
                 <input id="cfg-key-global" type="password" placeholder="仅用于更新，不会回显" />
@@ -157,6 +165,12 @@
               <input id="cfg-model-agent" placeholder="留空则使用全局默认" />
               <div id="cfg-base-url-label-agent" class="cfg-base-url-label">Base URL</div>
               <input id="cfg-base-url-agent" class="cfg-base-url-input" placeholder="Inherit global default" />
+              <div id="cfg-openai-api-version-label-agent" class="cfg-openai-api-version-label">API Version</div>
+              <input id="cfg-openai-api-version-agent" class="cfg-openai-api-version-input" placeholder="Optional api-version query param" />
+              <div id="cfg-azure-api-version-label-agent" class="cfg-azure-only-label">API Version</div>
+              <input id="cfg-azure-api-version-agent" class="cfg-azure-only-input" placeholder="2025-04-01-preview" />
+              <div id="cfg-azure-deployment-map-label-agent" class="cfg-azure-only-label">Deployment Map</div>
+              <input id="cfg-azure-deployment-map-agent" class="cfg-azure-only-input" placeholder="gpt-4.1-mini=my-deployment" />
               <div>API Key</div>
               <div style="display:flex;gap:8px;align-items:center;">
                 <input id="cfg-key-agent" type="password" placeholder="仅用于更新，不会回显" />
@@ -219,13 +233,18 @@
               </section>
               <section class="main-skills">
                 <div class="main-skills-header">
-                  <div class="main-skills-title">技能配置</div>
+                  <div class="main-skills-title" data-i18n="skills.title">技能配置</div>
                   <div id="skills-status" class="main-skills-status"></div>
                 </div>
+                <div class="main-skills-tabs" role="tablist" aria-label="Skills config tabs">
+                  <button id="skills-tab-skills" class="main-skills-tab active" type="button" data-config-tab="skills" data-i18n="skills.tab.skills">技能</button>
+                  <button id="skills-tab-tools" class="main-skills-tab" type="button" data-config-tab="tools" data-i18n="skills.tab.tools">工具</button>
+                </div>
                 <div id="skills-config" class="main-skills-list"></div>
+                <div id="tools-config" class="main-skills-list" style="display:none;"></div>
                 <div class="main-skills-actions">
                   <button id="skills-save" class="btn btn-primary btn-sm" type="button">保存技能配置</button>
-                  <div class="main-skills-hint">取消勾选=禁用该技能</div>
+                  <div id="skills-hint" class="main-skills-hint" data-i18n="skills.hint.skills">取消勾选=禁用该技能</div>
                 </div>
               </section>
 	              <section class="main-system">

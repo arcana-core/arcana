@@ -6,6 +6,7 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
   let engine = null;
   let cronTimer = null;
   let running = false;
+  const RESCHEDULE_WHEN_RUNNING_DELAY_MS = 250;
 
   function setEngine(e){
     engine = e || null;
@@ -29,12 +30,21 @@ export function createScheduler({ wakeDelayMsDefault = 250, cronStore, trace, ws
       clearWake(key);
       try {
         if (engine && typeof engine.tick === 'function'){
-          await engine.tick({
+          const result = await engine.tick({
             agentId: entry.agentId,
             sessionKey: entry.sessionKey,
             reason: entry.reason,
             skipIfRunning: true,
           });
+          if (result && result.skipped === true && result.reason === 'requests-in-flight'){
+            requestWake({
+              agentId: entry.agentId,
+              sessionKey: entry.sessionKey,
+              reason: 'wake.reschedule_running',
+              priority: entry.priority,
+              delayMs: RESCHEDULE_WHEN_RUNNING_DELAY_MS,
+            });
+          }
         }
       } catch (e) {
         try {

@@ -3,9 +3,10 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
+import { loadSessionMeta } from './session-meta-store.js';
 
 // Simple JSON-backed chat session store.
-// Schema: { id, title, workspace, agentId, createdAt, updatedAt, messages: [{ role: 'user'|'assistant', text, ts }], sessionTokens?: number }
+// Schema: { id, title, workspace, agentId, hidden?: boolean, createdAt, updatedAt, messages: [{ role: 'user'|'assistant', text, ts }], sessionTokens?: number }
 
 const DEFAULT_AGENT_ID = 'default';
 const SESSION_LOCK_STALE_MS = 30000; // 30s
@@ -128,7 +129,19 @@ function saveSessionInternal(obj, normAgentId, opts){
   return true;
 }
 
-export function createSession({ title, workspace, agentId } = {}){
+function applySessionMetaFields(target, sessionId, agentId){
+  if (!target || !sessionId) return target;
+  try {
+    const meta = loadSessionMeta(sessionId, { agentId });
+    if (!meta || typeof meta !== 'object') return target;
+    if (meta.sessionKey != null) target.sessionKey = String(meta.sessionKey || '');
+    if (meta.sessionSource != null) target.sessionSource = String(meta.sessionSource || '');
+    if (meta.workspaceRoot != null) target.workspaceRoot = String(meta.workspaceRoot || '');
+  } catch {}
+  return target;
+}
+
+export function createSession({ title, workspace, agentId, hidden } = {}){
   const t = String(title == null ? '' : title).trim();
   const normAgentId = normalizeAgentId(agentId);
   const stamp = nowIso().replace(/[:.]/g, '-').replace('T', '_').replace('Z', '');
@@ -140,6 +153,7 @@ export function createSession({ title, workspace, agentId } = {}){
     title: t,
     workspace: String(workspace || '').trim() || undefined,
     agentId: normAgentId,
+    hidden: hidden === true,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     messages: [],
@@ -159,10 +173,11 @@ export function listSessions(agentId){
     try {
       const st = statSync(p);
       const raw = JSON.parse(readFileSync(p, 'utf-8'));
+      if (raw && raw.hidden === true) continue;
       const createdAt = raw.createdAt || new Date(st.ctimeMs).toISOString();
       const updatedAt = raw.updatedAt || new Date(st.mtimeMs).toISOString();
       const titleRaw = (raw && typeof raw.title === 'string') ? String(raw.title).trim() : '';
-      out.push({
+      const item = applySessionMetaFields({
         id: raw.id || name.replace(/\.json$/, ''),
         title: titleRaw,
         workspace: raw.workspace || '',
@@ -170,7 +185,8 @@ export function listSessions(agentId){
         createdAt,
         updatedAt,
         last: (Array.isArray(raw.messages) && raw.messages.length) ? raw.messages[raw.messages.length - 1] : null,
-      });
+      }, raw.id || name.replace(/\.json$/, ''), normalizeAgentId(raw.agentId || normAgentId));
+      out.push(item);
     } catch {}
   }
   out.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
@@ -188,6 +204,8 @@ export function loadSession(id, opts){
     if (!obj || typeof obj !== 'object') return null;
     const agentId = normalizeAgentId(obj.agentId || normAgentId);
     obj.agentId = agentId;
+    obj.hidden = obj.hidden === true;
+    applySessionMetaFields(obj, sid, agentId);
     return obj;
   } catch {
     return null;
@@ -206,7 +224,7 @@ export function saveSession(obj, opts){
   }
 }
 
-export function appendMessage(sessionId, { role, text, agentId } = {}){
+export function appendMessage(sessionId, { role, text, agentId, mediaRefs } = {}){
   const id = String(sessionId || '').trim();
   if (!id) return null;
   const normAgentId = normalizeAgentId(agentId);
@@ -228,7 +246,14 @@ export function appendMessage(sessionId, { role, text, agentId } = {}){
     const hadNoMessages = obj.messages.length === 0;
     const roleStr = String(role || 'user');
     const textStr = String(text || '');
-    obj.messages.push({ role: roleStr, text: textStr, ts: nowIso() });
+    const normalizedMediaRefs = Array.isArray(mediaRefs)
+      ? mediaRefs
+        .map((ref) => typeof ref === 'string' ? ref.trim() : '')
+        .filter((ref) => ref)
+      : [];
+    const message = { role: roleStr, text: textStr, ts: nowIso() };
+    if (normalizedMediaRefs.length) message.mediaRefs = normalizedMediaRefs;
+    obj.messages.push(message);
 
     if (hadNoMessages && String(roleStr || '').toLowerCase() === 'user'){
       const currentTitle = String(obj.title || '').trim();

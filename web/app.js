@@ -3,6 +3,9 @@ const messages = document.querySelector('#messages');
 const input = document.querySelector('#input');
 const sendBtn = document.querySelector('#send');
 const stopBtn = document.querySelector('#stop');
+const insertImageBtn = document.querySelector('#insert-image');
+const imageInput = document.querySelector('#image-input');
+const attachmentStrip = document.querySelector('#attachment-strip');
 let activeAssistant = null; // current assistant bubble to stream text into
 
 // Detect Electron + macOS to enable custom draggable titlebar
@@ -23,6 +26,7 @@ try{
 } catch {}
 
 let __arcana_showToolMessages = false;
+let pendingImageAttachments = [];
 try{
   if (typeof window !== 'undefined' && window.location && typeof window.location.search === 'string'){
     const params = new URLSearchParams(window.location.search || '');
@@ -43,6 +47,9 @@ let gatewayV2ProbePromise = null;
 let gatewayV2SessionKey = '';
 let gatewayV2Ws = null;
 const gatewayV2Pending = new Map();
+let gatewayV2ClientId = '';
+let gatewayV2EventSeq = 0;
+const gatewayV2EventLog = [];
 let __apiTokenPromptedOnce = false;
 let __apiTokenHydratedOnce = false;
 
@@ -152,6 +159,107 @@ function getGatewayV2SessionKeyForCurrent(){
     try { gatewayV2SessionKey = gatewayV2SessionKey || ensureGatewayV2SessionKey(); } catch {}
     return String(gatewayV2SessionKey || 'session');
   }
+}
+
+function getGatewayV2AbortBody(){
+  try{
+    const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const sessionKey = getGatewayV2SessionKeyForCurrent();
+    if (!sessionKey) return null;
+    let sessionId = '';
+    try {
+      const sidFn = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId : null;
+      sessionId = String((sidFn ? sidFn() : currentId) || '').trim();
+    } catch {}
+    const body = { agentId, sessionKey };
+    if (sessionId) body.sessionId = sessionId;
+    return body;
+  } catch {
+    return null;
+  }
+}
+
+function ensureGatewayV2ClientId(){
+  try{
+    if (gatewayV2ClientId) return gatewayV2ClientId;
+    let rand = '';
+    try { rand = Math.random().toString(36).slice(2, 10); } catch { rand = String(Date.now() || '0'); }
+    gatewayV2ClientId = 'web-' + rand;
+    return gatewayV2ClientId;
+  } catch {
+    return 'web-client';
+  }
+}
+
+function getGatewayV2SubscriptionMeta(){
+  try{
+    const clientId = ensureGatewayV2ClientId();
+    if (currentThreadKind === 'group'){
+      const groupId = String(currentGroupId || '').trim();
+      return {
+        type: 'subscribe',
+        threadKind: 'group',
+        groupId,
+        clientId,
+        receiveAll: true,
+      };
+    }
+    const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    let sessionId = '';
+    try {
+      const sidFn = (typeof getCurrentSessionId === 'function') ? getCurrentSessionId : null;
+      sessionId = String((sidFn ? sidFn() : currentId) || '').trim();
+    } catch {}
+    const sessionKey = getGatewayV2SessionKeyFor(agentId, sessionId);
+    return {
+      type: 'subscribe',
+      threadKind: 'session',
+      agentId,
+      sessionKey,
+      sessionId,
+      clientId,
+      receiveAll: true,
+    };
+  } catch {
+    return { type: 'subscribe', threadKind: 'session', clientId: ensureGatewayV2ClientId(), receiveAll: true };
+  }
+}
+
+function syncGatewayV2Subscription(){
+  try{
+    const ws = gatewayV2Ws;
+    if (!ws || ws.readyState !== 1) return;
+    const meta = getGatewayV2SubscriptionMeta();
+    ws.send(JSON.stringify(meta));
+  } catch {}
+}
+
+function rememberPendingAssistantBubble(replyId, bubble){
+  const id = String(replyId || '').trim();
+  if (!id || !bubble) return;
+  try { gatewayV2Pending.set(id, bubble); } catch {}
+}
+
+function takePendingAssistantBubble(replyId, msgSessionId){
+  const id = String(replyId || '').trim();
+  if (id){
+    try{
+      if (gatewayV2Pending.has(id)){
+        const bubble = gatewayV2Pending.get(id) || null;
+        gatewayV2Pending.delete(id);
+        if (bubble) return bubble;
+      }
+    } catch {}
+  }
+  const sid = String(msgSessionId || '').trim();
+  if (sid && sid === String(currentId || '') && sid === String(streamingId || '')){
+    try{
+      if (activeAssistant && activeAssistant.isConnected !== false){
+        return activeAssistant;
+      }
+    } catch {}
+  }
+  return null;
 }
 
 function hasVoiceOpenIntent(text){
@@ -735,7 +843,9 @@ function serializeToolPanel(panel){
       if (!a) continue;
       actionsArr.push({
         id: a.id,
+        toolCallId: (typeof a.toolCallId === 'string' && a.toolCallId) ? a.toolCallId : undefined,
         toolName: a.toolName,
+        agentId: (typeof a.agentId === 'string' && a.agentId) ? a.agentId : undefined,
         category: a.category,
         status: a.status,
         argsSummary: a.argsSummary,
@@ -746,6 +856,9 @@ function serializeToolPanel(panel){
         turnIndex: a.turnIndex,
         ctxTokens: (typeof a.ctxTokens === 'number' && a.ctxTokens >= 0) ? a.ctxTokens : undefined,
         tokTokens: (typeof a.tokTokens === 'number' && a.tokTokens >= 0) ? a.tokTokens : undefined,
+        canAbort: !!a.canAbort,
+        kind: a.kind ? String(a.kind) : undefined,
+        sessionKey: (typeof a.sessionKey === 'string' && a.sessionKey) ? a.sessionKey : undefined,
         log: a.log,
       });
     }
@@ -823,7 +936,7 @@ function deserializeToolPanel(obj){
     const arr = Array.isArray(obj.actions) ? obj.actions : [];
     for (const raw of arr){
       if (!raw || typeof raw !== 'object') continue;
-      const id = String(raw.id || raw.toolCallId || '');
+      const id = String(raw.id || raw.toolCallId || raw.callId || '');
       if (!id) continue;
       const turnIndex = (typeof raw.turnIndex === 'number' && !Number.isNaN(raw.turnIndex)) ? raw.turnIndex : 0;
       let log = '';
@@ -834,7 +947,11 @@ function deserializeToolPanel(obj){
       const tokTokens = (typeof raw.tokTokens === 'number' && raw.tokTokens >= 0) ? raw.tokTokens : undefined;
       const action = {
         id,
+        toolCallId: (typeof raw.toolCallId === 'string' && raw.toolCallId)
+          ? raw.toolCallId
+          : ((typeof raw.callId === 'string' && raw.callId) ? raw.callId : ''),
         toolName: String(raw.toolName || ''),
+        agentId: (typeof raw.agentId === 'string' && raw.agentId) ? raw.agentId : '',
         category: String(raw.category || toolCategory(raw.toolName)),
         status: (raw.status === 'error' || raw.status === 'done' || raw.status === 'running') ? raw.status : 'done',
         argsSummary: String(raw.argsSummary || ''),
@@ -845,6 +962,9 @@ function deserializeToolPanel(obj){
         turnIndex,
         ctxTokens,
         tokTokens,
+        canAbort: !!raw.canAbort,
+        kind: raw.kind ? String(raw.kind) : undefined,
+        sessionKey: (typeof raw.sessionKey === 'string' && raw.sessionKey) ? raw.sessionKey : '',
         log,
       };
       panel.actions.set(id, action);
@@ -1545,12 +1665,32 @@ function formatToolUpdateInfo(raw){
   return info;
 }
 
+function getToolUsageTotals(data){
+  try{
+    const usage = (data && typeof data === 'object' && data.usage && typeof data.usage === 'object')
+      ? data.usage
+      : null;
+    const totalRaw =
+      (usage && typeof usage.totalTokens === 'number') ? usage.totalTokens
+        : (typeof data.totalTokens === 'number') ? data.totalTokens
+          : null;
+    const ctxRaw =
+      (usage && typeof usage.contextTokens === 'number') ? usage.contextTokens
+        : (typeof data.contextTokens === 'number') ? data.contextTokens
+          : null;
+    const total = (typeof totalRaw === 'number' && totalRaw >= 0) ? (Number(totalRaw) || 0) : null;
+    const ctx = (typeof ctxRaw === 'number' && ctxRaw >= 0) ? (Number(ctxRaw) || 0) : null;
+    return { totalTokens: total, contextTokens: ctx };
+  } catch {}
+  return { totalTokens: null, contextTokens: null };
+}
+
 function upsertToolAction(data){
   try{
     const sid = String(data.sessionId || getCurrentSessionId() || '');
   if (!sid) return;
   const panel = getToolPanel(sid); if (!panel) return;
-    const id = String(data.toolCallId || data.id || data.toolName || (panel.order.length + 1));
+    const id = String(data.toolCallId || data.callId || data.id || data.toolName || (panel.order.length + 1));
     const now = new Date();
     const ts = now.toLocaleTimeString();
     const storedTurn = lastToolTurnBySession.get(sid);
@@ -1558,9 +1698,19 @@ function upsertToolAction(data){
     const rawArgs = (typeof data.args !== 'undefined') ? data.args : (typeof data.input !== 'undefined') ? data.input : data.params;
     let action = panel.actions.get(id);
     if (!action){
+      const actionAgentId = String(
+        data.agentId
+        || ((renderedSessionAgentIdBySessionId && renderedSessionAgentIdBySessionId.get(sid)) || '')
+        || ((hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID)
+        || ''
+      );
       action = {
         id,
+        toolCallId: (typeof data.toolCallId === 'string' && data.toolCallId)
+          ? String(data.toolCallId)
+          : ((typeof data.callId === 'string' && data.callId) ? String(data.callId) : ''),
         toolName: String(data.toolName || ''),
+        agentId: actionAgentId,
         category: toolCategory(data.toolName),
         status: 'running',
         argsSummary: summarizeArgs(rawArgs),
@@ -1576,6 +1726,16 @@ function upsertToolAction(data){
       panel.actions.set(id, action);
       panel.order.push(id);
       if (!panel.selectedId) panel.selectedId = id;
+    }
+    if (!action.agentId && data.agentId){
+      action.agentId = String(data.agentId || '');
+    }
+    if (!action.toolCallId){
+      if (typeof data.toolCallId === 'string' && data.toolCallId){
+        action.toolCallId = String(data.toolCallId);
+      } else if (typeof data.callId === 'string' && data.callId){
+        action.toolCallId = String(data.callId);
+      }
     }
     if (!action.argsFull && rawArgs != null){
       let full = '';
@@ -1604,13 +1764,12 @@ function upsertToolAction(data){
       action.status = data.isError || data.error ? 'error' : 'done';
       action.endedAt = ts;
       try{
-        const usage = data && data.usage ? data.usage : null;
-        if (usage && typeof usage.totalTokens === 'number' && usage.totalTokens >= 0){
-          action.tokTokens = Number(usage.totalTokens) || 0;
+        const usageTotals = getToolUsageTotals(data);
+        if (usageTotals.totalTokens !== null){
+          action.tokTokens = usageTotals.totalTokens;
         }
-        if (typeof data.contextTokens === 'number' && data.contextTokens >= 0){
-          const ctxVal = Number(data.contextTokens) || 0;
-          if (ctxVal >= 0) action.ctxTokens = ctxVal;
+        if (usageTotals.contextTokens !== null){
+          action.ctxTokens = usageTotals.contextTokens;
         }
       } catch {}
     }
@@ -1624,6 +1783,73 @@ function upsertToolAction(data){
     if (typeof action.log === 'string' && action.log.length > TOOL_PANELS_MAX_LOG_CHARS){
       action.log = action.log.slice(-TOOL_PANELS_MAX_LOG_CHARS);
     }
+    try{ scheduleSaveToolPanel(sid); } catch {}
+    if (sid === getCurrentSessionId()){
+      if (activeLogTab === 'tools'){
+        renderToolsPanel(sid);
+      } else if (activeLogTab === 'details'){
+        renderToolDetails(sid);
+      }
+    }
+  } catch {}
+}
+
+function findLatestActionForTurn(sessionId, turnIndex, predicate){
+  try{
+    const sid = String(sessionId || getCurrentSessionId() || '');
+    if (!sid) return null;
+    const panel = getToolPanel(sid);
+    if (!panel || !Array.isArray(panel.order) || !panel.actions) return null;
+    const idx = (typeof turnIndex === 'number' && !Number.isNaN(turnIndex))
+      ? turnIndex
+      : (Number(lastToolTurnBySession.get(sid)) || 0);
+    for (let i = panel.order.length - 1; i >= 0; i--){
+      const id = panel.order[i];
+      if (!id) continue;
+      const action = panel.actions.get(id);
+      if (!action) continue;
+      const actionTurn = (typeof action.turnIndex === 'number' && !Number.isNaN(action.turnIndex))
+        ? action.turnIndex
+        : 0;
+      if (actionTurn !== idx) continue;
+      if (predicate && !predicate(action)) continue;
+      return action;
+    }
+  } catch {}
+  return null;
+}
+
+function backfillActionUsageFromLlm(sessionId, turnIndex, update){
+  try{
+    const sid = String(sessionId || getCurrentSessionId() || '');
+    if (!sid) return;
+    const idx = (typeof turnIndex === 'number' && !Number.isNaN(turnIndex))
+      ? turnIndex
+      : (Number(lastToolTurnBySession.get(sid)) || 0);
+    const tokVal = (update && typeof update.tokTokens === 'number' && update.tokTokens >= 0)
+      ? Number(update.tokTokens) || 0
+      : null;
+    const ctxVal = (update && typeof update.ctxTokens === 'number' && update.ctxTokens >= 0)
+      ? Number(update.ctxTokens) || 0
+      : null;
+    if (tokVal === null && ctxVal === null) return;
+
+    let action = findLatestActionForTurn(sid, idx, (a) => String(a.kind || '') === 'history_compact');
+    if (!action){
+      action = findLatestActionForTurn(sid, idx, (a) => {
+        const toolName = String(a.toolName || '');
+        if (toolName === 'LLM') return false;
+        const hasCtx = typeof a.ctxTokens === 'number' && a.ctxTokens >= 0;
+        const hasTok = typeof a.tokTokens === 'number' && a.tokTokens > 0;
+        const needsCtx = ctxVal !== null && !hasCtx;
+        const needsTok = tokVal !== null && !hasTok;
+        return needsCtx || needsTok;
+      });
+    }
+    if (!action) return;
+
+    if (ctxVal !== null) action.ctxTokens = ctxVal;
+    if (tokVal !== null) action.tokTokens = tokVal;
     try{ scheduleSaveToolPanel(sid); } catch {}
     if (sid === getCurrentSessionId()){
       if (activeLogTab === 'tools'){
@@ -1770,6 +1996,19 @@ function renderToolsPanel(sessionId){
     }
 
     label.appendChild(labelText);
+    const turnUsage = usageMap.get(turnKey) || {};
+    const turnTok = (typeof turnUsage.turnTokens === 'number' && turnUsage.turnTokens > 0)
+      ? turnUsage.turnTokens
+      : null;
+    if (turnTok !== null){
+      const turnBadges = document.createElement('div');
+      turnBadges.className = 'tools-turn-badges';
+      const tokBadge = document.createElement('div');
+      tokBadge.className = 'tools-turn-badge tools-turn-badge-tok';
+      tokBadge.textContent = 'TOK ' + formatCompactNumber(turnTok);
+      turnBadges.appendChild(tokBadge);
+      label.appendChild(turnBadges);
+    }
     group.appendChild(label);
     const items = byTurn.get(turnKey) || [];
     for (const a of items){
@@ -1808,14 +2047,7 @@ function renderToolsPanel(sessionId){
 
       const badgeRow = document.createElement('div');
       badgeRow.className = 'tools-card-badges';
-      const tokForCard = (typeof a.tokTokens === 'number' && a.tokTokens > 0) ? a.tokTokens : null;
       const ctxForCard = (typeof a.ctxTokens === 'number' && a.ctxTokens >= 0) ? a.ctxTokens : null;
-      if (tokForCard != null){
-        const tokBadge = document.createElement('div');
-        tokBadge.className = 'tools-turn-badge tools-turn-badge-tok tools-card-badge';
-        tokBadge.textContent = 'TOK ' + formatCompactNumber(tokForCard);
-        badgeRow.appendChild(tokBadge);
-      }
       if (ctxForCard != null){
         const ctxBadge = document.createElement('div');
         ctxBadge.className = 'tools-turn-badge tools-turn-badge-ctx tools-card-badge';
@@ -2014,6 +2246,89 @@ function appendMessage(role, text = '', ts = ''){
 	return bubble;
 }
 
+function renderBubbleMedia(bubble, mediaRefs, sessionId){
+  if (!bubble || !Array.isArray(mediaRefs) || !mediaRefs.length) return;
+  const parts = ensureBubbleParts(bubble) || {};
+  const mediaEl = parts.media || bubble;
+  mediaEl.innerHTML = '';
+  for (const refRaw of mediaRefs){
+    const ref = String(refRaw || '').trim();
+    if (!ref) continue;
+    const img = document.createElement('img');
+    img.src = mediaRefToImgSrc(ref, sessionId);
+    mediaEl.appendChild(img);
+  }
+}
+
+function makeAttachmentId(){
+  try { return 'att_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8); } catch { return 'att_' + String(Date.now()); }
+}
+
+function renderAttachmentStrip(){
+  if (!attachmentStrip) return;
+  attachmentStrip.innerHTML = '';
+  const items = Array.isArray(pendingImageAttachments) ? pendingImageAttachments : [];
+  if (!items.length){
+    attachmentStrip.classList.remove('has-items');
+    return;
+  }
+  attachmentStrip.classList.add('has-items');
+  for (const item of items){
+    const chip = document.createElement('div');
+    chip.className = 'attachment-chip';
+    const img = document.createElement('img');
+    img.src = item.dataUrl;
+    img.alt = 'attachment';
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.textContent = '×';
+    removeBtn.addEventListener('click', ()=>{
+      pendingImageAttachments = pendingImageAttachments.filter((entry)=> entry.id !== item.id);
+      renderAttachmentStrip();
+    });
+    chip.appendChild(img);
+    chip.appendChild(removeBtn);
+    attachmentStrip.appendChild(chip);
+  }
+}
+
+function addImageFiles(files){
+  const list = Array.from(files || []).filter((file)=> file && typeof file.type === 'string' && file.type.startsWith('image/'));
+  if (!list.length) return;
+  for (const file of list){
+    const reader = new FileReader();
+    reader.addEventListener('load', ()=>{
+      pendingImageAttachments.push({
+        id: makeAttachmentId(),
+        mimeType: file.type || 'image/png',
+        dataUrl: String(reader.result || ''),
+      });
+      renderAttachmentStrip();
+    });
+    reader.readAsDataURL(file);
+  }
+}
+
+function clearPendingAttachments(){
+  pendingImageAttachments = [];
+  if (imageInput) imageInput.value = '';
+  renderAttachmentStrip();
+}
+
+function getPendingAttachmentPayload(){
+  return (Array.isArray(pendingImageAttachments) ? pendingImageAttachments : []).map((item)=>({
+    type: 'image',
+    mimeType: item.mimeType,
+    content: item.dataUrl,
+  }));
+}
+
+function getPendingAttachmentMediaRefs(){
+  return (Array.isArray(pendingImageAttachments) ? pendingImageAttachments : [])
+    .map((item)=> String(item.dataUrl || '').trim())
+    .filter(Boolean);
+}
+
 function ensureBubbleParts(bubble){
   if (!bubble) return null;
   try {
@@ -2144,6 +2459,22 @@ function autoResize(){
   input.style.height = Math.min(120, Math.max(36, input.scrollHeight)) + 'px';
 }
 input.addEventListener('input', autoResize);
+input.addEventListener('paste', (e)=>{
+  try{
+    const items = Array.from((e.clipboardData && e.clipboardData.items) || []);
+    const files = items
+      .filter((item)=> item && typeof item.type === 'string' && item.type.startsWith('image/'))
+      .map((item)=> item.getAsFile())
+      .filter(Boolean);
+    if (!files.length) return;
+    e.preventDefault();
+    addImageFiles(files);
+  } catch {}
+});
+if (insertImageBtn && imageInput){
+  insertImageBtn.addEventListener('click', ()=> imageInput.click());
+  imageInput.addEventListener('change', ()=> addImageFiles(imageInput.files || []));
+}
 
 // Toggle advanced panel (more) + lazy-load config
 try {
@@ -2272,6 +2603,8 @@ const HISTORY_COMPRESSION_DEFAULT_ENABLED = true;
 const HISTORY_COMPRESSION_DEFAULT_THRESHOLD = 100000;
 const HISTORY_COMPRESSION_DEFAULT_KEEP_TURNS = 10;
 const BASE_URL_VISIBLE_PROVIDERS = new Set(['openai-compatible', 'generic', 'azure-openai-responses']);
+const OPENAI_API_VERSION_VISIBLE_PROVIDERS = new Set(['openai', 'openai-compatible', 'deepseek', 'generic']);
+const AZURE_CONFIG_PROVIDER = 'azure-openai-responses';
 
 function getConfigInputValue(id){
   try{
@@ -2321,6 +2654,21 @@ function shouldShowBaseUrlForProvider(provider){
   return false;
 }
 
+function shouldShowAzureConfigForProvider(provider){
+  try{
+    return String(provider || '').trim().toLowerCase() === AZURE_CONFIG_PROVIDER;
+  }catch{}
+  return false;
+}
+
+function shouldShowOpenAIApiVersionForProvider(provider){
+  try{
+    const value = String(provider || '').trim().toLowerCase();
+    return OPENAI_API_VERSION_VISIBLE_PROVIDERS.has(value);
+  }catch{}
+  return false;
+}
+
 function setConfigBaseUrlVisibility(scope, visible){
   try{
     const suffix = (scope === 'agent') ? 'agent' : 'global';
@@ -2332,12 +2680,52 @@ function setConfigBaseUrlVisibility(scope, visible){
   }catch{}
 }
 
+function setConfigAzureFieldVisibility(scope, visible){
+  try{
+    const suffix = (scope === 'agent') ? 'agent' : 'global';
+    const display = visible ? '' : 'none';
+    const ids = [
+      'cfg-azure-api-version-label-',
+      'cfg-azure-api-version-',
+      'cfg-azure-deployment-map-label-',
+      'cfg-azure-deployment-map-',
+    ];
+    ids.forEach(prefix=>{
+      try{
+        const el = qs(prefix + suffix);
+        if (el) el.style.display = display;
+      }catch{}
+    });
+  }catch{}
+}
+
+function setConfigOpenAIApiVersionVisibility(scope, visible){
+  try{
+    const suffix = (scope === 'agent') ? 'agent' : 'global';
+    const display = visible ? '' : 'none';
+    const ids = [
+      'cfg-openai-api-version-label-',
+      'cfg-openai-api-version-',
+    ];
+    ids.forEach(prefix=>{
+      try{
+        const el = qs(prefix + suffix);
+        if (el) el.style.display = display;
+      }catch{}
+    });
+  }catch{}
+}
+
 function updateConfigBaseUrlVisibility(){
   try{
     const globalProvider = getConfigInputValue('cfg-provider-global');
     const agentProvider = getConfigInputValue('cfg-provider-agent');
     setConfigBaseUrlVisibility('global', shouldShowBaseUrlForProvider(globalProvider));
     setConfigBaseUrlVisibility('agent', shouldShowBaseUrlForProvider(agentProvider || globalProvider));
+    setConfigOpenAIApiVersionVisibility('global', shouldShowOpenAIApiVersionForProvider(globalProvider));
+    setConfigOpenAIApiVersionVisibility('agent', shouldShowOpenAIApiVersionForProvider(agentProvider || globalProvider));
+    setConfigAzureFieldVisibility('global', shouldShowAzureConfigForProvider(globalProvider));
+    setConfigAzureFieldVisibility('agent', shouldShowAzureConfigForProvider(agentProvider || globalProvider));
   }catch{}
 }
 
@@ -2399,59 +2787,107 @@ function parseHistoryCompressionNumber(raw, fallback){
   return out;
 }
 
+let skillsConfigActiveTab = 'skills';
+function setSkillsConfigTab(tab){
+  try{
+    const next = String(tab || '').trim() === 'tools' ? 'tools' : 'skills';
+    const isSkills = next === 'skills';
+    skillsConfigActiveTab = next;
+    const skillsBtn = qs('skills-tab-skills');
+    const toolsBtn = qs('skills-tab-tools');
+    const skillsWrap = qs('skills-config');
+    const toolsWrap = qs('tools-config');
+    const hintEl = qs('skills-hint');
+    if (skillsBtn) skillsBtn.classList.toggle('active', isSkills);
+    if (toolsBtn) toolsBtn.classList.toggle('active', !isSkills);
+    if (skillsWrap) skillsWrap.style.display = isSkills ? '' : 'none';
+    if (toolsWrap) toolsWrap.style.display = isSkills ? 'none' : '';
+    if (hintEl) hintEl.textContent = tt(isSkills ? 'skills.hint.skills' : 'skills.hint.tools');
+  } catch {}
+}
+
+function normalizeConfigDisabledSet(raw){
+  const out = new Set();
+  try{
+    const arr = Array.isArray(raw) ? raw : [];
+    for (const item of arr){
+      if (typeof item !== 'string') continue;
+      const name = item.trim();
+      if (!name) continue;
+      out.add(name);
+    }
+  } catch {}
+  return out;
+}
+
+function renderConfigChecklist(target, items, disabledSet, nameAttr, emptyKey){
+  try{
+    if (!target) return;
+    target.innerHTML = '';
+    if (!Array.isArray(items) || !items.length){
+      const empty = document.createElement('div');
+      empty.textContent = tt(emptyKey);
+      empty.style.color = '#666';
+      target.appendChild(empty);
+      return;
+    }
+    for (const item of items){
+      const name = String(((item && item.name) || item || '')).trim();
+      if (!name) continue;
+      const row = document.createElement('label');
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '6px';
+      row.style.marginBottom = '2px';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.setAttribute(nameAttr, name);
+      cb.checked = !disabledSet.has(name);
+      const span = document.createElement('span');
+      span.textContent = name;
+      row.appendChild(cb);
+      row.appendChild(span);
+      target.appendChild(row);
+    }
+  } catch {}
+}
+
 async function reloadSkillsConfigUI(){
   try{
     const skillsWrap = qs('skills-config');
-    if (!skillsWrap) return;
+    const toolsWrap = qs('tools-config');
+    if (!skillsWrap || !toolsWrap) return;
     try{
       skillsWrap.textContent = tt('ui.loading');
+      toolsWrap.textContent = tt('ui.loading');
       const skillsStatus = qs('skills-status'); if (skillsStatus) skillsStatus.textContent = '';
       const aidSkills = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
       const urlSkills = '/api/skills?agentId=' + encodeURIComponent(aidSkills);
       const tokenS = getStoredApiToken();
       const headersS = tokenS ? { 'authorization':'Bearer ' + tokenS } : undefined;
       const rS = await fetch(urlSkills, headersS ? { headers: headersS } : undefined);
+      if (!rS || !rS.ok) throw new Error('HTTP ' + (rS ? rS.status : '0'));
       let jS = null;
       try { jS = await rS.json(); } catch { jS = null; }
       const skillsArr = jS && Array.isArray(jS.skills) ? jS.skills : [];
-      const disabledArr = jS && Array.isArray(jS.disabled) ? jS.disabled : [];
-      const disabledSet = new Set();
-      for (const raw of disabledArr){
-        if (typeof raw !== 'string') continue;
-        const n = raw.trim();
-        if (n) disabledSet.add(n);
-      }
-      skillsWrap.innerHTML = '';
-      if (!skillsArr.length){
-        const empty = document.createElement('div');
-        empty.textContent = tt('skills.noneFound');
-        empty.style.color = '#666';
-        skillsWrap.appendChild(empty);
-      } else {
-        for (const s of skillsArr){
-          const name = String(s && s.name || '').trim(); if (!name) continue;
-          const row = document.createElement('label');
-          row.style.display = 'flex';
-          row.style.alignItems = 'center';
-          row.style.gap = '6px';
-          row.style.marginBottom = '2px';
-          const cb = document.createElement('input');
-          cb.type = 'checkbox';
-          cb.dataset.skillName = name;
-          cb.checked = !disabledSet.has(name);
-          const span = document.createElement('span');
-          span.textContent = name;
-          row.appendChild(cb);
-          row.appendChild(span);
-          skillsWrap.appendChild(row);
-        }
-      }
+      const toolsArr = jS && Array.isArray(jS.tools) ? jS.tools : [];
+      const disabledSet = normalizeConfigDisabledSet(jS && jS.disabled);
+      const disabledToolsSet = normalizeConfigDisabledSet(jS && jS.disabledTools);
+      renderConfigChecklist(skillsWrap, skillsArr, disabledSet, 'data-skill-name', 'skills.noneFound');
+      renderConfigChecklist(toolsWrap, toolsArr, disabledToolsSet, 'data-tool-name', 'skills.tools.noneFound');
+      setSkillsConfigTab(skillsConfigActiveTab);
     } catch {
       skillsWrap.innerHTML = '';
       const err = document.createElement('div');
       err.textContent = tt('skills.loadFailed');
       err.style.color = '#a00';
       skillsWrap.appendChild(err);
+      toolsWrap.innerHTML = '';
+      const errTools = document.createElement('div');
+      errTools.textContent = tt('skills.tools.loadFailed');
+      errTools.style.color = '#a00';
+      toolsWrap.appendChild(errTools);
+      setSkillsConfigTab(skillsConfigActiveTab);
     }
   } catch {}
 }
@@ -2487,6 +2923,9 @@ async function loadConfigUI(){
     if (qs('cfg-provider-global')) qs('cfg-provider-global').value = globalCfg.provider || '';
     if (qs('cfg-model-global')) qs('cfg-model-global').value = globalCfg.model || '';
     if (qs('cfg-base-url-global')) qs('cfg-base-url-global').value = globalCfg.base_url || '';
+    if (qs('cfg-openai-api-version-global')) qs('cfg-openai-api-version-global').value = globalCfg.openai_api_version || '';
+    if (qs('cfg-azure-api-version-global')) qs('cfg-azure-api-version-global').value = globalCfg.azure_api_version || '';
+    if (qs('cfg-azure-deployment-map-global')) qs('cfg-azure-deployment-map-global').value = globalCfg.azure_deployment_name_map || '';
         if (qs('cfg-key-set-global')) qs('cfg-key-set-global').textContent = globalCfg.has_key ? tt('config.keySet') : tt('config.keyUnset');
 
     const globalEnabledRaw = (globalCfg && Object.prototype.hasOwnProperty.call(globalCfg, 'history_compression_enabled'))
@@ -2524,6 +2963,9 @@ async function loadConfigUI(){
       // Update per-agent model label cache
       try { __setCachedModelLabel(aid, agentCfg); } catch {}
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = agentCfg.base_url || '';
+      if (qs('cfg-openai-api-version-agent')) qs('cfg-openai-api-version-agent').value = agentCfg.openai_api_version || '';
+      if (qs('cfg-azure-api-version-agent')) qs('cfg-azure-api-version-agent').value = agentCfg.azure_api_version || '';
+      if (qs('cfg-azure-deployment-map-agent')) qs('cfg-azure-deployment-map-agent').value = agentCfg.azure_deployment_name_map || '';
             if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = agentCfg.has_key ? tt('config.keySet') : tt('config.keyUnset');
 
       let agentCompressEnabled = globalCompressEnabled;
@@ -2555,6 +2997,9 @@ async function loadConfigUI(){
       if (qs('cfg-provider-agent')) qs('cfg-provider-agent').value = '';
       if (qs('cfg-model-agent')) qs('cfg-model-agent').value = '';
       if (qs('cfg-base-url-agent')) qs('cfg-base-url-agent').value = '';
+      if (qs('cfg-openai-api-version-agent')) qs('cfg-openai-api-version-agent').value = '';
+      if (qs('cfg-azure-api-version-agent')) qs('cfg-azure-api-version-agent').value = '';
+      if (qs('cfg-azure-deployment-map-agent')) qs('cfg-azure-deployment-map-agent').value = '';
             if (qs('cfg-key-set-agent')) qs('cfg-key-set-agent').textContent = tt('config.keyUnset');
       const aEnabledEl = qs('cfg-compress-enabled-agent'); if (aEnabledEl) aEnabledEl.checked = !!globalCompressEnabled;
       const aThreshEl = qs('cfg-compress-threshold-agent'); if (aThreshEl) aThreshEl.value = String(globalCompressThreshold);
@@ -2574,6 +3019,9 @@ async function saveGlobalConfigUI(){
       provider: (qs('cfg-provider-global')||{}).value || '',
       model: (qs('cfg-model-global')||{}).value || '',
       base_url: (qs('cfg-base-url-global')||{}).value || '',
+      openai_api_version: (qs('cfg-openai-api-version-global')||{}).value || '',
+      azure_api_version: (qs('cfg-azure-api-version-global')||{}).value || '',
+      azure_deployment_name_map: (qs('cfg-azure-deployment-map-global')||{}).value || '',
     };
 
     const gEnabledEl = qs('cfg-compress-enabled-global');
@@ -2637,6 +3085,9 @@ async function saveAgentConfigUI(){
       provider: (qs('cfg-provider-agent')||{}).value || '',
       model: (qs('cfg-model-agent')||{}).value || '',
       base_url: (qs('cfg-base-url-agent')||{}).value || '',
+      openai_api_version: (qs('cfg-openai-api-version-agent')||{}).value || '',
+      azure_api_version: (qs('cfg-azure-api-version-agent')||{}).value || '',
+      azure_deployment_name_map: (qs('cfg-azure-deployment-map-agent')||{}).value || '',
     };
 
     const token = getStoredApiToken();
@@ -2707,14 +3158,24 @@ async function saveSkillsConfigUI(){
   try{
     const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
     const disabled = [];
+    const disabledTools = [];
     try {
-      const wrap = qs('skills-config');
-      if (wrap){
-        const boxes = wrap.querySelectorAll('input[type="checkbox"][data-skill-name]');
+      const skillsWrap = qs('skills-config');
+      if (skillsWrap){
+        const boxes = skillsWrap.querySelectorAll('input[type="checkbox"][data-skill-name]');
         boxes.forEach((cb)=>{
           const name = cb && cb.getAttribute && cb.getAttribute('data-skill-name');
           if (!name) return;
           if (!cb.checked) disabled.push(name);
+        });
+      }
+      const toolsWrap = qs('tools-config');
+      if (toolsWrap){
+        const boxes = toolsWrap.querySelectorAll('input[type="checkbox"][data-tool-name]');
+        boxes.forEach((cb)=>{
+          const name = cb && cb.getAttribute && cb.getAttribute('data-tool-name');
+          if (!name) return;
+          if (!cb.checked) disabledTools.push(name);
         });
       }
     } catch {}
@@ -2722,7 +3183,7 @@ async function saveSkillsConfigUI(){
     const token = getStoredApiToken();
     const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
 
-    const body = { agentId: aid, disabled };
+    const body = { agentId: aid, disabled, disabledTools };
     const r = await fetch('/api/skills', { method:'POST', headers, body: JSON.stringify(body) });
     let j = null;
     try { j = await r.json(); } catch { j = null; }
@@ -2833,7 +3294,10 @@ try { qs('cfg-save-agent').addEventListener('click', ()=>{ saveAgentConfigUI().c
 try { qs('cfg-clear-agent').addEventListener('click', ()=>{ clearAgentConfigUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-run-doctor').addEventListener('click', ()=>{ runDoctorUI().catch(()=>{}) }) } catch {}
 try { qs('cfg-support-bundle').addEventListener('click', ()=>{ createSupportBundleUI().catch(()=>{}) }) } catch {}
+try { qs('skills-tab-skills').addEventListener('click', ()=>{ setSkillsConfigTab('skills') }) } catch {}
+try { qs('skills-tab-tools').addEventListener('click', ()=>{ setSkillsConfigTab('tools') }) } catch {}
 try { qs('skills-save').addEventListener('click', ()=>{ saveSkillsConfigUI().catch(()=>{}) }) } catch {}
+try { setSkillsConfigTab(skillsConfigActiveTab); } catch {}
 try{
   const tabG = qs('cfg-scope-tab-global');
   const tabA = qs('cfg-scope-tab-agent');
@@ -2844,7 +3308,9 @@ try{
 try{
   const ids = [
     'cfg-provider-global','cfg-model-global','cfg-base-url-global',
-    'cfg-provider-agent','cfg-model-agent','cfg-base-url-agent'
+    'cfg-openai-api-version-global','cfg-azure-api-version-global','cfg-azure-deployment-map-global',
+    'cfg-provider-agent','cfg-model-agent','cfg-base-url-agent',
+    'cfg-openai-api-version-agent','cfg-azure-api-version-agent','cfg-azure-deployment-map-agent'
   ];
   ids.forEach(id=>{
     try{
@@ -2863,10 +3329,19 @@ try{
 // --- Sessions state ---
 const CKEY = 'arcana.currentSessionId';
 const AKEY = 'arcana.currentAgentId';
+const WKEY = 'arcana.currentWorkspace.v1';
+const WLIST_KEY = 'arcana.workspaces.v1';
+const WS_AGENTS_KEY = 'arcana.workspaceAgents.v1';
 const LSK_LAST_SEEN = 'arcana.sessions.lastSeen';
 const LSK_BG_SESS_COLLAPSED = 'arcana.sessions.bgCollapsed.v1';
+const LSK_SESSION_GROUPS_COLLAPSED = 'arcana.sessionGroupsCollapsed.v1';
+const BACKGROUND_WORKSPACE_ID = '__background__';
 let currentId = '';
 try { currentId = localStorage.getItem(CKEY) || '' } catch {}
+let currentThreadKind = 'session';
+let currentGroupId = '';
+let currentGroupEvents = [];
+let visibleGroupItems = [];
 let bgSessionsCollapsed = (()=>{
   try{
     const v = localStorage.getItem(LSK_BG_SESS_COLLAPSED);
@@ -2877,10 +3352,382 @@ let bgSessionsCollapsed = (()=>{
 })();
 let streamingId = '';
 const typing = new Map(); // sessionId -> boolean
+let renderedSessionAgentIdBySessionId = new Map(); // sessionId -> agentId (for currently rendered list)
 let agents = [];
 let currentAgentId = localStorage.getItem(AKEY) || '';
 let hasAgents = false;
+// Workspace selection is independent from sessions so empty workspaces remain switchable.
 let currentWorkspace = '';
+// The opened session's workspace (from server), for live info + legacy non-agent sends.
+let activeSessionWorkspace = '';
+
+function _loadSessionGroupsCollapsedState(){
+  try{
+    const raw = localStorage.getItem(LSK_SESSION_GROUPS_COLLAPSED);
+    const obj = _safeJsonParse(raw);
+    if (obj && typeof obj === 'object') return obj;
+  } catch {}
+  return {};
+}
+function _persistSessionGroupsCollapsedState(obj){
+  try { localStorage.setItem(LSK_SESSION_GROUPS_COLLAPSED, JSON.stringify(obj || {})); } catch {}
+}
+function _sessionGroupCollapsedKey(workspace, groupId){
+  return String(workspace || '') + '::' + String(groupId || '');
+}
+function isSessionGroupCollapsed(workspace, groupId){
+  try{
+    const key = _sessionGroupCollapsedKey(workspace, groupId);
+    const state = _loadSessionGroupsCollapsedState();
+    return !!(state && state[key]);
+  } catch { return false; }
+}
+function setSessionGroupCollapsed(workspace, groupId, collapsed){
+  try{
+    const key = _sessionGroupCollapsedKey(workspace, groupId);
+    const state = _loadSessionGroupsCollapsedState();
+    state[key] = collapsed ? 1 : 0;
+    _persistSessionGroupsCollapsedState(state);
+  } catch {}
+}
+
+let workspaces = [];
+let workspaceAgents = {};
+
+function _safeJsonParse(raw){
+  try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+
+function isBackgroundSessionItem(it){
+  try{
+    if (!it) return false;
+    const source = String((it.sessionSource || it.source || '')).trim().toLowerCase();
+    if (source === 'wake_agent' || source === 'livestream' || source === 'voice_ingress' || source === 'heartbeat' || source === 'cutpilot') return true;
+    const titleRaw = (typeof it.title === 'string') ? it.title : '';
+    const title = String(titleRaw || '');
+    if (title.startsWith('[cron-')) return true;
+    if (title.startsWith('Cron Agent Turn #')) return true;
+    if (title === 'Arcana Cron' || title.startsWith('Arcana Cron #')) return true;
+    return false;
+  } catch { return false }
+}
+
+function isForegroundWorkspaceValue(workspaceId){
+  try{
+    const ws = String(workspaceId || '');
+    if (!ws) return true;
+    return Array.isArray(workspaces) && workspaces.includes(ws);
+  } catch { return false }
+}
+
+function shouldShowInBackgroundWorkspace(it){
+  try{
+    if (!it) return false;
+    if (isBackgroundSessionItem(it)) return true;
+    const ws = String((it && it.workspace) || '');
+    return !isForegroundWorkspaceValue(ws);
+  } catch { return false }
+}
+
+function getWorkspaceLabel(workspaceId){
+  try{
+    const ws = String(workspaceId || '');
+    if (!ws) return '默认工作区';
+    if (ws === BACKGROUND_WORKSPACE_ID) return '后台工作区';
+    return ws;
+  } catch { return '默认工作区' }
+}
+
+function loadWorkspaceState(){
+  try{
+    try { currentWorkspace = String(localStorage.getItem(WKEY) || ''); } catch { currentWorkspace = ''; }
+
+    let list = [];
+    try{
+      const raw = localStorage.getItem(WLIST_KEY);
+      const obj = _safeJsonParse(raw);
+      if (Array.isArray(obj)) list = obj.map((x)=>String(x||'')).filter(Boolean);
+    } catch {}
+    workspaces = [''].concat(list.filter((x)=>x !== '' && x !== BACKGROUND_WORKSPACE_ID));
+
+    let map = {};
+    try{
+      const raw2 = localStorage.getItem(WS_AGENTS_KEY);
+      const obj2 = _safeJsonParse(raw2);
+      if (obj2 && typeof obj2 === 'object') map = obj2;
+    } catch {}
+    workspaceAgents = map || {};
+  } catch {
+    currentWorkspace = '';
+    workspaces = [''];
+    workspaceAgents = {};
+  }
+  if (String(currentWorkspace || '') === BACKGROUND_WORKSPACE_ID && !Array.isArray(workspaces)) {
+    workspaces = [''];
+  }
+}
+
+function persistWorkspaceState(){
+  try{
+    const list = (workspaces || []).map((x)=>String(x||'')).filter(Boolean);
+    const withoutDefault = list.filter((x)=>x !== '');
+    try { localStorage.setItem(WLIST_KEY, JSON.stringify(withoutDefault)); } catch {}
+    try { localStorage.setItem(WKEY, String(currentWorkspace || '')); } catch {}
+    try { localStorage.setItem(WS_AGENTS_KEY, JSON.stringify(workspaceAgents || {})); } catch {}
+  } catch {}
+}
+
+function ensureWorkspaceInList(workspaceId){
+  const ws = String(workspaceId || '');
+  if (ws === BACKGROUND_WORKSPACE_ID) return;
+  if (!ws) return;
+  if (!Array.isArray(workspaces)) workspaces = [''];
+  if (workspaces.includes(ws)) return;
+  workspaces.push(ws);
+  persistWorkspaceState();
+}
+
+function getWorkspaceAgentIds(workspaceId){
+  try{
+    const ws = String(workspaceId || '');
+    const raw = (workspaceAgents && typeof workspaceAgents === 'object') ? workspaceAgents[ws] : null;
+    if (Array.isArray(raw)) return raw.map((x)=>String(x||'')).filter(Boolean);
+    return [];
+  } catch { return [] }
+}
+
+function setWorkspaceAgentIds(workspaceId, agentIds){
+  try{
+    const ws = String(workspaceId || '');
+    const uniq = [];
+    const seen = new Set();
+    for (const id of (Array.isArray(agentIds) ? agentIds : [])){
+      const s = String(id || '').trim();
+      if (!s || seen.has(s)) continue;
+      seen.add(s);
+      uniq.push(s);
+    }
+    if (!workspaceAgents || typeof workspaceAgents !== 'object') workspaceAgents = {};
+    workspaceAgents[ws] = uniq;
+    persistWorkspaceState();
+  } catch {}
+}
+
+function addAgentToWorkspace(workspaceId, agentId){
+  try{
+    const ws = String(workspaceId || '');
+    const aid = String(agentId || '').trim();
+    if (!aid) return;
+    const cur = getWorkspaceAgentIds(ws);
+    if (cur.includes(aid)) return;
+    cur.push(aid);
+    setWorkspaceAgentIds(ws, cur);
+  } catch {}
+}
+
+function renderWorkspaceSelector(){
+  const sel = qs('workspace-select');
+  if (!sel) return;
+  const prev = String(currentWorkspace || '');
+  sel.innerHTML = '';
+  const frag = document.createDocumentFragment();
+
+  function addOpt(value, label){
+    const opt = document.createElement('option');
+    opt.value = String(value || '');
+    opt.textContent = String(label || value || '');
+    frag.appendChild(opt);
+  }
+
+  addOpt('', getWorkspaceLabel(''));
+  addOpt(BACKGROUND_WORKSPACE_ID, getWorkspaceLabel(BACKGROUND_WORKSPACE_ID));
+  for (const ws of (workspaces || [])){
+    const v = String(ws || '');
+    if (!v) continue;
+    addOpt(v, getWorkspaceLabel(v));
+  }
+  addOpt('__new__', '＋ 新工作区…');
+  sel.appendChild(frag);
+
+  try { sel.value = prev; } catch {}
+  if (String(sel.value || '') !== prev){
+    try { sel.value = ''; } catch {}
+    currentWorkspace = '';
+    persistWorkspaceState();
+  }
+}
+
+async function setCurrentWorkspace(nextWorkspace){
+  const next = String(nextWorkspace || '');
+  if (next === String(currentWorkspace || '')) return;
+  currentWorkspace = next;
+  ensureWorkspaceInList(next);
+  persistWorkspaceState();
+  renderWorkspaceSelector();
+
+  // Workspace switch should not auto-create sessions.
+  clearCurrentGroupThread();
+  setCurrent('');
+  try { renderMessages([]); } catch {}
+
+  if (next !== BACKGROUND_WORKSPACE_ID){
+    const allowed = getWorkspaceAgentIds(currentWorkspace);
+    if (currentAgentId && !allowed.includes(String(currentAgentId || ''))){
+      currentAgentId = allowed[0] || '';
+      try { currentAgentId ? localStorage.setItem(AKEY, currentAgentId) : localStorage.removeItem(AKEY); } catch {}
+    }
+  }
+  renderAgentsList();
+
+  try{
+    if (hasAgents){
+      const items = await refreshList();
+      if (currentAgentId && Array.isArray(items) && items.length){
+        await openSession(items[0].id, items[0] && items[0].agentId);
+      }
+    } else {
+      renderSessionList([]);
+    }
+  } catch {}
+}
+
+function openAddAgentModal(){
+  try{
+    const all = Array.isArray(agents) ? agents.slice() : [];
+    const existing = new Set(getWorkspaceAgentIds(currentWorkspace));
+    const candidates = all
+      .map((a)=>a && a.agentId ? String(a.agentId) : '')
+      .filter((id)=>id)
+      .sort((a,b)=>a.localeCompare(b));
+
+    const overlay = document.createElement('div');
+    overlay.className = 'arcana-modal-overlay';
+    const dialog = document.createElement('div');
+    dialog.className = 'arcana-modal';
+
+    const title = document.createElement('div');
+    title.className = 'arcana-modal-title';
+    title.textContent = '添加 Agent / 群聊';
+
+    const desc = document.createElement('div');
+    desc.className = 'arcana-modal-desc';
+    desc.textContent = '单选会将 Agent 添加到当前工作区；多选会创建一个群聊。';
+
+    const groupTitleInput = document.createElement('input');
+    groupTitleInput.type = 'text';
+    groupTitleInput.className = 'input';
+    groupTitleInput.placeholder = '群聊标题（可选）';
+    groupTitleInput.style.display = 'none';
+
+    const listWrap = document.createElement('div');
+    listWrap.className = 'arcana-modal-list';
+
+    const status = document.createElement('div');
+    status.className = 'arcana-modal-status';
+    status.style.display = 'none';
+
+    const actions = document.createElement('div');
+    actions.className = 'arcana-modal-actions';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-secondary btn-sm';
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = '取消';
+    const okBtn = document.createElement('button');
+    okBtn.className = 'btn btn-primary btn-sm';
+    okBtn.type = 'button';
+    okBtn.textContent = '添加';
+    okBtn.disabled = true;
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+
+    const selected = new Set();
+    function syncOk(){
+      okBtn.disabled = selected.size === 0;
+      groupTitleInput.style.display = selected.size > 1 ? '' : 'none';
+      status.style.display = 'none';
+      status.textContent = '';
+    }
+
+    if (!candidates.length){
+      const empty = document.createElement('div');
+      empty.className = 'arcana-modal-empty';
+      empty.textContent = '没有可添加的 Agent。';
+      listWrap.appendChild(empty);
+    } else {
+      for (const id of candidates){
+        const row = document.createElement('label');
+        row.className = 'arcana-modal-row';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.addEventListener('change', ()=>{
+          if (cb.checked) selected.add(id);
+          else selected.delete(id);
+          syncOk();
+        });
+        const txt = document.createElement('span');
+        txt.className = 'arcana-modal-row-text';
+        txt.textContent = existing.has(id) ? (id + '（已添加）') : id;
+        row.appendChild(cb);
+        row.appendChild(txt);
+        listWrap.appendChild(row);
+      }
+    }
+
+    function cleanup(){
+      try { document.body.removeChild(overlay); } catch {}
+    }
+
+    cancelBtn.addEventListener('click', ()=>{ cleanup(); });
+    overlay.addEventListener('click', (ev)=>{
+      try{
+        if (ev && ev.target === overlay) cleanup();
+      } catch {}
+    });
+
+    okBtn.addEventListener('click', async ()=>{
+      try{
+        const ids = Array.from(selected);
+        if (!ids.length) return;
+        if (ids.length === 1){
+          const id = String(ids[0] || '');
+          if (!id) return;
+          if (existing.has(id)){
+            status.textContent = '该 Agent 已在当前工作区中。';
+            status.style.display = '';
+            return;
+          }
+          addAgentToWorkspace(currentWorkspace, id);
+          renderAgentsList();
+          if (!currentAgentId){
+            try { await setCurrentAgent(id, { autoOpenFirst: false, autoCreate: false }); } catch {}
+          } else {
+            try { await refreshList(); } catch {}
+          }
+          cleanup();
+          return;
+        }
+        for (const id of ids){
+          if (!existing.has(id)) addAgentToWorkspace(currentWorkspace, id);
+        }
+        renderAgentsList();
+        const created = await createGroupSession(groupTitleInput.value || '', String(currentWorkspace || ''), ids);
+        try { await refreshList(); } catch {}
+        try { await openGroup(created && created.id ? created.id : ''); } catch {}
+        cleanup();
+      } catch {}
+    });
+
+    dialog.appendChild(title);
+    dialog.appendChild(desc);
+    dialog.appendChild(groupTitleInput);
+    dialog.appendChild(listWrap);
+    dialog.appendChild(status);
+    dialog.appendChild(actions);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    syncOk();
+  } catch {}
+}
 
 // Small retry/backoff for agents loading (primarily for Electron)
 const AGENTS_RETRY_BASE_MS = 300;
@@ -2941,6 +3788,75 @@ function setCurrent(id){
   currentId = id;
   try { localStorage.setItem(CKEY, id) } catch(e){ try{ warnStorageQuota(); } catch{} }
   try { window.__arcana_currentSessionId = id } catch {}
+}
+function clearCurrentGroupThread(){
+  currentThreadKind = 'session';
+  currentGroupId = '';
+  currentGroupEvents = [];
+}
+function groupEventDedupKey(event){
+  if (!event || typeof event !== 'object') return '';
+  const id = String(event.id || '').trim();
+  if (id) return 'id:' + id;
+  const role = String(event.role || '').trim();
+  const agentId = String(event.agentId || '').trim();
+  const text = String(event.text || '');
+  const ts = String(event.ts || '').trim();
+  const sourceKind = event.source && typeof event.source === 'object'
+    ? String(event.source.kind || '').trim()
+    : '';
+  const triggerEventId = event.source && typeof event.source === 'object'
+    ? String(event.source.triggerEventId || '').trim()
+    : '';
+  const senderType = event.sender && typeof event.sender === 'object'
+    ? String(event.sender.type || '').trim()
+    : '';
+  return ['fallback', role, agentId, text, ts, sourceKind, triggerEventId, senderType].join('|');
+}
+function dedupeGroupEvents(events){
+  const arr = Array.isArray(events) ? events : [];
+  if (!arr.length) return [];
+  const out = [];
+  const seen = new Set();
+  for (const event of arr){
+    if (!event || typeof event !== 'object') continue;
+    const key = groupEventDedupKey(event);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(event);
+  }
+  return out;
+}
+function appendUniqueGroupEvent(events, event){
+  const arr = Array.isArray(events) ? events : [];
+  if (!event || typeof event !== 'object') return arr.slice();
+  const next = arr.slice();
+  const incomingKey = groupEventDedupKey(event);
+  if (incomingKey){
+    for (const existing of next){
+      if (groupEventDedupKey(existing) === incomingKey){
+        return next;
+      }
+    }
+  }
+  next.push(event);
+  return next;
+}
+function groupEventsToMessages(events){
+  const out = [];
+  const arr = dedupeGroupEvents(events);
+  for (const ev of arr){
+    if (!ev || typeof ev !== 'object') continue;
+    const role = String(ev.role || '');
+    if (!role) continue;
+    let text = String(ev.text || '');
+    const agentId = String(ev.agentId || '').trim();
+    if (role === 'assistant' && agentId && !text.startsWith('@' + agentId)){
+      text = '@' + agentId + ' ' + text;
+    }
+    out.push({ role, text, ts: ev.ts || '' });
+  }
+  return out;
 }
 
 // Per-session lastSeen tracking (for unread indicators)
@@ -3045,6 +3961,10 @@ async function _fetchJsonExpectOk(url, opts, label){
 async function listSessions(agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const url = '/api/sessions?agentId=' + encodeURIComponent(id); const j = await _fetchJsonExpectOk(url, undefined, 'list'); return Array.isArray(j && j.sessions) ? j.sessions : [] }
 async function createSession(title, workspace, agentId){ const id = String(agentId || DEFAULT_AGENT_ID); const payload = { agentId: id }; const t0 = String(title || '').trim(); if (t0){ payload.title = t0; } if (workspace){ payload.workspace = String(workspace||''); } return await _fetchJsonExpectOk('/api/sessions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'create') }
 async function deleteSession(id, agentId){ if (!id) return { ok:false }; const aid = String(agentId || DEFAULT_AGENT_ID); const url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid); return await _fetchJsonExpectOk(url, { method:'DELETE' }, 'delete') }
+async function listGroupSessions(workspace){ const url = '/api/group-sessions?workspace=' + encodeURIComponent(String(workspace || '')); const j = await _fetchJsonExpectOk(url, undefined, 'group-list'); return Array.isArray(j && j.groups) ? j.groups : [] }
+async function createGroupSession(title, workspace, members){ const payload = { members: Array.isArray(members) ? members : [] }; const t0 = String(title || '').trim(); if (t0) payload.title = t0; if (workspace != null) payload.workspace = String(workspace || ''); return await _fetchJsonExpectOk('/api/group-sessions', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'group-create') }
+async function deleteGroupSession(id){ if (!id) return { ok:false }; const url = '/api/group-sessions/' + encodeURIComponent(id); return await _fetchJsonExpectOk(url, { method:'DELETE' }, 'group-delete') }
+async function groupTurn(groupId, text, policy, attachments){ const payload = { groupId: String(groupId || ''), text: String(text || ''), policy: String(policy || 'restricted') }; if (Array.isArray(attachments) && attachments.length) payload.attachments = attachments; return await _fetchJsonExpectOk('/v2/group-turn', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'group-turn') }
 async function listAgents(){ const j = await _fetchJsonExpectOk('/api/agents', undefined, 'agents'); return Array.isArray(j && j.agents) ? j.agents : [] }
 async function loadSession(id, agentId){
   try{
@@ -3060,6 +3980,19 @@ async function loadSession(id, agentId){
     try { return await r.json() } catch(e){ let preview = ''; try { preview = await r.clone().text() } catch {}; appendLog('[sessions] load JSON parse error' + (preview ? (': ' + _collapse(preview)) : '')); throw e }
   } catch(e){ appendLog('[sessions] load failed: ' + (((e && e.message) || e))); throw e }
 }
+async function loadGroupSession(id){
+  try{
+    const url = '/api/group-sessions/' + encodeURIComponent(id);
+    const token = getStoredApiToken();
+    const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
+    const r = await fetch(url, headers ? { headers } : undefined);
+    if (r.status === 404) return null;
+    const ct = (r.headers && r.headers.get) ? (r.headers.get('content-type') || '') : '';
+    if (!r.ok){ try { const body = await r.clone().text(); if (body) appendLog('[groups] load HTTP ' + r.status + ' ' + _collapse(body)) } catch {}; throw new Error('HTTP ' + r.status) }
+    if (!ct.includes('application/json')){ let preview = ''; try { preview = await r.clone().text() } catch {}; appendLog('[groups] load non-JSON response ' + r.status + (preview ? (': ' + _collapse(preview)) : '')) }
+    try { return await r.json() } catch(e){ let preview = ''; try { preview = await r.clone().text() } catch {}; appendLog('[groups] load JSON parse error' + (preview ? (': ' + _collapse(preview)) : '')); throw e }
+  } catch(e){ appendLog('[groups] load failed: ' + (((e && e.message) || e))); throw e }
+}
 
 function renderAgentsList(){
   const panel = qs('agents-panel');
@@ -3069,8 +4002,12 @@ function renderAgentsList(){
   box.innerHTML = '';
   const frag = document.createDocumentFragment();
   const current = String(currentAgentId || '');
-  for (const a of (agents||[])){
-    const id = a && a.agentId ? String(a.agentId) : '';
+  const canCreateSession = currentWorkspace !== BACKGROUND_WORKSPACE_ID;
+  const allowedIds = currentWorkspace === BACKGROUND_WORKSPACE_ID
+    ? (Array.isArray(agents) ? agents.map((a)=> a && a.agentId ? String(a.agentId) : '').filter(Boolean) : [])
+    : getWorkspaceAgentIds(currentWorkspace);
+  for (const idRaw of (allowedIds||[])){
+    const id = String(idRaw || '');
     if (!id) continue;
     const div = document.createElement('div');
     div.className = (id===current) ? 'agent-item active' : 'agent-item';
@@ -3079,24 +4016,48 @@ function renderAgentsList(){
     const label = document.createElement('span'); label.className = 'agent-id'; label.textContent = id;
     div.appendChild(dot);
     div.appendChild(label);
-    div.addEventListener('click', ()=>{ setCurrentAgent(id).catch(()=>{}); });
+    if (canCreateSession){
+      const add = document.createElement('button');
+      add.className = 'btn btn-ghost btn-icon btn-xs agent-add';
+      add.type = 'button';
+      add.textContent = '+';
+      add.title = tt('ui.newSession');
+      add.addEventListener('click', async (ev)=>{
+        try{
+          ev.stopPropagation && ev.stopPropagation();
+          ev.preventDefault && ev.preventDefault();
+        } catch {}
+        try{
+          // Switch to this agent (without forcing a session) then create explicitly.
+          await setCurrentAgent(id, { autoOpenFirst: false, autoCreate: false });
+          const obj = await createSession('', String(currentWorkspace || ''), id);
+          await openSession(obj.id);
+        } catch(e){
+          appendLog('[sessions] new session failed: ' + (((e && e.message) || e)));
+        }
+      });
+      div.appendChild(add);
+    }
+    div.addEventListener('click', ()=>{ setCurrentAgent(id, { autoCreate: false }).catch(()=>{}); });
     frag.appendChild(div);
   }
   if (!frag.childNodes.length){
     const empty = document.createElement('div');
     empty.className = 'agent-empty';
-    empty.textContent = 'No agents yet. Use the create_agent tool to create one.';
+    empty.textContent = currentWorkspace === BACKGROUND_WORKSPACE_ID
+      ? '后台工作区中暂无 Agent 会话。'
+      : 'No agents in this workspace yet.';
     box.appendChild(empty);
   } else {
     box.appendChild(frag);
   }
 }
 
-async function setCurrentAgent(id){
+async function setCurrentAgent(id, opts){
   const nextId = String(id || '');
   if (nextId === String(currentAgentId || '')) return;
   currentAgentId = nextId;
-  try { localStorage.setItem(AKEY, currentAgentId); } catch {}
+  try { currentAgentId ? localStorage.setItem(AKEY, currentAgentId) : localStorage.removeItem(AKEY); } catch {}
   renderAgentsList();
 
   // Best-effort refresh of config panel for new agent
@@ -3110,6 +4071,7 @@ async function setCurrentAgent(id){
     return;
   }
 
+  clearCurrentGroupThread();
   setCurrent('');
   try { renderMessages([]); } catch {}
 
@@ -3120,20 +4082,29 @@ async function setCurrentAgent(id){
     appendLog('[sessions] 切换代理刷新失败: ' + (((e && e.message) || e)));
   }
 
-  if (Array.isArray(items) && items.length){
+  const autoOpenFirst = !opts || opts.autoOpenFirst !== false;
+  if (autoOpenFirst && Array.isArray(items) && items.length){
     try {
-      await openSession(items[0].id);
-    } catch (e) {
-      appendLog('[sessions] 打开会话失败: ' + (((e && e.message) || e)));
-    }
+      if (hasAgents){
+        const aid = String(currentAgentId || '');
+        const pick = items.find((it)=> it && String(it.agentId || '') === aid) || null;
+        if (pick) await openSession(pick.id, pick.agentId);
+      } else {
+        await openSession(items[0].id);
+      }
+    } catch (e) { appendLog('[sessions] 打开会话失败: ' + (((e && e.message) || e))); }
     return;
   }
 
-  try {
-    const created = await createSession('', '', currentAgentId);
-    await openSession(created.id);
-  } catch (e) {
-    appendLog('[sessions] 创建新会话失败: ' + (((e && e.message) || e)));
+  // Do not force-create a session when none exists (user creates via "+" button).
+  const autoCreate = !!(opts && opts.autoCreate);
+  if (autoCreate){
+    try {
+      const created = await createSession('', String(currentWorkspace || ''), currentAgentId);
+      await openSession(created.id);
+    } catch (e) {
+      appendLog('[sessions] 创建新会话失败: ' + (((e && e.message) || e)));
+    }
   }
 }
 
@@ -3179,7 +4150,31 @@ async function loadAgents(){
         desired = agents[0].agentId || '';
       }
       currentAgentId = String(desired || '');
-      try { localStorage.setItem(AKEY, currentAgentId); } catch {}
+
+      // Bootstrap default workspace membership with all known agents on first run.
+      try{
+        const ws = String(currentWorkspace || '');
+        if (ws === ''){
+          const hasBinding = workspaceAgents && typeof workspaceAgents === 'object' && Array.isArray(workspaceAgents['']);
+          if (!hasBinding){
+            const allAgentIds = agents.map((a)=> a && a.agentId ? String(a.agentId) : '').filter(Boolean);
+            setWorkspaceAgentIds('', allAgentIds);
+          }
+        }
+      } catch {}
+
+      // Constrain current agent to current workspace membership.
+      try{
+        if (String(currentWorkspace || '') !== BACKGROUND_WORKSPACE_ID){
+          const allowed = getWorkspaceAgentIds(currentWorkspace);
+          if (!Array.isArray(allowed) || !allowed.length){
+            currentAgentId = '';
+          } else if (!allowed.includes(currentAgentId)){
+            currentAgentId = String(allowed[0] || '');
+          }
+        }
+      } catch {}
+      try { currentAgentId ? localStorage.setItem(AKEY, currentAgentId) : localStorage.removeItem(AKEY); } catch {}
     }
     renderAgentsList();
     // Ensure config UI reflects the resolved current agent on first load
@@ -3210,31 +4205,25 @@ async function loadAgents(){
 function renderSessionList(items){
   const box = qs('session-list'); if (!box) return;
   box.innerHTML = '';
+  try { renderedSessionAgentIdBySessionId = new Map(); } catch {}
   const list = Array.isArray(items) ? items.slice() : [];
-  const normal = [];
-  const background = [];
-  for (const it of list){
-    if (!it) continue;
-    const titleRaw = (it && typeof it.title === 'string') ? it.title : '';
-    const t = String(titleRaw || '');
-    const isCronRun = t.slice(0, 10) === '[cron-run]';
-    const isCronAgentTurn = t.startsWith('Cron Agent Turn #');
-    if (isCronRun || isCronAgentTurn){
-      background.push(it);
-    } else {
-      normal.push(it);
-    }
-  }
 
   function displaySessionTitle(raw){ try{ const s = String(raw || '').trim(); if (!s || s === '新会话' || s === 'New session'){ return (typeof t === 'function') ? t('session.untitled') : 'Untitled session'; } return s; } catch{ return (typeof t === 'function') ? t('session.untitled') : 'Untitled session'; } }
-  function renderOne(it, extraClass){
+  function renderOne(it, extraClass, agentIdOverride){
     const div = document.createElement('div');
-    const baseCls = (it.id===currentId) ? 'sess-item active' : 'sess-item';
+    const isGroup = !!(it && it.kind === 'group');
+    const isActive = isGroup ? (currentThreadKind === 'group' && it.id === currentGroupId) : (currentThreadKind === 'session' && it.id === currentId);
+    const baseCls = isActive ? 'sess-item active' : 'sess-item';
     div.className = extraClass ? (baseCls + ' ' + extraClass) : baseCls;
     div.dataset.id = it.id;
+    const aid = String(agentIdOverride || ((it && it.agentId) ? it.agentId : '') || ((hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID));
+    if (!isGroup){
+      try { div.dataset.agentId = aid; } catch {}
+      try { renderedSessionAgentIdBySessionId.set(String(it.id || ''), aid); } catch {}
+    }
     const unread = isSessionUnread(it);
     const unreadDot = unread ? '<span class=sess-unread-dot></span>' : '';
-    const running = !!typing.get(it.id);
+    const running = !isGroup && !!typing.get(it.id);
     const runningSpinner = running ? '<span class=sess-running-spinner></span>' : '';
     const title = displaySessionTitle(it.title);
     const metaTime = it.updatedAt ? ('<span class=meta>' + new Date(it.updatedAt).toLocaleString() + '</span>') : '';
@@ -3247,8 +4236,7 @@ function renderSessionList(items){
       try{
         ev.stopPropagation && ev.stopPropagation(); ev.preventDefault && ev.preventDefault();
         const ok = confirm(tt('sessions.deleteConfirm')); if (!ok) return;
-        const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-        const resp = await deleteSession(it.id, aid);
+        const resp = isGroup ? await deleteGroupSession(it.id) : await deleteSession(it.id, aid);
         if (!resp || resp.ok !== true){ appendLog('[sessions] delete failed: server rejected'); return }
         try{
           const sid = String(it.id || '');
@@ -3314,36 +4302,161 @@ function renderSessionList(items){
             } catch {}
           }
         } catch {}
-        const deletedCurrent = (it.id === currentId);
-        if (deletedCurrent) setCurrent('');
+        const deletedCurrent = isGroup ? (currentThreadKind === 'group' && it.id === currentGroupId) : (it.id === currentId);
+        if (deletedCurrent){
+          if (isGroup){
+            clearCurrentGroupThread();
+          }
+          setCurrent('');
+        }
         try { await refreshList() } catch {}
         if (deletedCurrent){
-          try {
-            const remain = await listSessions(hasAgents && currentAgentId ? currentAgentId : undefined);
-            if (Array.isArray(remain) && remain.length){
-              await openSession(remain[0].id);
-            } else {
-              let obj;
-              if (hasAgents && currentAgentId){
-                obj = await createSession('', '', currentAgentId);
-              } else {
-                const ws = await pickWorkspace() || '';
-                if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); return; }
-                obj = await createSession('', ws);
-              }
-              await openSession(obj.id);
-            }
-          } catch(e){ appendLog('[sessions] delete fallback failed: ' + (((e && e.message) || e))) }
+          // Do not force-create or auto-open a session when the last one is deleted.
+          try { activeSessionWorkspace = ''; } catch {}
+          try { renderMessages([]); } catch {}
         }
       } catch(e){ appendLog('[sessions] delete failed: ' + (((e && e.message) || e))) }
     });
     div.appendChild(del);
-    div.addEventListener('click', async ()=>{ await openSession(it.id) });
+    div.addEventListener('click', async ()=>{ if (isGroup) await openGroup(it.id); else await openSession(it.id, aid) });
     return div;
   }
 
+  if (hasAgents){
+    const groupItems = Array.isArray(visibleGroupItems) ? visibleGroupItems.slice() : [];
+    const ws = String(currentWorkspace || '');
+    const backgroundMode = ws === BACKGROUND_WORKSPACE_ID;
+    const allowedIds = backgroundMode
+      ? Array.from(new Set((list || []).map((it)=> String((it && it.agentId) || '')).filter(Boolean)))
+      : getWorkspaceAgentIds(currentWorkspace);
+    const byAgent = new Map();
+    for (const it of (list || [])){
+      if (!it) continue;
+      const aid = String((it && it.agentId) || '');
+      if (!aid) continue;
+      if (!byAgent.has(aid)) byAgent.set(aid, []);
+      byAgent.get(aid).push(it);
+    }
+
+    if (groupItems.length){
+      const group = document.createElement('div');
+      group.className = 'sess-group';
+      const header = document.createElement('div');
+      header.className = 'sess-group-header';
+      const toggle = document.createElement('span');
+      toggle.className = 'sess-group-toggle';
+      toggle.textContent = '▾';
+      const title = document.createElement('span');
+      title.className = 'sess-group-title';
+      title.textContent = '群聊';
+      const meta = document.createElement('span');
+      meta.className = 'sess-group-meta';
+      meta.textContent = String(groupItems.length);
+      header.appendChild(toggle);
+      header.appendChild(title);
+      header.appendChild(meta);
+      group.appendChild(header);
+
+      const body = document.createElement('div');
+      body.className = 'sess-group-body';
+      for (const it of groupItems){
+        body.appendChild(renderOne(it, 'sess-item-in-group'));
+      }
+      group.appendChild(body);
+      box.appendChild(group);
+    }
+
+    for (const idRaw of (allowedIds || [])){
+      const aid = String(idRaw || '');
+      if (!aid) continue;
+      const groupItems = (byAgent.get(aid) || []).slice();
+      groupItems.sort((a,b)=> String(b.updatedAt||'').localeCompare(String(a.updatedAt||'')));
+      const collapsed = isSessionGroupCollapsed(ws, aid);
+
+      const group = document.createElement('div');
+      group.className = collapsed ? 'sess-group collapsed' : 'sess-group';
+      const header = document.createElement('div');
+      header.className = 'sess-group-header';
+      header.dataset.agentId = aid;
+
+      const toggle = document.createElement('span');
+      toggle.className = 'sess-group-toggle';
+      toggle.textContent = collapsed ? '▸' : '▾';
+
+      const title = document.createElement('span');
+      title.className = 'sess-group-title';
+      title.textContent = aid;
+
+      const meta = document.createElement('span');
+      meta.className = 'sess-group-meta';
+      meta.textContent = String(groupItems.length);
+
+      const add = document.createElement('button');
+      add.className = 'btn btn-ghost btn-icon btn-xs sess-group-add';
+      add.type = 'button';
+      add.textContent = '+';
+      add.title = tt('ui.newSession');
+      add.addEventListener('click', async (ev)=>{
+        try{
+          ev.stopPropagation && ev.stopPropagation();
+          ev.preventDefault && ev.preventDefault();
+        } catch {}
+        try{
+          // Use the workspace snapshot captured when rendering this group.
+          // Avoid accidentally reading a later global workspace value.
+          const obj = await createSession('', ws, aid);
+          await openSession(obj.id, aid);
+        } catch(e){
+          appendLog('[sessions] new session failed: ' + (((e && e.message) || e)));
+        }
+      });
+
+      header.appendChild(toggle);
+      header.appendChild(title);
+      header.appendChild(meta);
+      if (!backgroundMode) header.appendChild(add);
+      header.addEventListener('click', ()=>{
+        const nextCollapsed = !isSessionGroupCollapsed(ws, aid);
+        setSessionGroupCollapsed(ws, aid, nextCollapsed);
+        renderSessionList(items);
+      });
+      group.appendChild(header);
+
+      if (!collapsed){
+        const body = document.createElement('div');
+        body.className = 'sess-group-body';
+        for (const it of groupItems){
+          body.appendChild(renderOne(it, 'sess-item-in-group', aid));
+        }
+        group.appendChild(body);
+      }
+      box.appendChild(group);
+    }
+    return;
+  }
+
+  const normal = [];
+  const background = [];
+  for (const it of list){
+    if (!it) continue;
+    if (isBackgroundSessionItem(it)){
+      background.push(it);
+    } else {
+      normal.push(it);
+    }
+  }
+
+  if (String(currentWorkspace || '') === BACKGROUND_WORKSPACE_ID){
+    for (const it of list){
+      box.appendChild(renderOne(it, 'sess-item-bg', DEFAULT_AGENT_ID));
+    }
+    return;
+  }
+
+  // In non-agent mode keep legacy list rendering (including background group).
+
   for (const it of normal){
-    box.appendChild(renderOne(it));
+    box.appendChild(renderOne(it, undefined, DEFAULT_AGENT_ID));
   }
 
   if (background.length){
@@ -3366,28 +4479,57 @@ function renderSessionList(items){
 
     if (!bgSessionsCollapsed){
       for (const it of background){
-        box.appendChild(renderOne(it, 'sess-item-bg'));
+        box.appendChild(renderOne(it, 'sess-item-bg', DEFAULT_AGENT_ID));
       }
     }
   }
 }
 
-async function openSession(id){
+async function openSession(id, agentId){
+  const sid = String(id || '');
+  if (!sid) return;
   const prevId = currentId;
-  setCurrent(id);
+  if (hasAgents){
+    let desiredAgentId = String(agentId || '');
+    if (!desiredAgentId){
+      try { desiredAgentId = String((renderedSessionAgentIdBySessionId && renderedSessionAgentIdBySessionId.get(sid)) || ''); } catch {}
+    }
+    if (!desiredAgentId){
+      desiredAgentId = String(currentAgentId || '');
+    }
+    if (!desiredAgentId){
+      try{
+        const allowed = getWorkspaceAgentIds(currentWorkspace);
+        if (Array.isArray(allowed) && allowed.length) desiredAgentId = String(allowed[0] || '');
+      } catch {}
+    }
+    if (desiredAgentId && desiredAgentId !== String(currentAgentId || '')){
+      try { await setCurrentAgent(desiredAgentId, { autoOpenFirst: false, autoCreate: false }); } catch {}
+    }
+    try {
+      if (desiredAgentId){
+        renderedSessionAgentIdBySessionId.set(sid, desiredAgentId);
+      }
+    } catch {}
+  }
+
+  clearCurrentGroupThread();
+  currentThreadKind = 'session';
+  setCurrent(sid);
   renderMessages([]); // clear
-  if (prevId && prevId !== id){
+  if (prevId && prevId !== sid){
     try{ gatewayV2Pending.clear(); } catch{}
     activeAssistant = null;
   }
   try{
-    bindGatewayV2ReactorToSession(id).catch(()=>{});
+    bindGatewayV2ReactorToSession(sid).catch(()=>{});
   } catch{}
+  try { syncGatewayV2Subscription(); } catch {}
   const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
   // Restore fullshell policy for this session (or pending fallback)
   try{
     const cb = qs('fullshell');
-    const stored = loadFullshellPolicy(aid, id);
+    const stored = loadFullshellPolicy(aid, sid);
     if (stored !== null){
       if (cb) cb.checked = !!stored;
       applyFullshellUi(!!stored);
@@ -3397,45 +4539,71 @@ async function openSession(id){
         if (cb) cb.checked = !!pend;
         applyFullshellUi(!!pend);
         clearPendingFullshell();
-        saveFullshellPolicy(aid, id, !!pend);
+        saveFullshellPolicy(aid, sid, !!pend);
       } else {
         if (cb) cb.checked = false;
         applyFullshellUi(false);
       }
     }
   } catch {}
-  const obj = await loadSession(id, aid);
+  const obj = await loadSession(sid, aid);
   try {
     if (obj && obj.updatedAt){
-      markSessionSeen(id, obj.updatedAt);
+      markSessionSeen(sid, obj.updatedAt);
     } else {
-      markSessionSeen(id);
+      markSessionSeen(sid);
     }
   } catch {}
   if (obj && obj.workspace) {
-    currentWorkspace = String(obj.workspace || '');
+    activeSessionWorkspace = String(obj.workspace || '');
   } else {
-    currentWorkspace = '';
+    activeSessionWorkspace = '';
   }
   try {
-    const info = ensureLiveForSession(id);
+    const info = ensureLiveForSession(sid);
     if (info){
-      info.workspace = currentWorkspace;
+      info.workspace = activeSessionWorkspace;
       const tokensNum = Number(obj && obj.sessionTokens);
       if (Number.isFinite(tokensNum) && tokensNum >= 0){ info.sessionTokens = tokensNum; }
     }
   } catch {}
   renderMessages((obj && Array.isArray(obj.messages)) ? obj.messages : []);
   // Log session workspace only when it changes to avoid duplicate lines when switching
-  try { if (obj && obj.workspace) { logWorkspaceIfChanged(id, 'workspace:', obj.workspace); } } catch {}
+  try { if (obj && obj.workspace) { logWorkspaceIfChanged(sid, 'workspace:', obj.workspace); } } catch {}
   requestRefreshList();
-  try { renderLogsFor(id, activeLogTab) } catch {}
-  try { renderLiveInfoFor(id); } catch {}
+  try { renderLogsFor(sid, activeLogTab) } catch {}
+  try { renderLiveInfoFor(sid); } catch {}
   try {
     if (toolStreamEnabled){
       try { ensureTransportReady().catch(()=>{}); } catch {}
     }
   } catch {}
+}
+
+async function openGroup(id){
+  const gid = String(id || '');
+  if (!gid) return;
+  clearCurrentGroupThread();
+  currentThreadKind = 'group';
+  currentGroupId = gid;
+  setCurrent('');
+  try { setupGatewayV2WebSocket(); } catch {}
+  try { syncGatewayV2Subscription(); } catch {}
+  renderMessages([]);
+  activeAssistant = null;
+  const obj = await loadGroupSession(gid);
+  if (!obj) return;
+  currentGroupEvents = dedupeGroupEvents(Array.isArray(obj.events) ? obj.events : []);
+  try {
+    if (obj.updatedAt){
+      markSessionSeen(gid, obj.updatedAt);
+    } else {
+      markSessionSeen(gid);
+    }
+  } catch {}
+  activeSessionWorkspace = String((obj && obj.workspace) || '');
+  renderMessages(groupEventsToMessages(currentGroupEvents));
+  requestRefreshList();
 }
 
 function renderMessages(msgs){
@@ -3481,7 +4649,10 @@ function renderMessages(msgs){
       continue;
     }
     if (role === 'user'){
-      appendMessage('user', rawText, m.ts || '');
+      const bubble = appendMessage('user', rawText, m.ts || '');
+      if (bubble && Array.isArray(m.mediaRefs) && m.mediaRefs.length){
+        renderBubbleMedia(bubble, m.mediaRefs, getCurrentSessionId() || currentId || '');
+      }
       continue;
     }
     if (rawText){
@@ -3492,20 +4663,85 @@ function renderMessages(msgs){
 }
 
 async function refreshList(){
-  const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-  const items = await listSessions(aid);
+  // Filter by selected workspace (do not fall back when empty).
+  const wsSel = String(currentWorkspace || '');
+  const backgroundMode = wsSel === BACKGROUND_WORKSPACE_ID;
+
+  if (hasAgents){
+    try{
+      const groups = await listGroupSessions(wsSel);
+      visibleGroupItems = Array.isArray(groups) ? groups.slice() : [];
+    } catch (e){
+      visibleGroupItems = [];
+      appendLog('[groups] list failed: ' + (((e && e.message) || e)));
+    }
+    const allowedIds = backgroundMode
+      ? (Array.isArray(agents) ? agents.map((a)=> a && a.agentId ? String(a.agentId) : '').filter(Boolean) : [])
+      : getWorkspaceAgentIds(currentWorkspace);
+    if (!Array.isArray(allowedIds) || !allowedIds.length){
+      renderSessionList([]);
+      return [];
+    }
+
+    const all = [];
+    for (const idRaw of (allowedIds || [])){
+      const aid = String(idRaw || '');
+      if (!aid) continue;
+      try{
+        const items = await listSessions(aid);
+        for (const it of (items || [])){
+          if (!it) continue;
+          try { it.agentId = aid; } catch {}
+          all.push(it);
+        }
+      } catch (e){
+        appendLog('[sessions] list failed for agent ' + aid + ': ' + (((e && e.message) || e)));
+      }
+    }
+
+    all.sort((a,b)=> String(b.updatedAt||'').localeCompare(String(a.updatedAt||'')));
+    const filtered = backgroundMode
+      ? all.filter((it)=> shouldShowInBackgroundWorkspace(it))
+      : all.filter((it)=> String((it && it.workspace) || '') === wsSel);
+    const visible = filtered;
+    primeLastSeenFromList(all);
+    primeLastSeenFromList(visibleGroupItems);
+    try{
+      if (currentId){
+        const currentItem = visible.find((it)=> it && it.id === currentId);
+        if (currentItem && currentItem.updatedAt){
+          markSessionSeen(currentId, currentItem.updatedAt);
+        }
+      }
+      if (currentThreadKind === 'group' && currentGroupId){
+        const currentGroup = visibleGroupItems.find((it)=> it && it.id === currentGroupId);
+        if (currentGroup && currentGroup.updatedAt){
+          markSessionSeen(currentGroupId, currentGroup.updatedAt);
+        }
+      }
+    } catch {}
+    renderSessionList(visible);
+    return visible;
+  }
+
+  visibleGroupItems = [];
+  const items = await listSessions(DEFAULT_AGENT_ID);
   items.sort((a,b)=> String(b.updatedAt||'').localeCompare(String(a.updatedAt||'')));
+  const filtered = backgroundMode
+    ? items.filter((it)=> shouldShowInBackgroundWorkspace(it))
+    : items.filter((it)=> String((it && it.workspace) || '') === wsSel);
+  const visible = filtered;
   primeLastSeenFromList(items);
   try{
     if (currentId){
-      const currentItem = items.find((it)=> it && it.id === currentId);
+      const currentItem = visible.find((it)=> it && it.id === currentId);
       if (currentItem && currentItem.updatedAt){
         markSessionSeen(currentId, currentItem.updatedAt);
       }
     }
   } catch {}
-  renderSessionList(items);
-  return items;
+  renderSessionList(visible);
+  return visible;
 }
 
 // Coalesced/throttled list refresh for frequent events (SSE typing/text etc.)
@@ -3534,12 +4770,16 @@ function requestRefreshList(){
 
 async function ensureSession(){
   if (currentId) return currentId;
+  if (hasAgents && !currentAgentId){
+    try { alert('请先在当前工作区添加一个 Agent'); } catch {}
+    throw new Error('agent_required');
+  }
   if (hasAgents && currentAgentId){
-    const created = await createSession('', '', currentAgentId);
+    const created = await createSession('', String(currentWorkspace || ''), currentAgentId);
     setCurrent(created.id);
     // If the user toggled before a session existed, persist pending now
     try{ persistPendingFullshellFor(created.id, currentAgentId || DEFAULT_AGENT_ID); } catch {}
-    currentWorkspace = String(created.workspace || '');
+    activeSessionWorkspace = String(created.workspace || currentWorkspace || '');
     await refreshList();
     return currentId;
   }
@@ -3549,37 +4789,50 @@ async function ensureSession(){
   setCurrent(created.id);
   // Persist pending fullshell for this newly created session
   try{ persistPendingFullshellFor(created.id, DEFAULT_AGENT_ID); } catch {}
-  currentWorkspace = String(created.workspace || ws || '');
+  activeSessionWorkspace = String(created.workspace || ws || '');
+  // Keep workspace selector in sync (best-effort) for non-agent mode.
+  try{
+    if (String(currentWorkspace || '') !== String(ws || '')){
+      currentWorkspace = String(ws || '');
+      ensureWorkspaceInList(currentWorkspace);
+      persistWorkspaceState();
+      renderWorkspaceSelector();
+    }
+  } catch {}
   await refreshList();
   return currentId;
 }
 
 async function sendWithSession(){
   const text = input.value.trim();
-  if (!text) return;
+  const attachments = getPendingAttachmentPayload();
+  const mediaRefs = getPendingAttachmentMediaRefs();
+  if (!text && !attachments.length) return;
   await ensureSession();
   const sidAtSend = currentId;
   // For non-agent sessions, ensure we have a workspace so legacy HTTP chat APIs accept the request
   if (!hasAgents || !currentAgentId){
-    if (!currentWorkspace && sidAtSend){
+    if (!activeSessionWorkspace && sidAtSend){
       try {
         const obj = await loadSession(sidAtSend, DEFAULT_AGENT_ID);
-        if (obj && obj.workspace) currentWorkspace = String(obj.workspace || '');
+        if (obj && obj.workspace) activeSessionWorkspace = String(obj.workspace || '');
       } catch {}
     }
   }
-  appendMessage('user', text);
+  const userBubble = appendMessage('user', text || 'See attached image.');
+  renderBubbleMedia(userBubble, mediaRefs, sidAtSend);
   input.value = ''; autoResize();
+  clearPendingAttachments();
   activeAssistant = appendMessage('assistant','');
   setTyping(activeAssistant, true);
   streamingId = sidAtSend;
   try{
-    const payload = { sessionId: sidAtSend, message: text, policy: (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted', agentId: currentAgentId || DEFAULT_AGENT_ID };
+    const payload = { sessionId: sidAtSend, message: text, policy: (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted', agentId: currentAgentId || DEFAULT_AGENT_ID, attachments };
     if (!hasAgents || !currentAgentId){
-      const ws = String(currentWorkspace || '').trim();
+      const ws = String(activeSessionWorkspace || '').trim();
       if (ws) payload.workspace = ws;
     }
-    const r = await fetch('/v2/turn-sync', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ agentId: payload.agentId, sessionKey: payload.sessionId, sessionId: payload.sessionId, text: payload.message, policy: payload.policy }) });
+    const r = await fetch('/v2/turn-sync', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ agentId: payload.agentId, sessionKey: payload.sessionId, sessionId: payload.sessionId, text: payload.message, policy: payload.policy, attachments: payload.attachments }) });
     let j = null; try { j = await r.json(); } catch {}
     if (!r.ok){
       const parts = [];
@@ -3605,7 +4858,9 @@ async function sendWithSession(){
 
 async function sendWithGatewayV2(){
   const text = input.value.trim();
-  if (!text) return;
+  const attachments = getPendingAttachmentPayload();
+  const mediaRefs = getPendingAttachmentMediaRefs();
+  if (!text && !attachments.length) return;
   const mode = await ensureTransportReady();
   if (!gatewayV2Enabled || mode !== 'v2'){
     await sendWithSession();
@@ -3619,9 +4874,11 @@ async function sendWithGatewayV2(){
   }
   // Ensure reactor runner is started (best-effort)
   try { await ensureV2RunnerStarted(); } catch {}
-  appendMessage('user', text);
+  const userBubble = appendMessage('user', text || 'See attached image.');
+  renderBubbleMedia(userBubble, mediaRefs, currentId || '');
   input.value = '';
   autoResize();
+  clearPendingAttachments();
   const bubble = appendMessage('assistant', '');
   activeAssistant = bubble;
   setTyping(bubble, true);
@@ -3629,7 +4886,7 @@ async function sendWithGatewayV2(){
   try{
     const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
     const sessionId = (typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || '';
-    const body = { agentId, sessionKey, sessionId, text, policy };
+    const body = { agentId, sessionKey, sessionId, text, policy, attachments };
     // Attach content-type and Authorization (if available) like other v2 calls
     const token = getStoredApiToken();
     const headers = token
@@ -3652,6 +4909,12 @@ async function sendWithGatewayV2(){
       try { if (sid) logMain(sid, msg); } catch {}
       return;
     }
+    try{
+      const replyId = j && j.eventId ? String(j.eventId) : '';
+      if (replyId){
+        rememberPendingAssistantBubble(replyId, bubble);
+      }
+    } catch {}
     // On success, still rely on Gateway v2 event stream (assistant_text/thinking_*)
     // for streaming updates, but perform a final sync so the last message
     // is never lost even if some events were dropped.
@@ -3676,10 +4939,44 @@ async function sendWithGatewayV2(){
   }
 }
 
+async function sendWithGroup(){
+  const text = input.value.trim();
+  const attachments = getPendingAttachmentPayload();
+  if (!text && !attachments.length) return;
+  if (!currentGroupId) return;
+  if (!text){
+    appendLog('[groups] 群聊暂不支持仅发送附件。');
+    return;
+  }
+  input.value = '';
+  autoResize();
+  clearPendingAttachments();
+  try{
+    const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
+    const result = await groupTurn(currentGroupId, text, policy, attachments);
+    if (result && result.group && currentThreadKind === 'group' && currentGroupId === String(result.group.id || '')){
+      currentGroupEvents = dedupeGroupEvents(Array.isArray(result.group.events) ? result.group.events : []);
+      renderMessages(groupEventsToMessages(currentGroupEvents));
+      try { markSessionSeen(currentGroupId, result.group.updatedAt || nowIso()); } catch {}
+    }
+    requestRefreshList();
+  } catch(e){
+    appendLog('[groups] send failed: ' + (((e && e.message) || e)));
+  }
+}
+
 async function handleSend(){
   const trimmed = String((input && input.value) || '').trim();
-  if (!trimmed) return;
+  if (!trimmed && pendingImageAttachments.length === 0) return;
+  if (hasAgents && currentThreadKind !== 'group' && !currentAgentId){
+    try { alert('请先在当前工作区添加一个 Agent'); } catch {}
+    return;
+  }
   if (maybeOpenVoiceIngress(trimmed)) return;
+  if (currentThreadKind === 'group'){
+    await sendWithGroup();
+    return;
+  }
   const mode = await ensureTransportReady();
   if (mode === 'v2'){
     await sendWithGatewayV2();
@@ -3697,12 +4994,11 @@ try {
     stopBtn.addEventListener('click', async ()=>{
       try{
         await ensureTransportReady();
-        const agentId = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
-        const sessionKey = getGatewayV2SessionKeyForCurrent();
-        if (!sessionKey) return;
+        const body = getGatewayV2AbortBody();
+        if (!body) return;
         const token = getStoredApiToken();
         const headers = token ? { 'content-type':'application/json', 'authorization':'Bearer ' + token } : { 'content-type':'application/json' };
-        await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify({ agentId, sessionKey }) });
+        await fetch('/v2/abort', { method:'POST', headers, body: JSON.stringify(body) });
       } catch {}
     });
   }
@@ -3743,7 +5039,10 @@ async function ensureTransportReady(){
 function setupGatewayV2WebSocket(){
   try{
     if (!gatewayV2Enabled) return;
-    if (gatewayV2Ws && gatewayV2Ws.readyState === 1) return;
+    if (gatewayV2Ws && gatewayV2Ws.readyState === 1){
+      try { syncGatewayV2Subscription(); } catch {}
+      return;
+    }
     let url = '';
     try{
       const loc = window.location;
@@ -3759,12 +5058,33 @@ function setupGatewayV2WebSocket(){
         url = url + sep + 'token=' + encodeURIComponent(token);
       }
     } catch{}
+    try{
+      const meta = getGatewayV2SubscriptionMeta();
+      const params = [
+        ['agentId', meta.agentId],
+        ['sessionKey', meta.sessionKey],
+        ['sessionId', meta.sessionId],
+        ['groupId', meta.groupId],
+        ['threadKind', meta.threadKind],
+        ['clientId', meta.clientId],
+        ['receiveAll', '1'],
+      ];
+      for (const pair of params){
+        const key = pair[0];
+        const value = String(pair[1] || '').trim();
+        if (!value) continue;
+        const sep = url.includes('?') ? '&' : '?';
+        url = url + sep + encodeURIComponent(key) + '=' + encodeURIComponent(value);
+      }
+    } catch{}
     let ws;
     try { ws = new WebSocket(url); } catch { return; }
     gatewayV2Ws = ws;
+    ws.onopen = ()=>{ try { syncGatewayV2Subscription(); } catch {} };
     ws.onmessage = (ev)=>{
       try {
         const payload = JSON.parse(ev.data);
+        recordGatewayV2Event(payload);
         handleGatewayV2Envelope(payload);
       } catch {}
     };
@@ -3778,9 +5098,44 @@ function setupGatewayV2WebSocket(){
   } catch {}
 }
 
+function recordGatewayV2Event(payload){
+  try {
+    gatewayV2EventSeq += 1;
+    const item = {
+      index: gatewayV2EventSeq,
+      ts: new Date().toISOString(),
+      payload,
+    };
+    gatewayV2EventLog.push(item);
+    if (gatewayV2EventLog.length > 1000) gatewayV2EventLog.shift();
+    window.arcanaGatewayV2Events = gatewayV2EventLog;
+    const type = String(payload && payload.type || 'event');
+    const event = payload && payload.event && typeof payload.event === 'object' ? payload.event : null;
+    const sessionKey = String((payload && payload.sessionKey) || (event && event.sessionKey) || '');
+    const sessionId = String((payload && payload.sessionId) || (event && event.sessionId) || '');
+    const agentId = String((payload && payload.agentId) || (event && event.agentId) || '');
+    console.debug('[ArcanaGatewayV2]', item.index, type, { agentId, sessionKey, sessionId, payload });
+  } catch {}
+}
+
 function handleGatewayV2Envelope(payload){
   try{
     if (!payload || typeof payload !== 'object') return;
+    if (payload.type === 'group.event.appended'){
+      const groupId = String(payload.groupId || '');
+      const event = payload.event;
+      if (groupId && currentThreadKind === 'group' && groupId === String(currentGroupId || '') && event && typeof event === 'object'){
+        const nextGroupEvents = appendUniqueGroupEvent(currentGroupEvents, event);
+        const changed = nextGroupEvents.length !== (Array.isArray(currentGroupEvents) ? currentGroupEvents.length : 0);
+        currentGroupEvents = nextGroupEvents;
+        if (changed){
+          renderMessages(groupEventsToMessages(currentGroupEvents));
+          try { markSessionSeen(groupId, event.ts || nowIso()); } catch {}
+        }
+      }
+      try { requestRefreshList(); } catch {}
+      return;
+    }
     // Top-level gateway v2 error events
     if (payload.type === 'turn.error' || payload.type === 'scheduler.wake_error'){
       const curAgent = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
@@ -3819,11 +5174,7 @@ function handleGatewayV2Envelope(payload){
           return;
         }
         const text = data && typeof data.text === 'string' ? data.text : '';
-        let bubble = null;
-        if (replyId && gatewayV2Pending.has(replyId)){
-          bubble = gatewayV2Pending.get(replyId) || null;
-          gatewayV2Pending.delete(replyId);
-        }
+        let bubble = takePendingAssistantBubble(replyId, msgSessionId);
         if (!bubble){
           bubble = appendMessage('assistant', '');
         }
@@ -3982,13 +5333,29 @@ async function fetchSelectedToolOutput(){
     if (!panel || !panel.selectedId) return;
     const action = panel.actions.get(panel.selectedId);
     if (!action) return;
-    const aid = (hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID;
+    const candidateAgentIds = [];
+    const pushAid = (value) => {
+      try{
+        const s = String(value || '').trim();
+        if (!s) return;
+        if (candidateAgentIds.includes(s)) return;
+        candidateAgentIds.push(s);
+      } catch {}
+    };
+    pushAid(action && action.agentId);
+    pushAid(renderedSessionAgentIdBySessionId && renderedSessionAgentIdBySessionId.get(sid));
+    pushAid((hasAgents && currentAgentId) ? currentAgentId : DEFAULT_AGENT_ID);
+    pushAid(DEFAULT_AGENT_ID);
     // THINK/LLM virtual cards fetch persisted thinking text by turnIndex
     const isThinkCard = (String(action.toolName||'').toLowerCase() === 'llm' && String(action.category||'') === 'think');
+    const bodyEl = document.getElementById('tools-details-body');
     let url = '';
+    let r = null;
+    let lastStatus = 0;
+    let turnIdx = null;
+    let toolCallId = '';
     if (isThinkCard){
-      let turnIdx = (typeof action.turnIndex === 'number' && !Number.isNaN(action.turnIndex)) ? action.turnIndex : null;
-      // Fallback: derive from virtual id pattern v:llm:<idx>
+      turnIdx = (typeof action.turnIndex === 'number' && !Number.isNaN(action.turnIndex)) ? action.turnIndex : null;
       if (turnIdx === null){
         try{
           const m = /^v:llm:(\d+)$/.exec(String(action.id||''));
@@ -3996,23 +5363,46 @@ async function fetchSelectedToolOutput(){
         } catch {}
       }
       if (turnIdx === null) turnIdx = 0;
-      const params = new URLSearchParams();
-      params.set('agentId', aid);
-      params.set('sessionId', sid);
-      params.set('turnIndex', String(turnIdx));
-      url = '/api/thinking-output?' + params.toString();
     } else {
+      const isPseudoToolCard = (
+        String(action.kind || '') === 'history_compact' ||
+        /^history_compact:/.test(String(action.id || '')) ||
+        /^v:/.test(String(action.id || ''))
+      );
+      if (isPseudoToolCard){
+        if (bodyEl) bodyEl.textContent = 'No cached tool output for this synthetic card.';
+        return;
+      }
+      toolCallId = String(action.toolCallId || action.id || '').trim();
+      if (!toolCallId){
+        if (bodyEl) bodyEl.textContent = 'Tool output is unavailable: missing toolCallId.';
+        return;
+      }
+    }
+    for (const aid of candidateAgentIds){
       const params = new URLSearchParams();
       params.set('agentId', aid);
       params.set('sessionId', sid);
-      params.set('toolCallId', action.id);
-      params.set('tailBytes', '200000');
-      url = '/api/tool-output?' + params.toString();
+      if (isThinkCard){
+        params.set('turnIndex', String(turnIdx));
+        url = '/api/thinking-output?' + params.toString();
+      } else {
+        params.set('toolCallId', toolCallId);
+        params.set('tailBytes', '200000');
+        url = '/api/tool-output?' + params.toString();
+      }
+      r = await fetch(url);
+      lastStatus = r && typeof r.status === 'number' ? r.status : 0;
+      if (r && r.ok){
+        if (action && aid && action.agentId !== aid) action.agentId = aid;
+        break;
+      }
+      if (!r || r.status !== 404){
+        break;
+      }
     }
-    const r = await fetch(url);
-    const bodyEl = document.getElementById('tools-details-body');
-    if (!r.ok){
-      if (bodyEl) bodyEl.textContent = (isThinkCard ? 'Failed to fetch thinking: HTTP ' : 'Failed to fetch tool output: HTTP ') + r.status;
+    if (!r || !r.ok){
+      if (bodyEl) bodyEl.textContent = (isThinkCard ? 'Failed to fetch thinking: HTTP ' : 'Failed to fetch tool output: HTTP ') + (lastStatus || '?');
       return;
     }
     let j = null;
@@ -4238,7 +5628,8 @@ function handleArcanaEvent(data){
         try {
           const targetId = data.sessionId || sid;
           const sid2 = String(targetId || '');
-          if (sid2 && data.usage && typeof data.usage.totalTokens === 'number'){
+          const usageTotals = getToolUsageTotals(data);
+          if (sid2 && usageTotals.totalTokens !== null){
             const idx = lastToolTurnBySession.get(sid2);
             if (typeof idx === 'number' && !Number.isNaN(idx)){
               const panel = getToolPanel(sid2);
@@ -4248,13 +5639,15 @@ function handleArcanaEvent(data){
                 const curTurn = (typeof existing.turnTokens === 'number' && existing.turnTokens >= 0) ? existing.turnTokens : 0;
                 const curTool = (typeof existing.toolTokens === 'number' && existing.toolTokens >= 0) ? existing.toolTokens : 0;
                 const curLlm = (typeof existing.llmTokens === 'number' && existing.llmTokens >= 0) ? existing.llmTokens : 0;
-                const add = Number(data.usage.totalTokens) || 0;
+                const add = usageTotals.totalTokens;
                 const nextTurn = curTurn + (add > 0 ? add : 0);
                 const nextTool = curTool + (add > 0 ? add : 0);
                 panel.turnUsage.set(idx, {
                   startSessionTokens: (typeof existing.startSessionTokens === 'number' && existing.startSessionTokens >= 0) ? existing.startSessionTokens : 0,
                   lastSessionTokens: (typeof existing.lastSessionTokens === 'number' && existing.lastSessionTokens >= 0) ? existing.lastSessionTokens : 0,
-                  lastContextTokens: (typeof existing.lastContextTokens === 'number' && existing.lastContextTokens >= 0) ? existing.lastContextTokens : 0,
+                  lastContextTokens: (usageTotals.contextTokens !== null)
+                    ? usageTotals.contextTokens
+                    : (typeof existing.lastContextTokens === 'number' && existing.lastContextTokens >= 0) ? existing.lastContextTokens : 0,
                   turnTokens: nextTurn,
                   toolTokens: nextTool,
                   llmTokens: curLlm,
@@ -4519,6 +5912,7 @@ function handleArcanaEvent(data){
                 if (ctxVal !== null) update.ctxTokens = ctxVal;
                 if (tokVal !== null) update.tokTokens = tokVal;
                 try { upsertLlmAction(sid2, idx, update); } catch {}
+                try { backfillActionUsageFromLlm(sid2, idx, update); } catch {}
               }
             }
           }
@@ -4538,10 +5932,10 @@ function handleArcanaEvent(data){
           if (sid2){
             const idx = getTurnIndexForEvent(sid2, snap);
             // Use per-call values for LLM card display (not cumulative)
-            const ctxForCard = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens >= 0)
+            const ctxForCard = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens > 0)
               ? data.lastCallContextTokens
               : null;
-            const tokForCard = (typeof data.lastCallTotalTokens === 'number' && data.lastCallTotalTokens >= 0)
+            const tokForCard = (typeof data.lastCallTotalTokens === 'number' && data.lastCallTotalTokens > 0)
               ? data.lastCallTotalTokens
               : null;
             if (ctxForCard !== null || tokForCard !== null){
@@ -4549,6 +5943,7 @@ function handleArcanaEvent(data){
               if (ctxForCard !== null) update.ctxTokens = ctxForCard;
               if (tokForCard !== null) update.tokTokens = tokForCard;
               try { upsertLlmAction(sid2, idx, update); } catch {}
+              try { backfillActionUsageFromLlm(sid2, idx, update); } catch {}
             }
             const panel = getToolPanel(sid2);
             if (panel){
@@ -4579,16 +5974,6 @@ function handleArcanaEvent(data){
                 toolTokens: curTool,
                 llmTokens: nextLlm,
               });
-              const ctxForTools = (typeof data.lastCallContextTokens === 'number' && data.lastCallContextTokens > 0) ? (Number(data.lastCallContextTokens) || 0) : null;
-              if (ctxForTools !== null && panel.actions && typeof panel.actions.forEach === 'function'){
-                panel.actions.forEach((action)=>{
-                  if (!action) return;
-                  if (typeof action.turnIndex !== 'number' || Number.isNaN(action.turnIndex)) return;
-                  if (action.turnIndex !== idx) return;
-                  if (typeof action.ctxTokens === 'number' && action.ctxTokens > 0) return;
-                  action.ctxTokens = ctxForTools;
-                });
-              }
               try{ scheduleSaveToolPanel(sid2); } catch {}
               if (sid2 === getCurrentSessionId()){
                 if (activeLogTab === 'tools'){
@@ -4809,14 +6194,50 @@ try{
 } catch{}
 try { ensureTransportReady().catch(()=>{}); } catch{}
 
+// Workspace selector + membership (localStorage-backed)
+try{
+  loadWorkspaceState();
+  renderWorkspaceSelector();
+  const wsSel = qs('workspace-select');
+  if (wsSel && wsSel.addEventListener){
+    wsSel.addEventListener('change', async ()=>{
+      const v = String((wsSel && wsSel.value) || '');
+      if (v === '__new__'){
+        const prev = String(currentWorkspace || '');
+        let chosen = '';
+        try { chosen = await pickWorkspace(); } catch { chosen = ''; }
+        chosen = String(chosen || '').trim();
+        if (chosen){
+          await setCurrentWorkspace(chosen);
+        } else {
+          // Revert selection
+          currentWorkspace = prev;
+          persistWorkspaceState();
+          renderWorkspaceSelector();
+        }
+        return;
+      }
+      await setCurrentWorkspace(v);
+    });
+  }
+  const addBtn = qs('workspace-add-agent');
+  if (addBtn && addBtn.addEventListener){
+    addBtn.addEventListener('click', ()=>{ try { openAddAgentModal(); } catch {} });
+  }
+} catch {}
+
 // Sidebar actions
 const newBtn = qs('new-session');
 if (newBtn && typeof newBtn.addEventListener === 'function'){
   newBtn.addEventListener('click', async ()=>{
     try{
       let obj;
-      if (hasAgents && currentAgentId){
-        obj = await createSession('', '', currentAgentId);
+      if (hasAgents){
+        if (!currentAgentId){
+          try { alert('请先在当前工作区添加一个 Agent'); } catch {}
+          return;
+        }
+        obj = await createSession('', String(currentWorkspace || ''), currentAgentId);
       } else {
         const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); return }
         obj = await createSession('', ws);
@@ -4830,8 +6251,12 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
     if (t && t.id === 'new-session'){
       try{
         let obj;
-        if (hasAgents && currentAgentId){
-          obj = await createSession('', '', currentAgentId);
+        if (hasAgents){
+          if (!currentAgentId){
+            try { alert('请先在当前工作区添加一个 Agent'); } catch {}
+            return;
+          }
+          obj = await createSession('', String(currentWorkspace || ''), currentAgentId);
         } else {
           const ws = await pickWorkspace(); if (!ws){ appendLog('[sessions] ' + tt('sessions.workspaceNotSelected')); return }
           obj = await createSession('', ws);
@@ -4849,13 +6274,35 @@ if (newBtn && typeof newBtn.addEventListener === 'function'){
   for (let i=1; i<=attempts; i++){
     try{
       try { await loadAgents(); } catch {}
-      await refreshList();
+      const visible = await refreshList();
+      // If the stored current session is not visible under the selected workspace, clear it.
+      try{
+        if (currentId){
+          const ok = Array.isArray(visible) && visible.some((it)=>it && it.id === currentId);
+          if (!ok){
+            setCurrent('');
+            try { renderMessages([]); } catch {}
+          }
+        }
+      } catch {}
       if (!currentId){
-        const aid = (hasAgents && currentAgentId) ? currentAgentId : undefined;
-        const items = await listSessions(aid);
-        if (items && items[0]) setCurrent(items[0].id);
+        // Only auto-select a session when we have an active agent (or are in non-agent mode).
+        if (!hasAgents || currentAgentId){
+          if (Array.isArray(visible) && visible.length){
+            setCurrent(visible[0].id);
+          }
+        }
       }
-      if (currentId) await openSession(currentId);
+      if (currentId){
+        let aid = '';
+        if (hasAgents){
+          try{
+            const hit = Array.isArray(visible) ? visible.find((it)=> it && it.id === currentId) : null;
+            aid = String((hit && hit.agentId) || '');
+          } catch {}
+        }
+        await openSession(currentId, aid);
+      }
       return;
     } catch(e){ appendLog('[sessions] 初始加载失败(' + i + '/' + attempts + '): ' + (((e && e.message) || e))); if (i < attempts) { await sleep(delay); delay = Math.min(2000, delay * 2) } }
   }

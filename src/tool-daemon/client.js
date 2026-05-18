@@ -49,6 +49,9 @@ export class ToolDaemonClient{
       }
       if (agentId) headers["x-arcana-agent-id"] = agentId;
       if (sessionId) headers["x-arcana-session-id"] = sessionId;
+      let workspaceRoot = override && override.workspaceRoot ? String(override.workspaceRoot) : "";
+      if (!workspaceRoot && cur && cur.workspaceRoot) workspaceRoot = String(cur.workspaceRoot);
+      if (workspaceRoot) headers["x-arcana-workspace-root"] = workspaceRoot;
     } catch {}
     return headers;
   }

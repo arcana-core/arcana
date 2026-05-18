@@ -44,6 +44,7 @@ export function applyProviderEnv(cfg) {
   if (!cfg) return;
   const provider = (cfg.provider || "openai").toLowerCase();
   const base = cfg.base_url?.trim();
+  const openaiApiVersion = cfg.openai_api_version?.trim();
   const openaiCompatBase = base || (provider === "deepseek" ? "https://api.deepseek.com" : "");
 
   if (provider === "openai" || provider === "openai-compatible" || provider === "deepseek") {
@@ -54,19 +55,36 @@ export function applyProviderEnv(cfg) {
       delete process.env.OPENAI_BASE_URL;
       delete process.env.OPENAI_API_BASE;
     }
+    if (openaiApiVersion) process.env.OPENAI_API_VERSION = openaiApiVersion;
+    else delete process.env.OPENAI_API_VERSION;
   } else if (provider === "openrouter") {
+    delete process.env.OPENAI_API_VERSION;
     if (base) process.env.OPENROUTER_BASE_URL = base;
     else delete process.env.OPENROUTER_BASE_URL;
+  } else if (provider === "azure-openai-responses") {
+    const azureApiVersion = cfg.azure_api_version?.trim();
+    const azureDeploymentNameMap = cfg.azure_deployment_name_map?.trim();
+    delete process.env.OPENAI_API_VERSION;
+    if (base) process.env.AZURE_OPENAI_BASE_URL = base;
+    else delete process.env.AZURE_OPENAI_BASE_URL;
+    if (azureApiVersion) process.env.AZURE_OPENAI_API_VERSION = azureApiVersion;
+    else delete process.env.AZURE_OPENAI_API_VERSION;
+    if (azureDeploymentNameMap) process.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP = azureDeploymentNameMap;
+    else delete process.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP;
   } else if (provider === "xai") {
+    delete process.env.OPENAI_API_VERSION;
     // no non-secret env wiring required
   } else if (provider === "anthropic") {
+    delete process.env.OPENAI_API_VERSION;
     if (base) process.env.ANTHROPIC_BASE_URL = base;
     else delete process.env.ANTHROPIC_BASE_URL;
   } else if (provider === "google") {
+    delete process.env.OPENAI_API_VERSION;
     // Google AI Studio — Arcana supplies apiKey via secrets/authStorage; only GOOGLE_API_BASE is set here
     if (base) process.env.GOOGLE_API_BASE = base; // optional; most setups use default
     else delete process.env.GOOGLE_API_BASE;
   } else {
+    delete process.env.OPENAI_API_VERSION;
     // Fallback: expose as ARCANA_GENERIC_* for potential custom provider wiring later
     if (base) process.env.ARCANA_GENERIC_BASE_URL = base;
   }

@@ -96,4 +96,16 @@ export function mergeStreamingText(prev, next, opts = {}){
   return merged;
 }
 
-export default { mergeStreamingText };
+export function mergeTextBlocks(blocks, opts = {}){
+  const arr = Array.isArray(blocks) ? blocks : [];
+  let text = '';
+  for (const block of arr){
+    if (!block || block.type !== 'text') continue;
+    const next = typeof block.text === 'string' ? block.text : String(block.text || '');
+    if (!next) continue;
+    text = mergeStreamingText(text, next, opts);
+  }
+  return text;
+}
+
+export default { mergeStreamingText, mergeTextBlocks };
