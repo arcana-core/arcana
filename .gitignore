@@ -9,7 +9,7 @@ tmp-*/
 .tmp*/
 .cache/
 tmp-pw-*/
-
+cutpilot-client/
 *.log
 *.tmp
 *.swp
