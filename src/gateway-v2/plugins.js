@@ -63,6 +63,13 @@ function normalizeTool(candidate){
 }
 
 export async function loadGatewayV2Plugins(cwd){
+  try {
+    const disabled = String(process.env.ARCANA_GATEWAY_V2_DISABLE_PLUGINS || '').trim().toLowerCase();
+    if (disabled === '1' || disabled === 'true' || disabled === 'yes' || disabled === 'on') {
+      return { runners: [], channels: [], sinks: [], tools: [], errors: [], pluginFiles: [] };
+    }
+  } catch {}
+
   const here = fileURLToPath(new URL('.', import.meta.url));
   const pkgRoot = join(here, '..');
 
@@ -159,4 +166,3 @@ export async function loadGatewayV2Plugins(cwd){
 }
 
 export default { loadGatewayV2Plugins };
-

@@ -561,6 +561,27 @@ function isLoopbackBindHost(raw){
   }
 }
 
+function emitAsyncTurnFailure({ agentId, sessionKey, sessionId, error, message } = {}){
+  try {
+    eventBus.emit('event', {
+      type: 'error',
+      agentId,
+      sessionKey,
+      sessionId,
+      error: String(error || 'turn_failed'),
+      message: String(message || error || 'turn_failed'),
+    });
+  } catch {}
+  try {
+    eventBus.emit('event', {
+      type: 'turn_end',
+      agentId,
+      sessionKey,
+      sessionId,
+    });
+  } catch {}
+}
+
 export async function startGatewayV2({ port } = {}) {
   const desiredPort = typeof port === 'number' && Number.isFinite(port)
     ? port
@@ -967,6 +988,123 @@ export async function startGatewayV2({ port } = {}) {
         return;
       }
 
+      if (method === 'POST' && u.pathname === '/v2/turn-async'){
+        const body = await readBodyJson(req, { maxBytes: TURN_REQUEST_MAX_BYTES }).catch((err) => {
+          const msg = String(err && err.message || err || '');
+          if (msg === 'body_too_large') {
+            sendJson(res, 413, { ok: false, error: 'body_too_large', message: 'Request body exceeds 12 MB limit' });
+            return '__handled__';
+          }
+          return null;
+        });
+        if (body === '__handled__') return;
+        const agentId = body && body.agentId ? String(body.agentId) : 'default';
+        const sessionKey = body && body.sessionKey ? String(body.sessionKey) : 'session';
+        const sessionIdRaw = body && body.sessionId ? String(body.sessionId) : '';
+        const localToolProxy = !!(body && body.localToolProxy);
+        const toolRouting = body && body.toolRouting ? body.toolRouting : undefined;
+        const toolAllowlist = normalizeToolAllowlist(body && body.toolAllowlist);
+        const localToolDefinitions = Array.isArray(body && body.localToolDefinitions) ? body.localToolDefinitions : [];
+        const localBootstrapFiles = Array.isArray(body && body.localBootstrapFiles) ? body.localBootstrapFiles : [];
+        const localAgentSignature = body && body.localAgentSignature ? String(body.localAgentSignature) : '';
+        const clientTurnId = body && body.clientTurnId ? String(body.clientTurnId).trim() : '';
+        const workspaceRoot = normalizeWorkspaceRootOverride(body && (body.workspaceRoot || body.projectRootDir));
+        const agentHomeRoot = normalizeAgentHomeRootOverride(body && (body.agentHomeRoot || body.agentHomeDir));
+        const text = body && body.text ? String(body.text) : '';
+        const attachments = normalizeChatAttachments(body && body.attachments);
+        const hasAttachments = attachments.length > 0;
+        if (!text && !hasAttachments){
+          sendJson(res, 400, { ok: false, error: 'missing_text' });
+          return;
+        }
+        let policy = 'restricted';
+        try {
+          const rawPol = body && typeof body.policy === 'string' ? body.policy : '';
+          const p = String(rawPol || '').trim().toLowerCase();
+          if (p === 'open' || p === 'restricted') policy = p;
+        } catch {}
+
+        let sessionId = '';
+        try {
+          const ws = workspaceRoot || resolveWorkspaceRoot();
+          const ensuredId = await ensureSessionId({
+            sessionId: sessionIdRaw || '',
+            sessionKey,
+            title: 'Arcana Web',
+            agentId,
+            workspaceRoot: ws,
+          });
+          sessionId = String(ensuredId || '').trim();
+        } catch (e) {
+          sendJson(res, 500, { ok: false, error: 'session_resolve_failed', message: String(e && e.message || e || '') });
+          return;
+        }
+        if (!sessionId){
+          sendJson(res, 500, { ok: false, error: 'session_resolve_failed' });
+          return;
+        }
+
+        localProxyDebugLog('/v2/turn-async routing', {
+          agentId,
+          sessionKey,
+          sessionId,
+          localToolProxy,
+          routing: summarizeToolRoutingRoutes(toolRouting),
+          toolAllowlist: Array.isArray(toolAllowlist) ? toolAllowlist : [],
+          localToolDefinitionsCount: localToolDefinitions.length,
+          localToolDefinitionNames: localToolDefinitions.map((item) => String(item && item.name || '').trim()).filter(Boolean),
+          localBootstrapFiles: localBootstrapFiles.map((item) => String(item && item.name || '').trim()).filter(Boolean),
+          workspaceRoot: workspaceRoot || null,
+          agentHomeRoot: agentHomeRoot || null,
+        });
+
+        const suppressBackground = String(process.env.ARCANA_GATEWAY_V2_SUPPRESS_ASYNC_TURN_BACKGROUND || '').trim() === '1';
+        if (!suppressBackground) {
+          setImmediate(() => {
+            runChatMessage({
+              agentId,
+              sessionKey,
+              sessionId,
+              workspaceRoot,
+              agentHomeRoot,
+              text,
+              policy,
+              title: 'Arcana Web',
+              sync: false,
+              toolRouting,
+              localToolProxy,
+              toolAllowlist,
+              localToolDefinitions,
+              localBootstrapFiles,
+              localAgentSignature,
+              clientTurnId,
+              attachments,
+            }).then((chat) => {
+              if (!chat || chat.ok === false){
+                emitAsyncTurnFailure({
+                  agentId,
+                  sessionKey,
+                  sessionId,
+                  error: chat && chat.error ? chat.error : 'turn_failed',
+                  message: chat && chat.message ? chat.message : (chat && chat.error ? chat.error : 'turn_failed'),
+                });
+              }
+            }).catch((e) => {
+              emitAsyncTurnFailure({
+                agentId,
+                sessionKey,
+                sessionId,
+                error: 'turn_failed',
+                message: String(e && e.message || e || 'turn_failed'),
+              });
+            });
+          });
+        }
+
+        sendJson(res, 202, { ok: true, sessionId, mode: 'async' });
+        return;
+      }
+
       if (method === 'POST' && u.pathname === '/v2/events'){
         const body = await readBodyJson(req).catch(() => null);
         const agentId = (body && body.agentId) || 'default';
@@ -1261,6 +1399,7 @@ export async function startGatewayV2({ port } = {}) {
         const localToolDefinitions = Array.isArray(body && body.localToolDefinitions) ? body.localToolDefinitions : [];
         const localBootstrapFiles = Array.isArray(body && body.localBootstrapFiles) ? body.localBootstrapFiles : [];
         const localAgentSignature = body && body.localAgentSignature ? String(body.localAgentSignature) : '';
+        const clientTurnId = body && body.clientTurnId ? String(body.clientTurnId).trim() : '';
         const workspaceRoot = normalizeWorkspaceRootOverride(body && (body.workspaceRoot || body.projectRootDir));
         const agentHomeRoot = normalizeAgentHomeRootOverride(body && (body.agentHomeRoot || body.agentHomeDir));
         const text = body && body.text ? String(body.text) : '';
@@ -1337,7 +1476,7 @@ export async function startGatewayV2({ port } = {}) {
           }
         }
 
-        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: false, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, attachments });
+        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: false, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, clientTurnId, attachments });
         if (!chat || chat.ok === false){
           const errMsg = chat && chat.error ? String(chat.error) : 'turn_failed';
           const status = chat && typeof chat.status === 'number' ? chat.status : 500;
@@ -1389,6 +1528,7 @@ export async function startGatewayV2({ port } = {}) {
         const localToolDefinitions = Array.isArray(body && body.localToolDefinitions) ? body.localToolDefinitions : [];
         const localBootstrapFiles = Array.isArray(body && body.localBootstrapFiles) ? body.localBootstrapFiles : [];
         const localAgentSignature = body && body.localAgentSignature ? String(body.localAgentSignature) : '';
+        const clientTurnId = body && body.clientTurnId ? String(body.clientTurnId).trim() : '';
         const workspaceRoot = normalizeWorkspaceRootOverride(body && (body.workspaceRoot || body.projectRootDir));
         const agentHomeRoot = normalizeAgentHomeRootOverride(body && (body.agentHomeRoot || body.agentHomeDir));
         const text = body && body.text ? String(body.text) : '';
@@ -1454,7 +1594,7 @@ export async function startGatewayV2({ port } = {}) {
           }
         }
 
-        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: true, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, attachments });
+        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: true, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, clientTurnId, attachments });
         if (!chat || chat.ok === false){
           const status = chat && typeof chat.status === 'number' ? chat.status : 500;
           const respBody = {

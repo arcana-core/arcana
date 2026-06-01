@@ -2552,6 +2552,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         tsMs: nowMs(),
       };
       if (usageModelLabel) ev.model = usageModelLabel;
+      if (clientTurnId) ev.clientTurnId = clientTurnId;
       emit(ev);
     } catch {}
   }
@@ -2806,10 +2807,11 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   return { ok: true, mode: 'turn', text: finalText, usage: responseUsage };
 }
 
-export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId, workspaceRoot: rawWorkspaceRoot, agentHomeRoot: rawAgentHomeRoot, text: rawText, policy: rawPolicy, title, sync, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, attachments: rawAttachments }){
+export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId, workspaceRoot: rawWorkspaceRoot, agentHomeRoot: rawAgentHomeRoot, text: rawText, policy: rawPolicy, title, sync, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, clientTurnId: rawClientTurnId, attachments: rawAttachments }){
   const agentId = normalizeAgentId(rawAgentId || DEFAULT_AGENT_ID);
   const policy = String(rawPolicy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   const trimmed = trimUserMessage(String(rawText || '').trim(), DEFAULT_CONTEXT_POLICY);
+  const clientTurnId = rawClientTurnId == null ? '' : String(rawClientTurnId).trim();
   const attachments = normalizeChatAttachments(rawAttachments);
   if (!trimmed && !attachments.length){
     return { ok: false, error: 'missing_text' };

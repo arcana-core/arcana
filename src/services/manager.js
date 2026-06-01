@@ -250,6 +250,13 @@ function installHooksOnce() {
 
 export async function startServicesOnce({ workspaceRoot } = {}) {
   if (state.started) return getServicesStatus();
+  try {
+    const disabled = String(process.env.ARCANA_DISABLE_CORE_SERVICES || "").trim().toLowerCase();
+    if (disabled === "1" || disabled === "true" || disabled === "yes" || disabled === "on") {
+      state.started = true;
+      return getServicesStatus();
+    }
+  } catch {}
 
   const root = workspaceRoot || resolveWorkspaceRoot();
   state.workspaceRoot = root;
