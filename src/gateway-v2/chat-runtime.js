@@ -2053,6 +2053,73 @@ function buildDiagnosticsPayload({ record, finishReason, stopReason, completionE
   }
 }
 
+function normalizeMediaRef(raw){
+  if (!raw) return '';
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  const mdMatch = s.match(/^\[[^\]]*]\(([^)]+)\)/);
+  if (mdMatch && mdMatch[1]){
+    s = mdMatch[1].trim();
+  } else {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if (!(first && first === last && (first === '"' || first === '\'' || first === '`'))){
+      s = s.split(/\s+/)[0];
+    }
+  }
+  const strip = new Set(['\'', '"', '`', '(', ')', '[', ']', '<', '>', ',', ';']);
+  while (s.length && strip.has(s[0])){
+    s = s.slice(1).trimStart();
+  }
+  while (s.length && strip.has(s[s.length - 1])){
+    s = s.slice(0, -1).trimEnd();
+  }
+  return s;
+}
+
+export function extractMediaFromAssistantText(text){
+  const mediaRefs = [];
+  if (!text) return { text: '', mediaRefs };
+  const lines = String(text || '').split(/\r?\n/);
+  let inFence = false;
+  const outLines = [];
+  for (const line of lines){
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')){
+      const count = (line.match(/```/g) || []).length;
+      if (count % 2 === 1) inFence = !inFence;
+      outLines.push(line);
+      continue;
+    }
+    if (inFence){
+      outLines.push(line);
+      continue;
+    }
+    const mediaMatch = trimmed.match(/^(?:[-*+]\s+|\d+[.)]\s+)?MEDIA\s*[:：]\s*(.*)$/);
+    if (mediaMatch){
+      const raw = mediaMatch[1] || '';
+      const ref = normalizeMediaRef(raw);
+      if (ref) mediaRefs.push(ref);
+      continue;
+    }
+    outLines.push(line);
+  }
+  return { text: outLines.join('\n'), mediaRefs };
+}
+
+function dedupeNormalizedMediaRefs(refs){
+  const seen = new Set();
+  const out = [];
+  const arr = Array.isArray(refs) ? refs : [];
+  for (const raw of arr){
+    const ref = normalizeMediaRef(raw);
+    if (!ref || seen.has(ref)) continue;
+    seen.add(ref);
+    out.push(ref);
+  }
+  return out;
+}
+
 function attachChatEventBridge(record, sessionId){
   const sess = record && record.session;
   if (!sess || typeof sess.subscribe !== 'function') return;
@@ -2077,73 +2144,6 @@ function attachChatEventBridge(record, sessionId){
   let lastCallContextTokens = 0;
   let lastCallTotalTokens = 0;
 
-
-  function normalizeMediaRef(raw){
-    if (!raw) return '';
-    let s = String(raw || '').trim();
-    if (!s) return '';
-    const mdMatch = s.match(/^\[[^\]]*]\(([^)]+)\)/);
-    if (mdMatch && mdMatch[1]){
-      s = mdMatch[1].trim();
-    } else {
-      const first = s[0];
-      const last = s[s.length - 1];
-      if (!(first && first === last && (first === '"' || first === '\'' || first === '`'))){
-        s = s.split(/\s+/)[0];
-      }
-    }
-    const strip = new Set(['\'', '"', '`', '(', ')', '[', ']', '<', '>', ',', ';']);
-    while (s.length && strip.has(s[0])){
-      s = s.slice(1).trimStart();
-    }
-    while (s.length && strip.has(s[s.length - 1])){
-      s = s.slice(0, -1).trimEnd();
-    }
-    return s;
-  }
-
-  function extractMediaFromAssistantText(text){
-    const mediaRefs = [];
-    if (!text) return { text: '', mediaRefs };
-    const lines = String(text || '').split(/\r?\n/);
-    let inFence = false;
-    const outLines = [];
-    for (const line of lines){
-      const trimmed = line.trim();
-      if (trimmed.startsWith('```')){
-        const count = (line.match(/```/g) || []).length;
-        if (count % 2 === 1) inFence = !inFence;
-        outLines.push(line);
-        continue;
-      }
-      if (inFence){
-        outLines.push(line);
-        continue;
-      }
-      const mediaMatch = trimmed.match(/^(?:[-*+]\s+|\d+[.)]\s+)?MEDIA\s*[:：]\s*(.*)$/);
-      if (mediaMatch){
-        const raw = mediaMatch[1] || '';
-        const ref = normalizeMediaRef(raw);
-        if (ref) mediaRefs.push(ref);
-        continue;
-      }
-      outLines.push(line);
-    }
-    return { text: outLines.join('\n'), mediaRefs };
-  }
-
-  function dedupeNormalizedMediaRefs(refs){
-    const seen = new Set();
-    const out = [];
-    const arr = Array.isArray(refs) ? refs : [];
-    for (const raw of arr){
-      const ref = normalizeMediaRef(raw);
-      if (!ref || seen.has(ref)) continue;
-      seen.add(ref);
-      out.push(ref);
-    }
-    return out;
-  }
 
   const mediaRefsSeen = new Set();
   let assistantRawText = '';
@@ -2475,19 +2475,27 @@ function sessionAlreadyHasAssistantText(sessionId, agentId, text){
 }
 
 export function ensureAssistantTextDelivered({ record, sessionId, sessionKey, agentId, text } = {}){
-  const finalText = String(text || '');
-  if (!finalText.trim()) return false;
+  // Normalize through the same media extraction as the streaming path, so the
+  // comparison below is clean-vs-clean. Comparing raw text against the
+  // streamed cleanText used to mismatch whenever the message carried MEDIA
+  // refs, re-emitting (duplicate bubble) and re-persisting (duplicate history).
+  const extracted = extractMediaFromAssistantText(String(text || ''));
+  const finalText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+  const mediaRefs = dedupeNormalizedMediaRefs((extracted && extracted.mediaRefs) || []);
+  if (!finalText.trim() && !mediaRefs.length) return false;
   let delivered = false;
   try {
-    if (String(record && record.__arcana_lastAssistantTextEmitted || '') !== finalText){
+    if (finalText.trim() && String(record && record.__arcana_lastAssistantTextEmitted || '') !== finalText){
       emit(withSessionStreamRouting({ type: 'assistant_text', text: finalText }, { sessionId, sessionKey, agentId }));
       if (record) record.__arcana_lastAssistantTextEmitted = finalText;
       delivered = true;
     }
   } catch {}
   try {
-    if (!sessionAlreadyHasAssistantText(sessionId, agentId, finalText)){
-      ssAppend(sessionId, { role: 'assistant', text: finalText, agentId });
+    const alreadyPersisted = String(record && record.__arcana_lastAssistantTextPersisted || '') === finalText
+      || sessionAlreadyHasAssistantText(sessionId, agentId, finalText);
+    if (finalText.trim() && !alreadyPersisted){
+      ssAppend(sessionId, { role: 'assistant', text: finalText, agentId, mediaRefs });
       if (record) record.__arcana_lastAssistantTextPersisted = finalText;
       delivered = true;
     }
@@ -3596,7 +3604,6 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
         sessionKey,
         agentId,
         turnEndCountBefore,
-        force: true,
       });
     }
   } finally {

@@ -580,6 +580,84 @@ test('ensureAssistantTextDelivered broadcasts and persists final text once', () 
   }
 });
 
+test('ensureAssistantTextDelivered does not duplicate when streaming already emitted the clean text', () => {
+  const previousHome = process.env.ARCANA_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'arcana-chat-runtime-test-'));
+  process.env.ARCANA_HOME = home;
+  const events = [];
+  const listener = (event) => events.push(event);
+  eventBus.on('event', listener);
+  try {
+    const session = createSession({
+      title: 'Probe',
+      workspace: home,
+      agentId: 'cutpilot',
+    });
+    // Simulate what the streaming bridge records at message_end: the
+    // media-extracted clean text was emitted and persisted.
+    const cleanText = 'Here is the result.';
+    const record = {
+      __arcana_lastAssistantTextEmitted: cleanText,
+      __arcana_lastAssistantTextPersisted: cleanText,
+    };
+    // runPromptSync hands over the RAW text (with MEDIA refs). Before the fix
+    // the raw-vs-clean mismatch re-emitted and re-persisted a duplicate.
+    const rawText = 'Here is the result.\nMEDIA: /tmp/out/clip.png';
+    assert.equal(ensureAssistantTextDelivered({
+      record,
+      sessionId: session.id,
+      sessionKey: 'cp:cutpilot:project:client',
+      agentId: 'cutpilot',
+      text: rawText,
+    }), false);
+    assert.deepEqual(events.filter((event) => event.type === 'assistant_text'), []);
+    const loaded = loadSession(session.id, { agentId: 'cutpilot' });
+    assert.deepEqual((loaded.messages || []).filter((m) => m.role === 'assistant'), []);
+  } finally {
+    eventBus.off('event', listener);
+    if (previousHome == null) delete process.env.ARCANA_HOME;
+    else process.env.ARCANA_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('ensureAssistantTextDelivered emits clean text and persists media refs when streaming missed it', () => {
+  const previousHome = process.env.ARCANA_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'arcana-chat-runtime-test-'));
+  process.env.ARCANA_HOME = home;
+  const events = [];
+  const listener = (event) => events.push(event);
+  eventBus.on('event', listener);
+  try {
+    const session = createSession({
+      title: 'Probe',
+      workspace: home,
+      agentId: 'cutpilot',
+    });
+    const record = {};
+    assert.equal(ensureAssistantTextDelivered({
+      record,
+      sessionId: session.id,
+      sessionKey: 'cp:cutpilot:project:client',
+      agentId: 'cutpilot',
+      text: 'Done.\nMEDIA: /tmp/out/clip.png',
+    }), true);
+    const emitted = events.filter((event) => event.type === 'assistant_text');
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].text, 'Done.');
+    const loaded = loadSession(session.id, { agentId: 'cutpilot' });
+    const assistantMessages = (loaded.messages || []).filter((m) => m.role === 'assistant');
+    assert.equal(assistantMessages.length, 1);
+    assert.equal(assistantMessages[0].text, 'Done.');
+    assert.deepEqual(assistantMessages[0].mediaRefs, ['/tmp/out/clip.png']);
+  } finally {
+    eventBus.off('event', listener);
+    if (previousHome == null) delete process.env.ARCANA_HOME;
+    else process.env.ARCANA_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('ensureTurnEndDelivered emits only when the bridge missed turn_end', () => {
   const events = [];
   const listener = (event) => events.push(event);
