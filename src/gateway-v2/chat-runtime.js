@@ -2599,7 +2599,16 @@ export function ensureAssistantTextDelivered({ record, sessionId, sessionKey, ag
     const alreadyPersisted = String(record && record.__arcana_lastAssistantTextPersisted || '') === finalText
       || sessionAlreadyHasAssistantText(sessionId, agentId, finalText);
     if (finalText.trim() && !alreadyPersisted){
-      ssAppend(sessionId, { role: 'assistant', text: finalText, agentId, mediaRefs });
+      // itemId makes the append idempotent: if the bridge already persisted
+      // this item at message_end, the store skips the duplicate row.
+      const persistItemId = String(record && record.__arcana_lastAssistantItemId || '');
+      ssAppend(sessionId, {
+        role: 'assistant',
+        text: finalText,
+        agentId,
+        mediaRefs,
+        ...(persistItemId ? { itemId: persistItemId } : {}),
+      });
       if (record) record.__arcana_lastAssistantTextPersisted = finalText;
       delivered = true;
     }

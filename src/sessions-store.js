@@ -1,16 +1,31 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, unlinkSync, renameSync, openSync, closeSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync,
+  unlinkSync, renameSync, openSync, closeSync, appendFileSync, readSync, fstatSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { arcanaHomePath, ensureArcanaHomeDir } from './arcana-home.js';
 import { fileURLToPath } from 'node:url';
 import { loadSessionMeta } from './session-meta-store.js';
 
-// Simple JSON-backed chat session store.
-// Schema: { id, title, workspace, agentId, hidden?: boolean, createdAt, updatedAt, messages: [{ role: 'user'|'assistant', text, ts }], sessionTokens?: number }
+// Chat session store, split into two files per session:
+//   <sid>.json   - small metadata snapshot { id, title, workspace, agentId,
+//                  hidden?, createdAt, updatedAt, summary?, ... } (no messages)
+//   <sid>.jsonl  - append-only message log, one JSON object per line:
+//                  { role, text, ts, mediaRefs?, itemId? }
+//
+// Appending a message is a single O_APPEND write: no lock, no full-file
+// rewrite, and atomic across processes. Whole-object writes (saveSession,
+// used by compaction/meta updates) are rare and take a non-blocking lockfile.
+//
+// Legacy combined files ({ ...meta, messages: [...] } in <sid>.json) are read
+// transparently and migrated to the split layout on first write.
 
 const DEFAULT_AGENT_ID = 'default';
 const SESSION_LOCK_STALE_MS = 30000; // 30s
-const SESSION_LOCK_TIMEOUT_MS = 3000; // 3s
+const SESSION_LOCK_ATTEMPTS = 5;
+const SESSION_SCHEMA_VERSION = 2;
+const TAIL_READ_BYTES = 262144; // 256KB
 
 // Internal: compute arcana package root (arcana/)
 function arcanaPkgRoot(){
@@ -37,6 +52,14 @@ function sessionsDir(agentIdRaw){
   return d;
 }
 
+function sessionMetaPath(agentIdRaw, sessionId){
+  return join(sessionsDir(agentIdRaw), String(sessionId) + '.json');
+}
+
+function sessionMessagesPath(agentIdRaw, sessionId){
+  return join(sessionsDir(agentIdRaw), String(sessionId) + '.jsonl');
+}
+
 function sessionLocksDir(agentIdRaw){
   const base = sessionsDir(agentIdRaw);
   const d = join(base, '.locks');
@@ -51,11 +74,14 @@ function sessionLockPath(agentIdRaw, sessionId){
   return join(d, sid + '.lock');
 }
 
-function acquireSessionLock(agentIdRaw, sessionId, timeoutMs = SESSION_LOCK_TIMEOUT_MS){
+// Non-blocking lockfile acquisition: a handful of immediate attempts with
+// stale-lock cleanup. Never sleeps — the previous implementation parked the
+// whole event loop with Atomics.wait while contending, freezing every other
+// request in the process.
+function tryAcquireSessionLock(agentIdRaw, sessionId){
   const path = sessionLockPath(agentIdRaw, sessionId);
   if (!path) return null;
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs){
+  for (let attempt = 0; attempt < SESSION_LOCK_ATTEMPTS; attempt += 1){
     try {
       const fd = openSync(path, 'wx');
       try { closeSync(fd); } catch {}
@@ -67,7 +93,6 @@ function acquireSessionLock(agentIdRaw, sessionId, timeoutMs = SESSION_LOCK_TIME
         try { unlinkSync(path); } catch {}
       }
     } catch {}
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
   return null;
 }
@@ -104,9 +129,9 @@ function slug(s){
     .slice(0, 40) || 'session';
 }
 
-function writeSessionFileAtomic(path, obj){
+function writeFileAtomic(path, content){
   const tmp = path + '.tmp';
-  writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf-8');
+  writeFileSync(tmp, content, 'utf-8');
   try {
     // On POSIX, renameSync will overwrite the destination atomically.
     // On Windows, renameSync fails if the destination exists, so fall back
@@ -119,14 +144,116 @@ function writeSessionFileAtomic(path, obj){
   }
 }
 
-function saveSessionInternal(obj, normAgentId, opts){
-  if (!obj || !obj.id) return false;
-  obj.agentId = normAgentId;
-  const touch = !opts || opts.touchUpdatedAt !== false;
-  if (touch) obj.updatedAt = nowIso();
-  const p = join(sessionsDir(normAgentId), obj.id + '.json');
-  writeSessionFileAtomic(p, obj);
-  return true;
+function normalizeMessageRecord(raw){
+  if (!raw || typeof raw !== 'object') return null;
+  const message = {
+    role: String(raw.role || 'user'),
+    text: typeof raw.text === 'string' ? raw.text : String(raw.text || ''),
+    ts: raw.ts ? String(raw.ts) : nowIso(),
+  };
+  if (Array.isArray(raw.mediaRefs)){
+    const refs = raw.mediaRefs
+      .map((ref) => typeof ref === 'string' ? ref.trim() : '')
+      .filter(Boolean);
+    if (refs.length) message.mediaRefs = refs;
+  }
+  const itemId = String(raw.itemId || '').trim();
+  if (itemId) message.itemId = itemId;
+  return message;
+}
+
+function serializeMessages(messages){
+  const arr = Array.isArray(messages) ? messages : [];
+  let out = '';
+  for (const raw of arr){
+    const message = normalizeMessageRecord(raw);
+    if (!message) continue;
+    out += JSON.stringify(message) + '\n';
+  }
+  return out;
+}
+
+function readMessagesFile(path){
+  let raw = '';
+  try {
+    raw = readFileSync(path, 'utf-8');
+  } catch {
+    return [];
+  }
+  if (!raw) return [];
+  const out = [];
+  for (const line of raw.split('\n')){
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // A partially written trailing line (crash mid-append) parses as garbage;
+    // skip it rather than failing the whole load.
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj && typeof obj === 'object') out.push(obj);
+    } catch {}
+  }
+  return out;
+}
+
+function readLastMessage(path){
+  let fd = null;
+  try {
+    fd = openSync(path, 'r');
+    const size = fstatSync(fd).size;
+    if (!size) return null;
+    const len = Math.min(size, TAIL_READ_BYTES);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    const lines = buf.toString('utf-8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i -= 1){
+      const trimmed = lines[i].trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && typeof obj === 'object') return obj;
+      } catch {}
+      // The oldest line in the tail window may be cut off; ignore it.
+      if (i === 0 && size > len){
+        const all = readMessagesFile(path);
+        return all.length ? all[all.length - 1] : null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    try { if (fd != null) closeSync(fd); } catch {}
+  }
+}
+
+function readMetaFile(path){
+  try {
+    if (!existsSync(path)) return null;
+    const obj = JSON.parse(readFileSync(path, 'utf-8'));
+    return (obj && typeof obj === 'object') ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+function stripMessagesFromMeta(obj){
+  const meta = { ...obj };
+  delete meta.messages;
+  meta.schema = SESSION_SCHEMA_VERSION;
+  return meta;
+}
+
+function isLegacyCombined(meta, messagesPath){
+  return !!(meta && Array.isArray(meta.messages)) && !existsSync(messagesPath);
+}
+
+// Move a legacy combined file to the split layout. Caller decides locking.
+function migrateLegacySession(meta, metaPath, messagesPath){
+  const messages = Array.isArray(meta.messages) ? meta.messages : [];
+  // Write the message log first: if we crash before the meta rewrite, the
+  // .jsonl copy wins on the next read and nothing is lost.
+  writeFileAtomic(messagesPath, serializeMessages(messages));
+  writeFileAtomic(metaPath, JSON.stringify(stripMessagesFromMeta(meta), null, 2));
 }
 
 function applySessionMetaFields(target, sessionId, agentId){
@@ -141,6 +268,16 @@ function applySessionMetaFields(target, sessionId, agentId){
   return target;
 }
 
+function freshestUpdatedAt(meta, messagesPath){
+  let updatedAt = meta && meta.updatedAt ? String(meta.updatedAt) : '';
+  try {
+    const st = statSync(messagesPath);
+    const fileIso = new Date(st.mtimeMs).toISOString();
+    if (!updatedAt || fileIso > updatedAt) updatedAt = fileIso;
+  } catch {}
+  return updatedAt;
+}
+
 export function createSession({ title, workspace, agentId, hidden } = {}){
   const t = String(title == null ? '' : title).trim();
   const normAgentId = normalizeAgentId(agentId);
@@ -148,7 +285,7 @@ export function createSession({ title, workspace, agentId, hidden } = {}){
   const agentSegment = normAgentId.slice(0, 40);
   const rand = randomBytes(4).toString('hex');
   const id = stamp + '--' + agentSegment + '--' + slug(t) + '--' + rand;
-  const obj = {
+  const meta = {
     id,
     title: t,
     workspace: String(workspace || '').trim() || undefined,
@@ -156,11 +293,10 @@ export function createSession({ title, workspace, agentId, hidden } = {}){
     hidden: hidden === true,
     createdAt: nowIso(),
     updatedAt: nowIso(),
-    messages: [],
+    schema: SESSION_SCHEMA_VERSION,
   };
-  const path = join(sessionsDir(normAgentId), id + '.json');
-  writeSessionFileAtomic(path, obj);
-  return obj;
+  writeFileAtomic(sessionMetaPath(normAgentId, id), JSON.stringify(meta, null, 2));
+  return { ...meta, messages: [] };
 }
 
 export function listSessions(agentId){
@@ -174,18 +310,26 @@ export function listSessions(agentId){
       const st = statSync(p);
       const raw = JSON.parse(readFileSync(p, 'utf-8'));
       if (raw && raw.hidden === true) continue;
+      const sid = raw.id || name.replace(/\.json$/, '');
+      const messagesPath = sessionMessagesPath(normAgentId, sid);
       const createdAt = raw.createdAt || new Date(st.ctimeMs).toISOString();
-      const updatedAt = raw.updatedAt || new Date(st.mtimeMs).toISOString();
+      const updatedAt = freshestUpdatedAt(raw, messagesPath) || new Date(st.mtimeMs).toISOString();
       const titleRaw = (raw && typeof raw.title === 'string') ? String(raw.title).trim() : '';
+      let last = null;
+      if (existsSync(messagesPath)){
+        last = readLastMessage(messagesPath);
+      } else if (Array.isArray(raw.messages) && raw.messages.length){
+        last = raw.messages[raw.messages.length - 1];
+      }
       const item = applySessionMetaFields({
-        id: raw.id || name.replace(/\.json$/, ''),
+        id: sid,
         title: titleRaw,
         workspace: raw.workspace || '',
         agentId: normalizeAgentId(raw.agentId || normAgentId),
         createdAt,
         updatedAt,
-        last: (Array.isArray(raw.messages) && raw.messages.length) ? raw.messages[raw.messages.length - 1] : null,
-      }, raw.id || name.replace(/\.json$/, ''), normalizeAgentId(raw.agentId || normAgentId));
+        last,
+      }, sid, normalizeAgentId(raw.agentId || normAgentId));
       out.push(item);
     } catch {}
   }
@@ -197,28 +341,43 @@ export function loadSession(id, opts){
   const sid = String(id || '').trim();
   if (!sid) return null;
   const normAgentId = normalizeAgentId(opts && opts.agentId);
-  const p = join(sessionsDir(normAgentId), sid + '.json');
-  if (!existsSync(p)) return null;
-  try {
-    const obj = JSON.parse(readFileSync(p, 'utf-8'));
-    if (!obj || typeof obj !== 'object') return null;
-    const agentId = normalizeAgentId(obj.agentId || normAgentId);
-    obj.agentId = agentId;
-    obj.hidden = obj.hidden === true;
-    applySessionMetaFields(obj, sid, agentId);
-    return obj;
-  } catch {
-    return null;
+  const metaPath = sessionMetaPath(normAgentId, sid);
+  const meta = readMetaFile(metaPath);
+  if (!meta) return null;
+  const messagesPath = sessionMessagesPath(normAgentId, sid);
+  const obj = { ...meta };
+  if (existsSync(messagesPath)){
+    obj.messages = readMessagesFile(messagesPath);
+  } else {
+    obj.messages = Array.isArray(meta.messages) ? meta.messages : [];
   }
+  const agentId = normalizeAgentId(obj.agentId || normAgentId);
+  obj.agentId = agentId;
+  obj.hidden = obj.hidden === true;
+  const updatedAt = freshestUpdatedAt(meta, messagesPath);
+  if (updatedAt) obj.updatedAt = updatedAt;
+  applySessionMetaFields(obj, sid, agentId);
+  return obj;
 }
 
 export function saveSession(obj, opts){
   if (!obj || !obj.id) return false;
   const normAgentId = normalizeAgentId((obj && obj.agentId) || (opts && opts.agentId));
-  const lockPath = acquireSessionLock(normAgentId, obj.id);
+  const lockPath = tryAcquireSessionLock(normAgentId, obj.id);
   if (!lockPath) return false;
   try {
-    return saveSessionInternal(obj, normAgentId, opts || {});
+    obj.agentId = normAgentId;
+    const touch = !opts || opts.touchUpdatedAt !== false;
+    if (touch) obj.updatedAt = nowIso();
+    const metaPath = sessionMetaPath(normAgentId, obj.id);
+    const messagesPath = sessionMessagesPath(normAgentId, obj.id);
+    // Whole-object saves (compaction, meta edits) rewrite both files; the hot
+    // per-message path is appendMessage below and never does this.
+    if (Array.isArray(obj.messages)){
+      writeFileAtomic(messagesPath, serializeMessages(obj.messages));
+    }
+    writeFileAtomic(metaPath, JSON.stringify(stripMessagesFromMeta(obj), null, 2));
+    return true;
   } finally {
     releaseSessionLock(lockPath);
   }
@@ -228,96 +387,106 @@ export function appendMessage(sessionId, { role, text, agentId, mediaRefs, itemI
   const id = String(sessionId || '').trim();
   if (!id) return null;
   const normAgentId = normalizeAgentId(agentId);
-  const lockPath = acquireSessionLock(normAgentId, id);
-  if (!lockPath) return null;
-  try {
-    const existing = loadSession(id, { agentId: normAgentId });
-    const obj = existing || {
+  const metaPath = sessionMetaPath(normAgentId, id);
+  const messagesPath = sessionMessagesPath(normAgentId, id);
+
+  let meta = readMetaFile(metaPath);
+  if (!meta){
+    meta = {
       id,
       title: '',
       workspace: undefined,
       agentId: normAgentId,
       createdAt: nowIso(),
       updatedAt: nowIso(),
-      messages: [],
+      schema: SESSION_SCHEMA_VERSION,
     };
-    obj.agentId = normalizeAgentId(obj.agentId || normAgentId);
-    obj.messages = Array.isArray(obj.messages) ? obj.messages : [];
-    const hadNoMessages = obj.messages.length === 0;
-    const roleStr = String(role || 'user');
-    const textStr = String(text || '');
-    const normalizedMediaRefs = Array.isArray(mediaRefs)
-      ? mediaRefs
-        .map((ref) => typeof ref === 'string' ? ref.trim() : '')
-        .filter((ref) => ref)
-      : [];
-    const message = { role: roleStr, text: textStr, ts: nowIso() };
-    if (normalizedMediaRefs.length) message.mediaRefs = normalizedMediaRefs;
-    const itemIdStr = String(itemId || '').trim();
-    if (itemIdStr) message.itemId = itemIdStr;
-    obj.messages.push(message);
+    writeFileAtomic(metaPath, JSON.stringify(meta, null, 2));
+  } else if (isLegacyCombined(meta, messagesPath)){
+    const lockPath = tryAcquireSessionLock(normAgentId, id);
+    if (lockPath){
+      try { migrateLegacySession(meta, metaPath, messagesPath); } finally { releaseSessionLock(lockPath); }
+      meta = readMetaFile(metaPath) || meta;
+    }
+    // If the lock was contended, fall through: the append below still lands in
+    // the .jsonl, which wins over the embedded copy on the next migration.
+  }
 
-    if (hadNoMessages && String(roleStr || '').toLowerCase() === 'user'){
-      const currentTitle = String(obj.title || '').trim();
-      const isLegacyUntitled = (currentTitle === '新会话' || currentTitle === 'New session');
-      if (!currentTitle || isLegacyUntitled){
-        const autoTitle = deriveSessionTitleFromText(textStr);
-        if (autoTitle) obj.title = autoTitle;
+  const message = normalizeMessageRecord({ role, text, ts: nowIso(), mediaRefs, itemId });
+  if (!message) return null;
+
+  // Idempotent per item: the streaming bridge and the post-turn fallback may
+  // both persist the same assistant item; one row wins.
+  if (message.itemId){
+    const last = readLastMessage(messagesPath);
+    if (last && String(last.itemId || '') === message.itemId){
+      return { id, agentId: normalizeAgentId(meta.agentId || normAgentId), deduped: true };
+    }
+  }
+
+  let hadNoMessages = true;
+  try {
+    const st = statSync(messagesPath);
+    hadNoMessages = st.size === 0;
+  } catch {}
+  if (hadNoMessages && Array.isArray(meta.messages) && meta.messages.length){
+    hadNoMessages = false;
+  }
+
+  appendFileSync(messagesPath, JSON.stringify(message) + '\n', 'utf-8');
+
+  if (hadNoMessages && message.role.toLowerCase() === 'user'){
+    const currentTitle = String(meta.title || '').trim();
+    const isLegacyUntitled = (currentTitle === '新会话' || currentTitle === 'New session');
+    if (!currentTitle || isLegacyUntitled){
+      const autoTitle = deriveSessionTitleFromText(message.text);
+      if (autoTitle){
+        meta.title = autoTitle;
+        meta.updatedAt = nowIso();
+        try { writeFileAtomic(metaPath, JSON.stringify(stripMessagesFromMeta(meta), null, 2)); } catch {}
       }
     }
-    // appendMessage should always bump updatedAt
-    saveSessionInternal(obj, obj.agentId, { touchUpdatedAt: true });
-    return obj;
-  } finally {
-    releaseSessionLock(lockPath);
   }
+
+  return { id, agentId: normalizeAgentId(meta.agentId || normAgentId), appended: true };
 }
 
 export function upsertLastMessage(sessionId, { role, text, agentId } = {}){
   const id = String(sessionId || '').trim();
   if (!id) return null;
   const normAgentId = normalizeAgentId(agentId);
-  const lockPath = acquireSessionLock(normAgentId, id);
-  if (!lockPath) return null;
-  try {
-    const existing = loadSession(id, { agentId: normAgentId });
-    const obj = existing || {
-      id,
-      title: '',
-      workspace: undefined,
-      agentId: normAgentId,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      messages: [],
-    };
-    obj.agentId = normalizeAgentId(obj.agentId || normAgentId);
-    obj.messages = Array.isArray(obj.messages) ? obj.messages : [];
-    const roleStr = String(role || 'assistant');
-    const textStr = String(text || '');
-    const msgs = obj.messages;
-    const last = msgs.length ? msgs[msgs.length - 1] : null;
-    if (last && last.role === roleStr){
-      last.text = textStr;
-    } else {
-      msgs.push({ role: roleStr, text: textStr, ts: nowIso() });
-    }
-    // upsertLastMessage should always bump updatedAt
-    saveSessionInternal(obj, obj.agentId, { touchUpdatedAt: true });
-    return obj;
-  } finally {
-    releaseSessionLock(lockPath);
+  const obj = loadSession(id, { agentId: normAgentId }) || {
+    id,
+    title: '',
+    workspace: undefined,
+    agentId: normAgentId,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [],
+  };
+  obj.messages = Array.isArray(obj.messages) ? obj.messages : [];
+  const roleStr = String(role || 'assistant');
+  const textStr = String(text || '');
+  const last = obj.messages.length ? obj.messages[obj.messages.length - 1] : null;
+  if (last && last.role === roleStr){
+    last.text = textStr;
+  } else {
+    obj.messages.push({ role: roleStr, text: textStr, ts: nowIso() });
   }
+  return saveSession(obj, { agentId: normAgentId }) ? obj : null;
 }
 
 export function deleteSession(id, opts){
   const sid = String(id || '').trim();
   if (!sid) return false;
   const normAgentId = normalizeAgentId(opts && opts.agentId);
-  const lockPath = acquireSessionLock(normAgentId, sid);
+  const lockPath = tryAcquireSessionLock(normAgentId, sid);
   if (!lockPath) return false;
   try {
-    const p = join(sessionsDir(normAgentId), sid + '.json');
-    try { unlinkSync(p); return true; } catch { return false; }
+    const metaPath = sessionMetaPath(normAgentId, sid);
+    const messagesPath = sessionMessagesPath(normAgentId, sid);
+    try { unlinkSync(messagesPath); } catch {}
+    try { unlinkSync(metaPath); return true; } catch { return false; }
   } finally {
     releaseSessionLock(lockPath);
   }
@@ -332,14 +501,14 @@ export function buildHistoryPreludeText(obj, opts){
   if (!opts || typeof opts !== 'object'){
     if (!msgs.length) return '';
     const lines = [];
-    lines.push('[Conversation History \u2014 keep for context]\n');
+    lines.push('[Conversation History — keep for context]\n');
     for (const m of msgs){
       let role = 'User';
       if (m.role === 'assistant') role = 'Assistant';
       else if (m.role === 'tool') role = 'Tool';
       else if (m.role === 'system') role = 'System';
       const t = String(m.text || '');
-      const chunk = t.length > 3000 ? ('\u2026' + t.slice(-3000)) : t;
+      const chunk = t.length > 3000 ? ('…' + t.slice(-3000)) : t;
       lines.push(role + ': ' + chunk);
     }
     return lines.join('\n');
@@ -357,14 +526,14 @@ export function buildHistoryPreludeText(obj, opts){
   const recent = msgs.slice(-maxMessages);
 
   const convLines = [];
-  convLines.push('[Conversation History \u2014 keep for context]\n');
+  convLines.push('[Conversation History — keep for context]\n');
   for (const m of recent){
     let role = 'User';
     if (m.role === 'assistant') role = 'Assistant';
     else if (m.role === 'tool') role = 'Tool';
     else if (m.role === 'system') role = 'System';
     const t = String(m.text || '');
-    const chunk = t.length > maxMessageChars ? ('\u2026' + t.slice(-maxMessageChars)) : t;
+    const chunk = t.length > maxMessageChars ? ('…' + t.slice(-maxMessageChars)) : t;
     convLines.push(role + ': ' + chunk);
   }
 
@@ -393,7 +562,7 @@ export function buildHistoryPreludeText(obj, opts){
     out += '[Summary]\n' + summary + '\n\n';
   }
   out += kept.join('\n');
-  if (out.length > maxTotalChars) out = '\u2026' + out.slice(-maxTotalChars);
+  if (out.length > maxTotalChars) out = '…' + out.slice(-maxTotalChars);
   return out;
 }
 
