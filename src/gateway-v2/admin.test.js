@@ -167,3 +167,25 @@ test('tailFile returns the last bytes starting on a line boundary', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('GET /admin/metrics returns prometheus text with service status gauges', async () => {
+  const { router } = makeRouter();
+  const res = fakeRes();
+  // capture raw text body
+  let raw = '';
+  res.writeHead = (code, headers) => { res.statusCode = code; res.headers = headers; };
+  res.end = (payload) => { raw = payload; };
+  await router.handle(fakeReq({ url: '/admin/metrics', headers: AUTH }), res, new URL('http://x/admin/metrics'));
+  assert.equal(res.statusCode, 200);
+  assert.match(res.headers['content-type'], /text\/plain/);
+  assert.match(raw, /arcana_uptime_seconds \d+/);
+  assert.match(raw, /arcana_ws_clients 3/);
+  assert.match(raw, /arcana_services_status\{status="running"\} 1/);
+});
+
+test('admin metrics also require the admin token', async () => {
+  const { router } = makeRouter();
+  const res = fakeRes();
+  await router.handle(fakeReq({ url: '/admin/metrics' }), res, new URL('http://x/admin/metrics'));
+  assert.equal(res.statusCode, 401);
+});

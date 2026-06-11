@@ -1,0 +1,17 @@
+node_modules
+.git
+.arcana
+/data
+tmp
+tmp-*
+*.log
+playground
+packages
+glitchbell-site
+wowclip
+whiteboard-mobile
+web/models
+*.mp4
+*.wav
+*.jpeg
+*.png

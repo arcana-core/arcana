@@ -23,6 +23,7 @@ import { ensureArcanaHomeDir } from '../arcana-home.js';
 import { loadOrCreateApiToken, API_TOKEN_HEADER } from '../auth/api-token.js';
 import { loadSession, listSessions, appendMessage } from '../sessions-store.js';
 import { getSessionIdForKey, resolveSessionIdForKey } from '../session-key-store.js';
+import { registerSecretValue } from '../secrets/redaction.js';
 
 export const SDK_VERSION = 1;
 const DEFAULT_AGENT_ID = 'default';
@@ -93,7 +94,10 @@ export async function resolveSecretFromStore({ name, agentId } = {}){
     throw err;
   }
   const agentHomeRoot = agentId ? agentHomeRootFor(agentId) : undefined;
-  return store.getText(String(name || '').trim(), agentHomeRoot);
+  const value = store.getText(String(name || '').trim(), agentHomeRoot);
+  // Track every resolved secret so it is scrubbed from outbound events/logs.
+  try { if (value) registerSecretValue(value); } catch {}
+  return value;
 }
 
 export function buildServiceSdk(opts = {}){

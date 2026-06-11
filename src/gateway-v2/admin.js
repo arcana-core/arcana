@@ -22,6 +22,7 @@ import * as serviceManager from '../services/manager.js';
 import { loadAgentsSnapshot } from '../agents-snapshot.js';
 import { listSessions } from '../sessions-store.js';
 import { isAuthorizedAdminRequest, loadOrCreateAdminToken } from '../auth/admin-token.js';
+import { renderMetrics } from './metrics.js';
 
 const LOG_FILES = {
   manager: 'manager.log',
@@ -171,6 +172,32 @@ export function createAdminRouter(opts = {}){
 
       if (method === 'GET' && u.pathname === '/admin/services'){
         sendJson(res, 200, { ok: true, ...servicesSummary() });
+        return true;
+      }
+
+      if (method === 'GET' && u.pathname === '/admin/metrics'){
+        const svc = servicesSummary();
+        const mem = process.memoryUsage();
+        let wsClients = 0;
+        try { wsClients = wsHub && typeof wsHub.countMatchingClients === 'function' ? wsHub.countMatchingClients({}) : 0; } catch {}
+        const gauges = {
+          arcana_uptime_seconds: { value: Math.floor((Date.now() - startedAtMs) / 1000), help: 'Gateway uptime in seconds' },
+          arcana_memory_rss_bytes: { value: mem.rss, help: 'Resident set size' },
+          arcana_memory_heap_used_bytes: { value: mem.heapUsed, help: 'Heap used' },
+          arcana_ws_clients: { value: wsClients, help: 'Connected WebSocket clients' },
+          arcana_services_total: { value: svc.count, help: 'Tracked services' },
+        };
+        let body = renderMetrics(gauges);
+        // Per-status service counts as a single labeled gauge series.
+        const statusEntries = Object.entries(svc.byStatus || {});
+        if (statusEntries.length){
+          body += '# HELP arcana_services_status Services by status\n# TYPE arcana_services_status gauge\n';
+          body += statusEntries
+            .map(([status, n]) => 'arcana_services_status{status="' + String(status).replace(/"/g, '\\"') + '"} ' + n)
+            .join('\n') + '\n';
+        }
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(body);
         return true;
       }
 

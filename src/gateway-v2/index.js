@@ -3,13 +3,18 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, readdirSy
 import { dirname, extname, join, resolve as resolvePath, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
+import https from 'node:https';
+import { readFileSync as fsReadFileSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { configureLongRunningHttpServer } from '../http-server-timeouts.js';
 
 import { loadOrCreateApiToken, isAuthorizedRequest, tokenHint, getApiTokenFilePath } from '../auth/api-token.js';
 import { nowMs, iso, readBodyJson, paginateSessionMessages } from './util.js';
 import { createAdminRouter } from './admin.js';
-import { loadOrCreateAdminToken, getAdminTokenFilePath } from '../auth/admin-token.js';
+import { loadOrCreateAdminToken, getAdminTokenFilePath, isAuthorizedAdminRequest } from '../auth/admin-token.js';
+import { redactString, hasTrackedSecrets } from '../secrets/redaction.js';
+import { createRateLimiter, clientKeyFromReq } from './rate-limit.js';
+import { incCounter } from './metrics.js';
 import { logError } from '../util/error.js';
 import { createWsHub } from './ws-hub.js';
 import * as eventStore from './event-store.js';
@@ -591,7 +596,10 @@ export async function startGatewayV2({ port } = {}) {
   const bindHost = process.env.ARCANA_BIND_HOST && String(process.env.ARCANA_BIND_HOST).trim()
     ? String(process.env.ARCANA_BIND_HOST).trim()
     : '127.0.0.1';
-  const bypassTokenAuth = isLoopbackBindHost(bindHost);
+  // ARCANA_REQUIRE_AUTH=1 disables the loopback convenience bypass — set it in
+  // any deployment where a reverse proxy or sidecar forwards to 127.0.0.1.
+  const requireAuthAlways = /^(1|true|yes|on)$/i.test(String(process.env.ARCANA_REQUIRE_AUTH || '').trim());
+  const bypassTokenAuth = !requireAuthAlways && isLoopbackBindHost(bindHost);
 
   apiToken = loadOrCreateApiToken();
   try {
@@ -609,6 +617,9 @@ export async function startGatewayV2({ port } = {}) {
   }
 
   const wsHub = createWsHub({
+    // Scrub resolved secret values from any outbound event payload. No-op
+    // until a service actually reads a secret via the SDK.
+    redact: (payload) => (hasTrackedSecrets() ? redactString(payload) : payload),
     getInitialMessages: () => {
       const ev = buildServerInfoEvent();
       return ev ? [ev] : [];
@@ -726,6 +737,11 @@ export async function startGatewayV2({ port } = {}) {
   });
   try { attachLocalToolProxyHub(wsHub); } catch {}
   const trace = createTraceEmitter({ wsHub });
+
+  const rateLimiter = createRateLimiter({});
+  if (rateLimiter.enabled){
+    console.log('[arcana:gateway-v2] rate limit: ' + rateLimiter.rpm + ' req/min/client (burst ' + rateLimiter.burst + ')');
+  }
 
   const adminRouter = createAdminRouter({ wsHub, startedAtMs: Date.now() });
   try {
@@ -1013,7 +1029,24 @@ export async function startGatewayV2({ port } = {}) {
     }
   }
 
-  const server = configureLongRunningHttpServer(http.createServer(async (req, res) => {
+  // TLS: terminate HTTPS in-process when cert+key are provided. Otherwise plain
+  // HTTP (the usual setup is a reverse proxy / load balancer terminating TLS,
+  // in which case also set ARCANA_REQUIRE_AUTH=1).
+  let tlsOptions = null;
+  try {
+    const certPath = String(process.env.ARCANA_TLS_CERT || '').trim();
+    const keyPath = String(process.env.ARCANA_TLS_KEY || '').trim();
+    if (certPath && keyPath){
+      tlsOptions = { cert: fsReadFileSync(certPath), key: fsReadFileSync(keyPath) };
+      const caPath = String(process.env.ARCANA_TLS_CA || '').trim();
+      if (caPath) tlsOptions.ca = fsReadFileSync(caPath);
+    }
+  } catch (e) {
+    console.error('[arcana:gateway-v2] TLS cert/key load failed; falling back to HTTP: ' + (e && e.message ? e.message : e));
+    tlsOptions = null;
+  }
+
+  const requestHandler = async (req, res) => {
     try {
       const { method, url } = req;
       if (!method || !url) {
@@ -1024,9 +1057,22 @@ export async function startGatewayV2({ port } = {}) {
       const u = new URL(url, 'http://localhost');
 
       // Operator console API: separate admin token, no loopback bypass.
+      // Exempt from the request rate limiter (operator traffic, low volume).
       if (u.pathname.startsWith('/admin/')){
         const handled = await adminRouter.handle(req, res, u);
         if (handled) return;
+      }
+
+      // Coarse per-client rate limit on the client-facing surface.
+      if (rateLimiter.enabled && (u.pathname.startsWith('/v2/') || u.pathname.startsWith('/api/'))){
+        const verdict = rateLimiter.take(clientKeyFromReq(req));
+        if (!verdict.allowed){
+          try { incCounter('arcana_requests_rate_limited_total', null, 'Requests rejected by the rate limiter'); } catch {}
+          const retry = Math.ceil((verdict.retryAfterMs || 1000) / 1000);
+          res.writeHead(429, { 'content-type': 'application/json; charset=utf-8', 'retry-after': String(retry) });
+          res.end(JSON.stringify({ ok: false, error: 'rate_limited', retryAfterMs: verdict.retryAfterMs }));
+          return;
+        }
       }
 
       if (u.pathname.startsWith('/v2/')){
@@ -3038,7 +3084,11 @@ export async function startGatewayV2({ port } = {}) {
         sendJson(res, 500, { ok: false, error: 'internal_error' });
       } catch {}
     }
-  }));
+  };
+
+  const server = configureLongRunningHttpServer(
+    tlsOptions ? https.createServer(tlsOptions, requestHandler) : http.createServer(requestHandler),
+  );
 
   const wss = new WebSocketServer({ noServer: true });
   wss.on('connection', (ws, req) => {
@@ -3058,7 +3108,11 @@ export async function startGatewayV2({ port } = {}) {
       groupId = String(u.searchParams.get('groupId') || '').trim();
       threadKind = String(u.searchParams.get('threadKind') || '').trim() === 'group' ? 'group' : 'session';
       clientId = String(u.searchParams.get('clientId') || '').trim();
-      receiveAll = String(u.searchParams.get('receiveAll') || '').trim() === '1';
+      // receiveAll subscribes to every agent's event stream — operator-only.
+      // Without the admin token the flag is silently ignored, so a regular
+      // client cannot widen its subscription beyond its own session scope.
+      receiveAll = String(u.searchParams.get('receiveAll') || '').trim() === '1'
+        && isAuthorizedAdminRequest(req);
     } catch {}
     wsHub.addClient(ws, { agentId, sessionKey, sessionId, groupId, threadKind, clientId, receiveAll });
   });
@@ -3090,7 +3144,8 @@ export async function startGatewayV2({ port } = {}) {
   const bound = server.address();
   const actualPort = bound && typeof bound.port === 'number' ? bound.port : desiredPort;
   const hostLabel = (bound && typeof bound.address === 'string' && bound.address) ? bound.address : bindHost;
-  console.log('[arcana:gateway-v2] listening on http://' + hostLabel + ':' + actualPort);
+  const scheme = tlsOptions ? 'https' : 'http';
+  console.log('[arcana:gateway-v2] listening on ' + scheme + '://' + hostLabel + ':' + actualPort);
 
   return {
     server,

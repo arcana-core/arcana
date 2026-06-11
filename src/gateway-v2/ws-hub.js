@@ -46,6 +46,11 @@ export function createWsHub(options = {}){
   const onDisconnect = (options && typeof options.onDisconnect === 'function')
     ? options.onDisconnect
     : null;
+  // Optional payload scrubber (e.g. secret redaction) applied to the
+  // serialized broadcast string. Identity by default.
+  const redact = (options && typeof options.redact === 'function')
+    ? options.redact
+    : null;
 
   const clients = new Set();
   let pingInterval = null;
@@ -279,6 +284,9 @@ export function createWsHub(options = {}){
       payload = JSON.stringify(obj);
     } catch {
       return 0;
+    }
+    if (redact){
+      try { payload = redact(payload); } catch {}
     }
     const type = String(obj && obj.type || '');
     let sent = 0;
