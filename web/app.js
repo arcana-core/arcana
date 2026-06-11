@@ -2291,6 +2291,21 @@ async function pickWorkspace(){
   });
 }
 
+// While renderMessages runs, new message rows go into a DocumentFragment so a
+// full history render costs one DOM insertion instead of one per message.
+let messageInsertTarget = null;
+let scrollToBottomScheduled = false;
+
+function scheduleScrollToBottom(){
+	if (scrollToBottomScheduled) return;
+	scrollToBottomScheduled = true;
+	const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : (fn)=> setTimeout(fn, 16);
+	raf(()=>{
+		scrollToBottomScheduled = false;
+		try { if (messages) messages.scrollTop = messages.scrollHeight; } catch {}
+	});
+}
+
 function appendMessage(role, text = '', ts = ''){
 	const wrap = document.createElement('div');
 	wrap.className = 'msg ' + (role === 'user' ? 'me' : 'other');
@@ -2315,8 +2330,15 @@ function appendMessage(role, text = '', ts = ''){
 	col.appendChild(timeEl);
 	wrap.appendChild(avatar);
 	wrap.appendChild(col);
-	messages.appendChild(wrap);
-	messages.scrollTop = messages.scrollHeight;
+	if (messageInsertTarget){
+		messageInsertTarget.appendChild(wrap);
+	} else {
+		messages.appendChild(wrap);
+		// A live bubble was appended outside renderMessages; the rendered-keys
+		// cache no longer mirrors the DOM, so the next render rebuilds.
+		try { messages.__arcanaRenderedKeys = null; } catch {}
+		scheduleScrollToBottom();
+	}
 	return bubble;
 }
 
@@ -4682,60 +4704,104 @@ async function openGroup(id){
   requestRefreshList();
 }
 
+function renderOneMessage(m){
+  if (!m) return;
+  const role = (m && m.role) ? m.role : '';
+  if (!__arcana_showToolMessages && (role === 'tool' || role === 'system')) return;
+  const rawText = (m && typeof m.text === 'string') ? m.text : '';
+  if (role === 'assistant'){
+    const extracted = extractMediaFromAssistantText(rawText);
+    const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
+    const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
+    const bubble = appendMessage('assistant', cleanText, m.ts || '');
+    if (bubble && mediaRefs.length){
+      const parts = ensureBubbleParts(bubble) || {};
+      const mediaEl = parts.media || bubble;
+      let sidCurrent = '';
+      try { sidCurrent = getCurrentSessionId() || currentId || ''; } catch {}
+      const existingSrcs = new Set();
+      try{
+        if (mediaEl.querySelectorAll){
+          const imgs = mediaEl.querySelectorAll('img');
+          for (const img of imgs){ if (img && img.src) existingSrcs.add(img.src); }
+        }
+      } catch {}
+      for (const refRaw of mediaRefs){
+        const ref = String(refRaw || '').trim(); if (!ref) continue;
+        const src = mediaRefToImgSrc(ref, sidCurrent);
+        if (existingSrcs.has(src)) continue;
+        const img = document.createElement('img');
+        img.src = src;
+        img.style.maxWidth = '100%';
+        img.style.borderRadius = '6px';
+        img.style.display = 'block';
+        img.style.marginTop = '8px';
+        mediaEl.appendChild(img);
+        try{ existingSrcs.add(img.src); } catch {}
+      }
+    }
+    return;
+  }
+  if (role === 'user'){
+    const bubble = appendMessage('user', rawText, m.ts || '');
+    if (bubble && Array.isArray(m.mediaRefs) && m.mediaRefs.length){
+      renderBubbleMedia(bubble, m.mediaRefs, getCurrentSessionId() || currentId || '');
+    }
+    return;
+  }
+  if (rawText){
+    appendMessage(role || 'assistant', rawText, m.ts || '');
+  }
+}
+
+function messageRenderKey(m, index){
+  if (!m) return 'null:' + index;
+  const role = m.role ? String(m.role) : '';
+  const ts = m.ts ? String(m.ts) : '';
+  const itemId = m.itemId ? String(m.itemId) : '';
+  const text = (typeof m.text === 'string') ? m.text : '';
+  return role + '|' + ts + '|' + itemId + '|' + text.length + '|' + text.slice(0, 24);
+}
+
+function computeIncrementalRenderStart(oldKeys, newKeys){
+  // Returns the index to start rendering from when the previously rendered
+  // list is a strict prefix of the new one (append-only update), or -1 when a
+  // full rebuild is needed.
+  if (!Array.isArray(oldKeys) || !oldKeys.length) return -1;
+  if (!Array.isArray(newKeys) || oldKeys.length > newKeys.length) return -1;
+  for (let i = 0; i < oldKeys.length; i += 1){
+    if (oldKeys[i] !== newKeys[i]) return -1;
+  }
+  return oldKeys.length;
+}
+
 function renderMessages(msgs){
   try{ if(!messages) return; } catch {}
-  messages.innerHTML = '';
   const arr = Array.isArray(msgs) ? msgs : [];
-  for (const m of arr){
-    if (!m) continue;
-    const role = (m && m.role) ? m.role : '';
-    if (!__arcana_showToolMessages && (role === 'tool' || role === 'system')) continue;
-    const rawText = (m && typeof m.text === 'string') ? m.text : '';
-    if (role === 'assistant'){
-      const extracted = extractMediaFromAssistantText(rawText);
-      const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : '';
-      const mediaRefs = (extracted && Array.isArray(extracted.mediaRefs)) ? extracted.mediaRefs : [];
-      const bubble = appendMessage('assistant', cleanText, m.ts || '');
-      if (bubble && mediaRefs.length){
-        const parts = ensureBubbleParts(bubble) || {};
-        const mediaEl = parts.media || bubble;
-        let sidCurrent = '';
-        try { sidCurrent = getCurrentSessionId() || currentId || ''; } catch {}
-        const existingSrcs = new Set();
-        try{
-          if (mediaEl.querySelectorAll){
-            const imgs = mediaEl.querySelectorAll('img');
-            for (const img of imgs){ if (img && img.src) existingSrcs.add(img.src); }
-          }
-        } catch {}
-        for (const refRaw of mediaRefs){
-          const ref = String(refRaw || '').trim(); if (!ref) continue;
-          const src = mediaRefToImgSrc(ref, sidCurrent);
-          if (existingSrcs.has(src)) continue;
-          const img = document.createElement('img');
-          img.src = src;
-          img.style.maxWidth = '100%';
-          img.style.borderRadius = '6px';
-          img.style.display = 'block';
-          img.style.marginTop = '8px';
-          mediaEl.appendChild(img);
-          try{ existingSrcs.add(img.src); } catch {}
-        }
-      }
-      continue;
-    }
-    if (role === 'user'){
-      const bubble = appendMessage('user', rawText, m.ts || '');
-      if (bubble && Array.isArray(m.mediaRefs) && m.mediaRefs.length){
-        renderBubbleMedia(bubble, m.mediaRefs, getCurrentSessionId() || currentId || '');
-      }
-      continue;
-    }
-    if (rawText){
-      appendMessage(role || 'assistant', rawText, m.ts || '');
-    }
+  const newKeys = arr.map(messageRenderKey);
+  // Append-only fast path: when the previously rendered list is a strict
+  // prefix of the new one (live group refresh, polled history), only the tail
+  // is rendered instead of rebuilding every row.
+  const oldKeys = Array.isArray(messages.__arcanaRenderedKeys) ? messages.__arcanaRenderedKeys : null;
+  let start = computeIncrementalRenderStart(oldKeys, newKeys);
+  if (start < 0){
+    messages.innerHTML = '';
+    start = 0;
   }
-  messages.scrollTop = messages.scrollHeight;
+  if (start < arr.length){
+    const frag = document.createDocumentFragment();
+    messageInsertTarget = frag;
+    try {
+      for (let i = start; i < arr.length; i += 1){
+        renderOneMessage(arr[i]);
+      }
+    } finally {
+      messageInsertTarget = null;
+    }
+    messages.appendChild(frag);
+  }
+  messages.__arcanaRenderedKeys = newKeys;
+  scheduleScrollToBottom();
 }
 
 async function refreshList(){
@@ -4929,7 +4995,7 @@ async function sendWithSession(){
     if (streamingId === currentId && activeAssistant && activeAssistant.classList.contains('typing')){ setTyping(activeAssistant, false); activeAssistant.textContent = (j && j.text) || tt('chat.noResponse'); }
     requestRefreshList();
   } catch(e) { if (activeAssistant) activeAssistant.textContent = tt('chat.errorPrefix') + (((e && e.message) || e)); }
-  finally { messages.scrollTop = messages.scrollHeight; }
+  finally { scheduleScrollToBottom(); }
 }
 
 async function sendWithGatewayV2(){
@@ -4958,7 +5024,7 @@ async function sendWithGatewayV2(){
   const bubble = appendMessage('assistant', '');
   activeAssistant = bubble;
   setTyping(bubble, true);
-  messages.scrollTop = messages.scrollHeight;
+  scheduleScrollToBottom();
   try{
     const policy = (qs('fullshell') && qs('fullshell').checked) ? 'open' : 'restricted';
     const sessionId = (typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || '';
@@ -5011,7 +5077,7 @@ async function sendWithGatewayV2(){
     bubble.textContent = msg;
     try { if (sid) logMain(sid, msg); } catch {}
   } finally {
-    messages.scrollTop = messages.scrollHeight;
+    scheduleScrollToBottom();
   }
 }
 
@@ -5313,7 +5379,7 @@ function handleGatewayV2Envelope(payload){
           }
         }
 
-        messages.scrollTop = messages.scrollHeight;
+        scheduleScrollToBottom();
         return;
       }
       if (evType === 'wake_info'){
@@ -6090,7 +6156,7 @@ function handleArcanaEvent(data){
         if (data.type === 'item_completed'){
           try { bubble.__arcanaItemCompleted = true; } catch {}
         }
-        messages.scrollTop = messages.scrollHeight;
+        scheduleScrollToBottom();
         try { if (currentId) markSessionSeen(currentId); } catch {}
         return;
       }
@@ -6157,7 +6223,7 @@ function handleArcanaEvent(data){
           }
         }
       }
-        messages.scrollTop = messages.scrollHeight;
+        scheduleScrollToBottom();
         try { if (currentId) markSessionSeen(currentId); } catch {}
         return;
       }
@@ -6227,7 +6293,7 @@ function handleArcanaEvent(data){
             if (container.appendChild) container.appendChild(img);
           }
         }
-        messages.scrollTop = messages.scrollHeight;
+        scheduleScrollToBottom();
         try { if (currentId) markSessionSeen(currentId); } catch {}
         return;
       }
