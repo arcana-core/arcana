@@ -132,3 +132,29 @@ export async function atomicWriteJson(filePath, value){
 
 export default { nowMs, iso, safeJsonParse, readBodyJson, ensureDir, atomicWriteJson, randomId };
 
+
+// Slice a session object's messages for the paginated GET /api/sessions/:id.
+// limit: newest N messages; before: page backwards (indexes < before).
+// Returns null when no pagination was requested (caller sends the object as-is).
+export function paginateSessionMessages(obj, limitRaw, beforeRaw){
+  // Number(null/'') is 0, which would silently turn "no param" into before=0.
+  const hasLimitParam = limitRaw !== null && limitRaw !== undefined && String(limitRaw).trim() !== '';
+  const hasBeforeParam = beforeRaw !== null && beforeRaw !== undefined && String(beforeRaw).trim() !== '';
+  const limit = hasLimitParam ? Number(limitRaw) : NaN;
+  const before = hasBeforeParam ? Number(beforeRaw) : NaN;
+  const wantsLimit = Number.isFinite(limit) && limit > 0;
+  const wantsBefore = Number.isFinite(before) && before >= 0;
+  if (!wantsLimit && !wantsBefore) return null;
+  const messages = Array.isArray(obj && obj.messages) ? obj.messages : [];
+  const total = messages.length;
+  const end = wantsBefore ? Math.min(Math.floor(before), total) : total;
+  const effectiveLimit = wantsLimit ? Math.floor(limit) : end;
+  const start = Math.max(0, end - effectiveLimit);
+  return {
+    ...obj,
+    messages: messages.slice(start, end),
+    totalMessages: total,
+    firstIndex: start,
+    hasMore: start > 0,
+  };
+}

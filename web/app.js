@@ -4062,10 +4062,16 @@ async function createGroupSession(title, workspace, members){ const payload = { 
 async function deleteGroupSession(id){ if (!id) return { ok:false }; const url = '/api/group-sessions/' + encodeURIComponent(id); return await _fetchJsonExpectOk(url, { method:'DELETE' }, 'group-delete') }
 async function groupTurn(groupId, text, policy, attachments){ const payload = { groupId: String(groupId || ''), text: String(text || ''), policy: String(policy || 'restricted') }; if (Array.isArray(attachments) && attachments.length) payload.attachments = attachments; return await _fetchJsonExpectOk('/v2/group-turn', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }, 'group-turn') }
 async function listAgents(){ const j = await _fetchJsonExpectOk('/api/agents', undefined, 'agents'); return Array.isArray(j && j.agents) ? j.agents : [] }
-async function loadSession(id, agentId){
+async function loadSession(id, agentId, opts){
   try{
     const aid = String(agentId || DEFAULT_AGENT_ID);
-    const url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid);
+    let url = '/api/sessions/' + encodeURIComponent(id) + '?agentId=' + encodeURIComponent(aid);
+    try {
+      const limit = Number(opts && opts.limit);
+      if (Number.isFinite(limit) && limit > 0) url += '&limit=' + Math.floor(limit);
+      const before = Number(opts && opts.before);
+      if (Number.isFinite(before) && before >= 0) url += '&before=' + Math.floor(before);
+    } catch {}
     const token = getStoredApiToken();
     const headers = token ? { 'authorization':'Bearer ' + token } : undefined;
     const r = await fetch(url, headers ? { headers } : undefined);
@@ -4643,7 +4649,7 @@ async function openSession(id, agentId){
       }
     }
   } catch {}
-  const obj = await loadSession(sid, aid);
+  const obj = await loadSession(sid, aid, { limit: HISTORY_PAGE_SIZE });
   try {
     if (obj && obj.updatedAt){
       markSessionSeen(sid, obj.updatedAt);
@@ -4664,7 +4670,15 @@ async function openSession(id, agentId){
       if (Number.isFinite(tokensNum) && tokensNum >= 0){ info.sessionTokens = tokensNum; }
     }
   } catch {}
-  renderMessages((obj && Array.isArray(obj.messages)) ? obj.messages : []);
+  historyPaging = {
+    sessionId: sid,
+    agentId: aid,
+    firstIndex: Number(obj && obj.firstIndex) || 0,
+    hasMore: !!(obj && obj.hasMore),
+    messages: (obj && Array.isArray(obj.messages)) ? obj.messages.slice() : [],
+  };
+  renderMessages(historyPaging.messages);
+  updateLoadEarlierButton();
   // Log session workspace only when it changes to avoid duplicate lines when switching
   try { if (obj && obj.workspace) { logWorkspaceIfChanged(sid, 'workspace:', obj.workspace); } } catch {}
   requestRefreshList();
@@ -4775,7 +4789,7 @@ function computeIncrementalRenderStart(oldKeys, newKeys){
   return oldKeys.length;
 }
 
-function renderMessages(msgs){
+function renderMessages(msgs, opts){
   try{ if(!messages) return; } catch {}
   const arr = Array.isArray(msgs) ? msgs : [];
   const newKeys = arr.map(messageRenderKey);
@@ -4801,7 +4815,68 @@ function renderMessages(msgs){
     messages.appendChild(frag);
   }
   messages.__arcanaRenderedKeys = newKeys;
-  scheduleScrollToBottom();
+  if (!(opts && opts.scroll === false)) scheduleScrollToBottom();
+}
+
+// History pagination: openSession loads only the newest HISTORY_PAGE_SIZE
+// messages; older pages are fetched on demand via the load-earlier button.
+const HISTORY_PAGE_SIZE = 200;
+let historyPaging = null;
+let loadEarlierBtn = null;
+let loadEarlierBusy = false;
+
+function updateLoadEarlierButton(){
+  try {
+    if (!messages) return;
+    const active = historyPaging && historyPaging.hasMore && historyPaging.sessionId === currentId;
+    if (!active){
+      if (loadEarlierBtn && loadEarlierBtn.parentElement) loadEarlierBtn.parentElement.removeChild(loadEarlierBtn);
+      return;
+    }
+    if (!loadEarlierBtn){
+      loadEarlierBtn = document.createElement('button');
+      loadEarlierBtn.type = 'button';
+      loadEarlierBtn.className = 'load-earlier-btn';
+      loadEarlierBtn.style.cssText = 'align-self:center;margin:4px auto;padding:4px 14px;border:1px solid #ccc;border-radius:12px;background:#fff;color:#555;font-size:12px;cursor:pointer;';
+      loadEarlierBtn.addEventListener('click', ()=>{ loadEarlierMessages().catch(()=>{}); });
+    }
+    loadEarlierBtn.textContent = loadEarlierBusy ? '加载中…' : '加载更早消息';
+    if (messages.firstChild !== loadEarlierBtn){
+      messages.insertBefore(loadEarlierBtn, messages.firstChild || null);
+    }
+  } catch {}
+}
+
+async function loadEarlierMessages(){
+  if (loadEarlierBusy) return;
+  const paging = historyPaging;
+  if (!paging || !paging.hasMore || paging.sessionId !== currentId) return;
+  loadEarlierBusy = true;
+  updateLoadEarlierButton();
+  try {
+    const obj = await loadSession(paging.sessionId, paging.agentId, {
+      limit: HISTORY_PAGE_SIZE,
+      before: paging.firstIndex,
+    });
+    if (!obj || paging.sessionId !== currentId) return;
+    const older = Array.isArray(obj.messages) ? obj.messages : [];
+    paging.firstIndex = Number(obj.firstIndex) || 0;
+    paging.hasMore = !!obj.hasMore;
+    paging.messages = older.concat(paging.messages);
+    // Prepending forces a rebuild; keep the viewport anchored on the row the
+    // user was looking at instead of jumping to the bottom.
+    const prevHeight = messages.scrollHeight;
+    const prevTop = messages.scrollTop;
+    renderMessages(paging.messages, { scroll: false });
+    updateLoadEarlierButton();
+    const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : (fn)=> setTimeout(fn, 16);
+    raf(()=>{
+      try { messages.scrollTop = messages.scrollHeight - prevHeight + prevTop; } catch {}
+    });
+  } finally {
+    loadEarlierBusy = false;
+    updateLoadEarlierButton();
+  }
 }
 
 async function refreshList(){
@@ -4956,7 +5031,7 @@ async function sendWithSession(){
   if (!hasAgents || !currentAgentId){
     if (!activeSessionWorkspace && sidAtSend){
       try {
-        const obj = await loadSession(sidAtSend, DEFAULT_AGENT_ID);
+        const obj = await loadSession(sidAtSend, DEFAULT_AGENT_ID, { limit: 1 });
         if (obj && obj.workspace) activeSessionWorkspace = String(obj.workspace || '');
       } catch {}
     }

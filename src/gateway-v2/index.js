@@ -7,7 +7,7 @@ import { WebSocketServer } from 'ws';
 import { configureLongRunningHttpServer } from '../http-server-timeouts.js';
 
 import { loadOrCreateApiToken, isAuthorizedRequest, tokenHint, getApiTokenFilePath } from '../auth/api-token.js';
-import { nowMs, iso, readBodyJson } from './util.js';
+import { nowMs, iso, readBodyJson, paginateSessionMessages } from './util.js';
 import { logError } from '../util/error.js';
 import { createWsHub } from './ws-hub.js';
 import * as eventStore from './event-store.js';
@@ -2013,7 +2013,10 @@ export async function startGatewayV2({ port } = {}) {
               sendJson(res, 404, { error: 'not_found' });
               return;
             }
-            sendJson(res, 200, obj);
+            // Optional pagination: ?limit=N returns the newest N messages,
+            // ?before=<index> pages backwards (messages with index < before).
+            const paginated = paginateSessionMessages(obj, u.searchParams.get('limit'), u.searchParams.get('before'));
+            sendJson(res, 200, paginated || obj);
           } catch (e) {
             sendJson(res, 500, { error: 'get_failed', message: e && e.message ? String(e.message) : String(e || '') });
           }
