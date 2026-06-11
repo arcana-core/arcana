@@ -58,6 +58,11 @@ export function createServiceProcess(opts = {}){
     backoffCapMs = 30000,
     stableMs = 60000,
     onLog = null,
+    // Capability broker for the child's ctx.sdk. async (method, params) => value.
+    // The parent side is the trust boundary: it re-checks scoping regardless
+    // of what the child claims.
+    sdkHandler = null,
+    secretsAllowlist = [],
     forkFn = defaultFork,
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
@@ -102,9 +107,28 @@ export function createServiceProcess(opts = {}){
   function killChild(sig){ try { if (child) child.kill(sig); } catch {} }
   function resolveStops(){ const rs = stopResolvers; stopResolvers = []; for (const r of rs){ try { r(); } catch {} } }
 
+  function handleSdkRpc(msg){
+    const reply = (payload) => { try { if (child) child.send({ type: 'sdk_rpc_result', id: msg.id, ...payload }); } catch {} };
+    if (typeof sdkHandler !== 'function'){
+      reply({ ok: false, error: { message: 'sdk handler unavailable', code: 'SDK_UNAVAILABLE' } });
+      return;
+    }
+    Promise.resolve()
+      .then(() => sdkHandler(String(msg.method || ''), msg.params || {}))
+      .then((value) => reply({ ok: true, value }))
+      .catch((err) => reply({
+        ok: false,
+        error: {
+          message: String(err && err.message ? err.message : err),
+          code: err && err.code ? String(err.code) : 'SDK_RPC_FAILED',
+        },
+      }));
+  }
+
   function onMessage(msg){
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'heartbeat'){ lastHeartbeatAt = nowFn(); return; }
+    if (msg.type === 'sdk_rpc'){ handleSdkRpc(msg); return; }
     if (msg.type === 'ready'){
       status = 'running';
       readyAt = nowFn();
@@ -155,7 +179,13 @@ export function createServiceProcess(opts = {}){
     child.on('error', (err) => { lastError = String(err && err.message ? err.message : err); });
     lastHeartbeatAt = nowFn();
     try {
-      child.send({ type: 'init', servicePath, ctx, heartbeatIntervalMs });
+      child.send({
+        type: 'init',
+        servicePath,
+        ctx,
+        heartbeatIntervalMs,
+        sdkInit: { secretsAllowlist },
+      });
     } catch (e) {
       lastError = String(e && e.message ? e.message : e);
     }

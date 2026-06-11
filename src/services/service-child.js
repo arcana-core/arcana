@@ -7,25 +7,61 @@
 // other service keep running. The supervisor restarts it.
 //
 // IPC protocol (parent -> child):
-//   { type: 'init', servicePath, ctx, heartbeatIntervalMs }
+//   { type: 'init', servicePath, ctx, heartbeatIntervalMs, sdkInit }
 //   { type: 'stop' }
+//   { type: 'sdk_rpc_result', id, ok, value | error: { message, code } }
 // IPC protocol (child -> parent):
 //   { type: 'spawned' }                      // process is alive, awaiting init
 //   { type: 'ready', hasStop }               // start(ctx) resolved
 //   { type: 'skipped' }                       // module has no start()/default
 //   { type: 'heartbeat' }                     // periodic liveness
 //   { type: 'fatal', error }                  // about to exit non-zero
+//   { type: 'sdk_rpc', id, method, params }   // capability call (e.g. secrets)
 
 import { pathToFileURL } from 'node:url';
+import { buildServiceSdk } from './sdk.js';
 
 const STOP_TIMEOUT_MS = 5000;
+const SDK_RPC_TIMEOUT_MS = 30000;
 
 let handle = null;
 let stopping = false;
 let heartbeatTimer = null;
 
+const pendingRpc = new Map(); // id -> { resolve, reject, timer }
+let rpcSeq = 0;
+
 function send(msg){
   try { if (typeof process.send === 'function') process.send(msg); } catch {}
+}
+
+function ipcCall(method, params){
+  return new Promise((resolve, reject) => {
+    const id = ++rpcSeq;
+    const timer = setTimeout(() => {
+      pendingRpc.delete(id);
+      const err = new Error('sdk rpc timeout: ' + method);
+      err.code = 'SDK_RPC_TIMEOUT';
+      reject(err);
+    }, SDK_RPC_TIMEOUT_MS);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    pendingRpc.set(id, { resolve, reject, timer });
+    send({ type: 'sdk_rpc', id, method, params });
+  });
+}
+
+function onRpcResult(msg){
+  const entry = pendingRpc.get(msg.id);
+  if (!entry) return;
+  pendingRpc.delete(msg.id);
+  try { clearTimeout(entry.timer); } catch {}
+  if (msg.ok){
+    entry.resolve(msg.value);
+  } else {
+    const err = new Error(msg.error && msg.error.message ? msg.error.message : 'sdk rpc failed');
+    if (msg.error && msg.error.code) err.code = msg.error.code;
+    entry.reject(err);
+  }
 }
 
 function resolveStarter(mod){
@@ -35,7 +71,7 @@ function resolveStarter(mod){
   return null;
 }
 
-async function runStart(servicePath, ctx){
+async function runStart(servicePath, ctx, sdkInit){
   const href = pathToFileURL(servicePath).href + '?v=' + String(Date.now());
   const mod = await import(href);
   const starter = resolveStarter(mod);
@@ -43,7 +79,15 @@ async function runStart(servicePath, ctx){
     send({ type: 'skipped' });
     return;
   }
-  handle = await starter(ctx);
+  const sdk = buildServiceSdk({
+    mode: 'child',
+    serviceId: ctx && ctx.serviceId,
+    workspaceRoot: ctx && ctx.workspaceRoot,
+    logDir: ctx && ctx.logDir,
+    secretsAllowlist: sdkInit && sdkInit.secretsAllowlist,
+    ipcCall,
+  });
+  handle = await starter({ ...ctx, sdk });
   send({ type: 'ready', hasStop: !!(handle && typeof handle.stop === 'function') });
 }
 
@@ -72,10 +116,12 @@ process.on('message', (msg) => {
   if (!msg || typeof msg !== 'object') return;
   if (msg.type === 'init'){
     startHeartbeat(msg.heartbeatIntervalMs);
-    runStart(msg.servicePath, msg.ctx).catch((err) => {
+    runStart(msg.servicePath, msg.ctx, msg.sdkInit).catch((err) => {
       send({ type: 'fatal', error: String(err && err.stack ? err.stack : err) });
       process.exit(1);
     });
+  } else if (msg.type === 'sdk_rpc_result'){
+    onRpcResult(msg);
   } else if (msg.type === 'stop'){
     shutdown(0);
   }

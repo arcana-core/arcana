@@ -219,3 +219,99 @@ export async function start(ctx){
 
   rmSync(dir, { recursive: true, force: true });
 });
+
+test('sdk_rpc routes to the handler and replies with the value', async () => {
+  const harness = makeTimerHarness();
+  const children = [];
+  const calls = [];
+  const proc = createServiceProcess({
+    id: 'svc',
+    servicePath: '/tmp/svc.mjs',
+    ctx: {},
+    logFile: '/dev/null',
+    childPath: CHILD_PATH,
+    secretsAllowlist: ['TOKEN_A'],
+    sdkHandler: async (method, params) => { calls.push([method, params]); return 'secret-value'; },
+    forkFn: () => { const c = makeFakeChild(); children.push(c); return c; },
+    setTimeoutFn: harness.setTimeoutFn,
+    clearTimeoutFn: harness.clearTimeoutFn,
+    nowFn: harness.nowFn,
+  });
+
+  proc.start();
+  const initMsg = children[0].sent.find((m) => m.type === 'init');
+  assert.deepEqual(initMsg.sdkInit, { secretsAllowlist: ['TOKEN_A'] }, 'allowlist shipped to the child');
+
+  children[0].emit('message', { type: 'sdk_rpc', id: 7, method: 'secrets.get', params: { name: 'TOKEN_A' } });
+  await new Promise((r) => setImmediate(r));
+  const reply = children[0].sent.find((m) => m.type === 'sdk_rpc_result');
+  assert.deepEqual(reply, { type: 'sdk_rpc_result', id: 7, ok: true, value: 'secret-value' });
+  assert.deepEqual(calls, [['secrets.get', { name: 'TOKEN_A' }]]);
+});
+
+test('sdk_rpc propagates handler errors with their code', async () => {
+  const harness = makeTimerHarness();
+  const children = [];
+  const proc = createServiceProcess({
+    id: 'svc',
+    servicePath: '/tmp/svc.mjs',
+    ctx: {},
+    logFile: '/dev/null',
+    childPath: CHILD_PATH,
+    sdkHandler: async () => { const e = new Error('nope'); e.code = 'SECRET_NOT_ALLOWED'; throw e; },
+    forkFn: () => { const c = makeFakeChild(); children.push(c); return c; },
+    setTimeoutFn: harness.setTimeoutFn,
+    clearTimeoutFn: harness.clearTimeoutFn,
+    nowFn: harness.nowFn,
+  });
+
+  proc.start();
+  children[0].emit('message', { type: 'sdk_rpc', id: 1, method: 'secrets.get', params: { name: 'X' } });
+  await new Promise((r) => setImmediate(r));
+  const reply = children[0].sent.find((m) => m.type === 'sdk_rpc_result');
+  assert.equal(reply.ok, false);
+  assert.equal(reply.error.code, 'SECRET_NOT_ALLOWED');
+});
+
+test('end-to-end: isolated service reads a scoped secret through ctx.sdk', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'arcana-svc-sdk-e2e-'));
+  const marker = join(dir, 'secret-out.txt');
+  const servicePath = join(dir, 'svc.mjs');
+  writeFileSync(servicePath, `
+import { writeFileSync } from 'node:fs';
+export async function start(ctx){
+  let allowed = '';
+  let denied = '';
+  try { allowed = await ctx.sdk.secrets.get('PROVIDER_KEY'); } catch (e) { allowed = 'ERR:' + e.code; }
+  try { await ctx.sdk.secrets.get('OTHER'); denied = 'unexpectedly-allowed'; } catch (e) { denied = String(e.code); }
+  writeFileSync(${JSON.stringify(marker)}, allowed + '|' + denied);
+  return { async stop(){} };
+}
+`, 'utf-8');
+
+  const proc = createServiceProcess({
+    id: 'e2e-sdk',
+    servicePath,
+    ctx: { workspaceRoot: dir, serviceId: 'e2e-sdk', logDir: dir },
+    logFile: join(dir, 'svc.log'),
+    childPath: CHILD_PATH,
+    secretsAllowlist: ['PROVIDER_KEY'],
+    sdkHandler: async (method, params) => {
+      assert.equal(method, 'secrets.get');
+      assert.equal(params.name, 'PROVIDER_KEY');
+      return 'sk-live-123';
+    },
+  });
+
+  proc.start();
+  const deadline = Date.now() + 8000;
+  while (proc.status().status !== 'running' && Date.now() < deadline){
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(proc.status().status, 'running');
+  assert.equal(readFileSync(marker, 'utf-8'), 'sk-live-123|SECRET_NOT_ALLOWED',
+    'declared secret resolves via the parent broker; undeclared is denied in the child');
+
+  await proc.stop({ timeoutMs: 4000 });
+  rmSync(dir, { recursive: true, force: true });
+});

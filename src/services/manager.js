@@ -20,6 +20,7 @@ import { promises as fsp, readFileSync, existsSync } from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { resolveWorkspaceRoot } from "../workspace-guard.js";
 import { createServiceProcess } from "./service-supervisor.js";
+import { buildServiceSdk, normalizeSecretsAllowlist, isSecretAllowed, resolveSecretFromStore } from "./sdk.js";
 
 const SERVICE_CHILD_PATH = fileURLToPath(new URL("./service-child.js", import.meta.url));
 
@@ -119,6 +120,34 @@ export function resolveServiceOptions(id, config) {
     maxRestarts: num(cfg.maxRestarts, 5),
     heartbeatTimeoutMs: num(cfg.heartbeatTimeoutMs, 10000),
     memoryLimitMBRaw: cfg.memoryLimitMB,
+    // Per-service secret scope for ctx.sdk.secrets (deny by default).
+    secrets: normalizeSecretsAllowlist(cfg.secrets),
+  };
+}
+
+// Gateway-side capability broker for an isolated service. This is the trust
+// boundary: the child's own allowlist copy is convenience, this check is the
+// one that matters. The vault's derived key stays in this process.
+function makeSdkHandler(serviceId, options) {
+  const allowlist = options.secrets;
+  return async function sdkHandler(method, params) {
+    if (method === "secrets.get") {
+      const name = String(params && params.name || "").trim();
+      if (!name) {
+        const err = new Error("secret name required");
+        err.code = "SECRET_NAME_REQUIRED";
+        throw err;
+      }
+      if (!isSecretAllowed(allowlist, name)) {
+        const err = new Error('secret "' + name + '" is not declared for service "' + serviceId + '"');
+        err.code = "SECRET_NOT_ALLOWED";
+        throw err;
+      }
+      return resolveSecretFromStore({ name, agentId: params && params.agentId });
+    }
+    const err = new Error("unknown sdk method: " + method);
+    err.code = "SDK_METHOD_UNKNOWN";
+    throw err;
   };
 }
 
@@ -207,6 +236,8 @@ async function startOneIsolated(filePath, workspaceRoot, opts) {
     restart: opts.restart,
     maxRestarts: opts.maxRestarts,
     heartbeatTimeoutMs: opts.heartbeatTimeoutMs,
+    secretsAllowlist: opts.secrets,
+    sdkHandler: makeSdkHandler(id, opts),
     onLog: (level, msg) => { appendLog(managerLog, "[" + level + "] " + msg).catch(() => {}); },
   });
 
@@ -263,7 +294,14 @@ async function startOne(filePath, workspaceRoot) {
       return;
     }
 
-    const ctx = { workspaceRoot, servicePath: filePath, serviceId: id, logDir };
+    const sdk = buildServiceSdk({
+      mode: "in-process",
+      serviceId: id,
+      workspaceRoot,
+      logDir,
+      secretsAllowlist: options.secrets,
+    });
+    const ctx = { workspaceRoot, servicePath: filePath, serviceId: id, logDir, sdk };
     const STARTUP_TIMEOUT_MS = 30000;
     const startPromise = starter(ctx);
     const TIMEOUT = Symbol("timeout");
