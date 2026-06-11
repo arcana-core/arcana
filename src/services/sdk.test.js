@@ -175,3 +175,31 @@ test('agents helpers normalize ids and compute home roots', () => {
     rmSync(home, { recursive: true, force: true });
   });
 });
+
+test('secrets.status and listNames route through IPC in child mode', async () => {
+  const seen = [];
+  const sdk = buildServiceSdk({
+    mode: 'child', serviceId: 'svc', secretsAllowlist: ['A', 'B'],
+    ipcCall: async (method, params) => {
+      seen.push([method, params]);
+      if (method === 'secrets.status') return { initialized: true, locked: false };
+      if (method === 'secrets.listNames') return { bindings: { A: { scope: 'global' }, C: { scope: 'global' } } };
+      return null;
+    },
+  });
+  assert.deepEqual(await sdk.secrets.status(), { initialized: true, locked: false });
+  const names = await sdk.secrets.listNames({ agentId: 'cutpilot' });
+  assert.deepEqual(Object.keys(names.bindings), ['A'], 'listNames filtered to the allowlist');
+  assert.deepEqual(seen.map((s) => s[0]), ['secrets.status', 'secrets.listNames']);
+});
+
+test('secrets.listNames in-process filters bindings to the allowlist', async () => {
+  const sdk = buildServiceSdk({
+    mode: 'in-process', serviceId: 'svc', secretsAllowlist: ['KEEP'],
+    resolveSecretNamesFn: async () => ({ bindings: { KEEP: { scope: 'agent' }, DROP: { scope: 'global' } } }),
+    resolveSecretStatusFn: async () => ({ initialized: true, locked: true }),
+  });
+  const names = await sdk.secrets.listNames();
+  assert.deepEqual(Object.keys(names.bindings), ['KEEP']);
+  assert.deepEqual(await sdk.secrets.status(), { initialized: true, locked: true });
+});

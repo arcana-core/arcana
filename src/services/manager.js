@@ -20,7 +20,15 @@ import { promises as fsp, readFileSync, existsSync } from "node:fs";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { resolveWorkspaceRoot } from "../workspace-guard.js";
 import { createServiceProcess } from "./service-supervisor.js";
-import { buildServiceSdk, normalizeSecretsAllowlist, isSecretAllowed, resolveSecretFromStore } from "./sdk.js";
+import {
+  buildServiceSdk,
+  normalizeSecretsAllowlist,
+  isSecretAllowed,
+  resolveSecretFromStore,
+  resolveSecretStatusFromStore,
+  resolveSecretNamesFromStore,
+  filterBindingsToAllowlist,
+} from "./sdk.js";
 
 const SERVICE_CHILD_PATH = fileURLToPath(new URL("./service-child.js", import.meta.url));
 
@@ -144,6 +152,14 @@ function makeSdkHandler(serviceId, options) {
         throw err;
       }
       return resolveSecretFromStore({ name, agentId: params && params.agentId });
+    }
+    if (method === "secrets.status") {
+      return resolveSecretStatusFromStore();
+    }
+    if (method === "secrets.listNames") {
+      // Only expose binding metadata for the service's declared secrets.
+      const listed = await resolveSecretNamesFromStore({ agentId: params && params.agentId });
+      return filterBindingsToAllowlist(listed, allowlist);
     }
     const err = new Error("unknown sdk method: " + method);
     err.code = "SDK_METHOD_UNKNOWN";

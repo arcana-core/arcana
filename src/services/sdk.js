@@ -83,9 +83,9 @@ function resolveApiToken(){
   try { return loadOrCreateApiToken() || ''; } catch { return ''; }
 }
 
-// Gateway-side resolver used by the in-process SDK and by the IPC broker.
+// Gateway-side resolvers used by the in-process SDK and by the IPC broker.
 // Imported lazily so isolated children never load the vault machinery.
-export async function resolveSecretFromStore({ name, agentId } = {}){
+async function loadSecretsStore(){
   const mod = await import('../secrets/index.js');
   const store = mod.secrets || (mod.default && mod.default.secrets);
   if (!store || typeof store.getText !== 'function'){
@@ -93,11 +93,46 @@ export async function resolveSecretFromStore({ name, agentId } = {}){
     err.code = 'SECRETS_UNAVAILABLE';
     throw err;
   }
+  return store;
+}
+
+export async function resolveSecretFromStore({ name, agentId } = {}){
+  const store = await loadSecretsStore();
   const agentHomeRoot = agentId ? agentHomeRootFor(agentId) : undefined;
   const value = store.getText(String(name || '').trim(), agentHomeRoot);
   // Track every resolved secret so it is scrubbed from outbound events/logs.
   try { if (value) registerSecretValue(value); } catch {}
   return value;
+}
+
+export async function resolveSecretStatusFromStore(){
+  const store = await loadSecretsStore();
+  if (typeof store.status !== 'function') return { initialized: null, locked: null };
+  const st = store.status() || {};
+  return {
+    initialized: typeof st.initialized === 'boolean' ? st.initialized : null,
+    locked: typeof st.locked === 'boolean' ? st.locked : null,
+  };
+}
+
+export async function resolveSecretNamesFromStore({ agentId } = {}){
+  const store = await loadSecretsStore();
+  if (typeof store.listNames !== 'function') return { bindings: {} };
+  const agentHomeRoot = agentId ? agentHomeRootFor(agentId) : undefined;
+  const listed = await store.listNames(agentHomeRoot);
+  return listed && typeof listed === 'object' ? listed : { bindings: {} };
+}
+
+// Restrict binding metadata to the service's declared secret names.
+export function filterBindingsToAllowlist(listed, allowlist){
+  if (!listed || typeof listed !== 'object') return { bindings: {} };
+  if (allowlist === '*') return listed;
+  const bindings = (listed.bindings && typeof listed.bindings === 'object') ? listed.bindings : {};
+  const filtered = {};
+  for (const k of Object.keys(bindings)){
+    if (Array.isArray(allowlist) && allowlist.includes(k)) filtered[k] = bindings[k];
+  }
+  return { ...listed, bindings: filtered };
 }
 
 export function buildServiceSdk(opts = {}){
@@ -110,6 +145,8 @@ export function buildServiceSdk(opts = {}){
   // injectable for tests
   const fetchFn = typeof opts.fetchFn === 'function' ? opts.fetchFn : fetch;
   const resolveSecret = typeof opts.resolveSecretFn === 'function' ? opts.resolveSecretFn : resolveSecretFromStore;
+  const resolveStatus = typeof opts.resolveSecretStatusFn === 'function' ? opts.resolveSecretStatusFn : resolveSecretStatusFromStore;
+  const resolveNames = typeof opts.resolveSecretNamesFn === 'function' ? opts.resolveSecretNamesFn : resolveSecretNamesFromStore;
 
   const gatewayUrl = resolveGatewayUrl();
   let cachedToken = null;
@@ -175,6 +212,27 @@ export function buildServiceSdk(opts = {}){
     return resolveSecret({ name: key, agentId });
   }
 
+  async function getSecretStatus(){
+    if (mode === 'child'){
+      if (!ipcCall){ const e = new Error('sdk ipc unavailable'); e.code = 'SDK_IPC_UNAVAILABLE'; throw e; }
+      return ipcCall('secrets.status', {});
+    }
+    return resolveStatus();
+  }
+
+  async function getSecretNames({ agentId } = {}){
+    let listed;
+    if (mode === 'child'){
+      if (!ipcCall){ const e = new Error('sdk ipc unavailable'); e.code = 'SDK_IPC_UNAVAILABLE'; throw e; }
+      // The broker already scopes to the allowlist; filter again locally so
+      // both sides agree even if the broker is permissive.
+      listed = await ipcCall('secrets.listNames', { agentId: agentId ? String(agentId) : undefined });
+    } else {
+      listed = await resolveNames({ agentId });
+    }
+    return filterBindingsToAllowlist(listed, allowlist);
+  }
+
   async function log(level, message){
     const line = '[' + new Date().toISOString() + '] [' + String(level || 'info') + '] ' + String(message || '') + '\n';
     try { await fsp.appendFile(join(logDir, 'sdk.log'), line, 'utf-8'); } catch {}
@@ -195,6 +253,8 @@ export function buildServiceSdk(opts = {}){
     },
     secrets: {
       get: getSecret,
+      status: getSecretStatus,
+      listNames: getSecretNames,
       // The declared contract, not the vault contents: deterministic in both
       // modes and never touches the store.
       list: async () => (allowlist === '*' ? '*' : allowlist.slice()),
