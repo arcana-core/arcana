@@ -8,6 +8,8 @@ import { configureLongRunningHttpServer } from '../http-server-timeouts.js';
 
 import { loadOrCreateApiToken, isAuthorizedRequest, tokenHint, getApiTokenFilePath } from '../auth/api-token.js';
 import { nowMs, iso, readBodyJson, paginateSessionMessages } from './util.js';
+import { createAdminRouter } from './admin.js';
+import { loadOrCreateAdminToken, getAdminTokenFilePath } from '../auth/admin-token.js';
 import { logError } from '../util/error.js';
 import { createWsHub } from './ws-hub.js';
 import * as eventStore from './event-store.js';
@@ -725,6 +727,13 @@ export async function startGatewayV2({ port } = {}) {
   try { attachLocalToolProxyHub(wsHub); } catch {}
   const trace = createTraceEmitter({ wsHub });
 
+  const adminRouter = createAdminRouter({ wsHub, startedAtMs: Date.now() });
+  try {
+    const adminPath = getAdminTokenFilePath();
+    loadOrCreateAdminToken();
+    console.log('[arcana:gateway-v2] admin console at /admin.html (token file: ' + adminPath + ')');
+  } catch {}
+
   // Bridge Codex/event-bus events into the WebSocket stream.
   // For most events we forward them as-is, but we synthesize
   // thinking_progress from thinking_delta so the web UI can show
@@ -1013,6 +1022,12 @@ export async function startGatewayV2({ port } = {}) {
       }
 
       const u = new URL(url, 'http://localhost');
+
+      // Operator console API: separate admin token, no loopback bypass.
+      if (u.pathname.startsWith('/admin/')){
+        const handled = await adminRouter.handle(req, res, u);
+        if (handled) return;
+      }
 
       if (u.pathname.startsWith('/v2/')){
         if (!bypassTokenAuth && !isAuthorizedRequest(req, apiToken)){
