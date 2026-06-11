@@ -557,7 +557,9 @@ export function createEngine({ lane, scheduler, inbox, outbox, stateStore, runne
         };
 
         let decision;
-        if (wakeMode === 'llm'){
+        if (ok && hasOutput){
+          decision = decideWake(wakeInput);
+        } else if (wakeMode === 'llm'){
           decision = await decideWakeLLM(wakeInput, {
             agentId: aId,
             sessionKey: sKey,

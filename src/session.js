@@ -124,6 +124,12 @@ export function buildInjectedLocalToolsSystemPrompt(input){
   return lines.join('\n');
 }
 
+export function normalizeSystemPromptOverride(input){
+  const value = String(input || '').trim();
+  if (!value) return '';
+  return value.slice(0, 20000);
+}
+
 export function normalizeLocalBootstrapFiles(input){
   if (!Array.isArray(input)) return [];
   const out = [];
@@ -473,6 +479,7 @@ export async function createArcanaSession(opts={}){
   const injectedLocalToolDefinitions = normalizeInjectedLocalToolDefinitions(opts && opts.localToolDefinitions);
   const injectedLocalBootstrapFiles = normalizeLocalBootstrapFiles(opts && opts.localBootstrapFiles);
   const injectedLocalToolsPrompt = buildInjectedLocalToolsSystemPrompt(injectedLocalToolDefinitions);
+  const systemPromptOverride = normalizeSystemPromptOverride(opts && opts.systemPromptOverride);
   const injectedLocalToolsDebug = summarizeInjectedLocalToolDefinitionsForDebug(injectedLocalToolDefinitions);
   const pkgRoot = arcanaPkgRoot();
   const repoRoot = dirname(pkgRoot);
@@ -1325,6 +1332,7 @@ export async function createArcanaSession(opts={}){
 	  const loader = new DefaultResourceLoader({
     cwd: workspaceRoot,
     agentDir: agentHomeRoot,
+    ...(systemPromptOverride ? { systemPromptOverride: () => systemPromptOverride } : {}),
     agentsFilesOverride: (base)=>{
       const allBaseFiles = base && Array.isArray(base.agentsFiles) ? base.agentsFiles : [];
       let baseFiles = allBaseFiles;
@@ -1355,32 +1363,34 @@ export async function createArcanaSession(opts={}){
 	    appendSystemPromptOverride: (base)=>{
 	      const extras = [];
 
-      // Workspace override: repo-local .pi/APPEND_SYSTEM.md
-      try {
-        const repoAppend = readIfExists(join(repoRoot, ".pi", "APPEND_SYSTEM.md"));
-        if (repoAppend) extras.push(repoAppend);
-      } catch {}
-
-      // Base APPEND_SYSTEM: prefer $ARCANA_HOME/APPEND_SYSTEM.md, fall back to packaged default.
-      try {
-        let baseAppend = "";
+      if (!systemPromptOverride){
+        // Workspace override: repo-local .pi/APPEND_SYSTEM.md
         try {
-          const homeDir = resolveArcanaHome();
-          if (homeDir) baseAppend = readIfExists(join(homeDir, "APPEND_SYSTEM.md"));
+          const repoAppend = readIfExists(join(repoRoot, ".pi", "APPEND_SYSTEM.md"));
+          if (repoAppend) extras.push(repoAppend);
         } catch {}
-        if (!baseAppend){
-          baseAppend = readIfExists(join(pkgRoot, ".pi", "APPEND_SYSTEM.md"));
-        }
-        if (baseAppend) extras.push(baseAppend);
-      } catch {}
-	      const soulLine = hasSoulHint
-	        ? "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."
-	        : "";
-	      if (soulLine) extras.push(soulLine);
+
+        // Base APPEND_SYSTEM: prefer $ARCANA_HOME/APPEND_SYSTEM.md, fall back to packaged default.
+        try {
+          let baseAppend = "";
+          try {
+            const homeDir = resolveArcanaHome();
+            if (homeDir) baseAppend = readIfExists(join(homeDir, "APPEND_SYSTEM.md"));
+          } catch {}
+          if (!baseAppend){
+            baseAppend = readIfExists(join(pkgRoot, ".pi", "APPEND_SYSTEM.md"));
+          }
+          if (baseAppend) extras.push(baseAppend);
+        } catch {}
+	        const soulLine = hasSoulHint
+	          ? "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it."
+	          : "";
+	        if (soulLine) extras.push(soulLine);
+      }
 	      if (injectedLocalToolsPrompt) extras.push(injectedLocalToolsPrompt);
 	      // Append skills prompt after APPEND_SYSTEM.md blocks and SOUL hint
 	      if (skillsPrompt && skillsPrompt.trim()) extras.push(skillsPrompt);
-      const mergedSp = [...(base||[])];
+      const mergedSp = systemPromptOverride ? [] : [...(base||[])];
       for (const sText of extras){ if (sText && !mergedSp.includes(sText)) mergedSp.push(sText); }
       return mergedSp;
     }
@@ -1571,6 +1581,7 @@ export async function createArcanaSession(opts={}){
     customTools: sessionCustomTools,
     model,
     resourceLoader: loader,
+    ...(opts.sessionManager ? { sessionManager: opts.sessionManager } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
   });
 
@@ -1595,7 +1606,11 @@ export async function createArcanaSession(opts={}){
   // ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL is enabled.
   try {
     const env = (typeof process !== 'undefined' && process && process.env) ? process.env : null;
-    const logReqEnv = env && (env.ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST || env.ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL);
+    const logReqEnv = env && (
+      env.ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST ||
+      env.ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL ||
+      env.ARCANA_GATEWAY_V2_CHAT_LOG_ALL_FULL
+    );
     if (logReqEnv && createdSession && createdSession.agent && createdSession.agent.streamFn){
       const agent = createdSession.agent;
       const originalStreamFn = agent.streamFn;

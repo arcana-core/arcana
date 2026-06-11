@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   attachLocalToolProxyHub,
+  buildChatCaptureSummary,
   buildLocalAgentSignature,
   buildLocalToolDefinitionsSignature,
   cancelLocalToolProxyCallsForClient,
@@ -10,11 +11,14 @@ import {
   emitUserMessageDelivered,
   ensureAssistantTextDelivered,
   ensureTurnEndDelivered,
+  buildLlmUsageEvent,
   handleLocalToolProxyHeartbeat,
   handleLocalToolProxyMessage,
+  isRequiredBillingUsageMissing,
   normalizeAgentHomeRootOverride,
   normalizeWorkspaceRootOverride,
   requestLocalToolExecution,
+  selectUsageSnapshot,
   withSessionStreamRouting,
 } from './chat-runtime.js';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -173,6 +177,111 @@ test('withSessionStreamRouting attaches sessionKey to assistant stream events', 
     sessionId: 'session-123',
     sessionKey: 'cp:cutpilot:project:ios-native',
   });
+});
+
+test('buildLlmUsageEvent includes clientTurnId for billing idempotency', () => {
+  const event = buildLlmUsageEvent({
+    usage: {
+      inputTokens: 4,
+      cacheReadTokens: 8,
+      contextTokens: 12,
+      outputTokens: 5,
+      totalTokens: 17,
+      lastCallInputTokens: 4,
+      lastCallCacheReadTokens: 8,
+      lastCallContextTokens: 12,
+      lastCallTotalTokens: 17,
+    },
+    sessionId: 'session-123',
+    sessionKey: 'cp:cutpilot:project:client',
+    agentId: 'cutpilot',
+    sessionTokens: 34,
+    model: 'openai-compatible:gpt-5.5',
+    clientTurnId: 'turn-abc',
+    tsMs: 123456,
+  });
+
+  assert.deepEqual(event, {
+    type: 'llm_usage',
+    sessionId: 'session-123',
+    sessionKey: 'cp:cutpilot:project:client',
+    agentId: 'cutpilot',
+    inputTokens: 4,
+    cacheReadTokens: 8,
+    cacheWriteTokens: 0,
+    contextTokens: 12,
+    outputTokens: 5,
+    totalTokens: 17,
+    lastCallInputTokens: 4,
+    lastCallCacheReadTokens: 8,
+    lastCallCacheWriteTokens: 0,
+    lastCallContextTokens: 12,
+    lastCallTotalTokens: 17,
+    sessionTokens: 34,
+    tsMs: 123456,
+    model: 'openai-compatible:gpt-5.5',
+    clientTurnId: 'turn-abc',
+  });
+});
+
+test('isRequiredBillingUsageMissing requires real usage for local tool proxy billing sessions', () => {
+  assert.equal(isRequiredBillingUsageMissing(
+    { localToolProxyEnabled: true },
+    { contextTokens: 0, outputTokens: 0, totalTokens: 0 },
+  ), true);
+
+  assert.equal(isRequiredBillingUsageMissing(
+    { localToolProxyEnabled: true },
+    { contextTokens: 10, outputTokens: 3, totalTokens: 13 },
+  ), false);
+
+  assert.equal(isRequiredBillingUsageMissing(
+    { localToolProxyEnabled: false },
+    { contextTokens: 0, outputTokens: 0, totalTokens: 0 },
+  ), false);
+});
+
+test('selectUsageSnapshot uses observed provider usage when bridge snapshot is empty', () => {
+  assert.deepEqual(
+    selectUsageSnapshot(
+      { contextTokens: 0, outputTokens: 0, totalTokens: 0, lastCallContextTokens: 0, lastCallTotalTokens: 0 },
+      { contextTokens: 1154, outputTokens: 5, totalTokens: 4871, lastCallContextTokens: 1154, lastCallTotalTokens: 4871 },
+    ),
+    { contextTokens: 1154, outputTokens: 5, totalTokens: 4871, lastCallContextTokens: 1154, lastCallTotalTokens: 4871 },
+  );
+});
+
+test('buildChatCaptureSummary identifies token-heavy model request payload paths', () => {
+  const summary = buildChatCaptureSummary({
+    promptText: 'hello',
+    stats: { usageContextTokens: 123, usageOutputTokens: 4, usageTotalTokens: 127 },
+    modelRequest: {
+      context: {
+        messages: [
+          { role: 'user', content: 'short text' },
+          { role: 'tool', toolResult: 'tool-result-' + 'x'.repeat(5000) },
+          { role: 'user', image: 'data:image/png;base64,' + 'A'.repeat(6000) },
+        ],
+      },
+      providerPayload: {
+        input: [
+          { type: 'text', text: 'provider text' },
+        ],
+      },
+    },
+  });
+
+  assert.equal(summary.stats.usageTotalTokens, 127);
+  assert.ok(summary.totals.bytes > 11000);
+  assert.ok(summary.categoryBytes.data_image > 6000);
+  assert.ok(summary.categoryBytes.tool > 5000);
+  assert.equal(summary.topItems[0].path, 'modelRequest.context.messages[2].image');
+});
+
+test('selectUsageSnapshot keeps bridge snapshot when both sources observed the same turn', () => {
+  const bridge = { contextTokens: 12, outputTokens: 5, totalTokens: 17, lastCallContextTokens: 12, lastCallTotalTokens: 17 };
+  const observed = { contextTokens: 12, outputTokens: 5, totalTokens: 17, lastCallContextTokens: 12, lastCallTotalTokens: 17 };
+  assert.equal(selectUsageSnapshot(bridge, observed), bridge);
 });
 
 test('requestLocalToolExecution resolves matching local tool results', async () => {

@@ -5,7 +5,7 @@ import { parseFrontmatter } from '@mariozechner/pi-coding-agent';
 import { arcanaHomePath } from '../arcana-home.js';
 import { resolveWorkspaceRoot, ensureReadAllowed } from '../workspace-guard.js';
 import { getSessionIdForKey } from '../session-key-store.js';
-import { createArcanaSession, summarizeInjectedLocalToolDefinitionsForDebug } from '../session.js';
+import { createArcanaSession, normalizeSystemPromptOverride, summarizeInjectedLocalToolDefinitionsForDebug } from '../session.js';
 import { ensureSessionId } from '../cron/arcana-task.js';
 import { runWithContext, emit } from '../event-bus.js';
 import { loadArcanaConfig, loadAgentConfig } from '../config.js';
@@ -28,6 +28,13 @@ import { persistToolMetaToDisk, persistToolResultToDisk, scheduleAppendToolStrea
 import { thinkingStart, appendThinkingDelta, thinkingEnd } from '../thinking-output-store.js';
 import { mergeStreamingText, mergeTextBlocks } from '../streaming-text.js';
 import { normalizeChatAttachments, extractAttachmentImages, attachmentsToMediaRefs } from './chat-attachments.js';
+import {
+  deleteContextFile,
+  forceFlushContextSession,
+  openContextSessionManager,
+  pruneContextStore,
+  rotateContextAfterCompaction,
+} from '../agent-context-store.js';
 
 // Long-lived chat sessions keyed by agentId|sessionKey|sessionId|policy|workspaceRoot|agentHomeRoot
 const chatSessions = new Map();
@@ -562,6 +569,7 @@ const DEFAULT_AGENT_ID = 'default';
 const MAX_LOG_JSON_CHARS = 8000;
 const MAX_PROMPT_LOG_CHARS = 8000;
 const MAX_PROMPT_LOG_CHARS_FULL = 2 * 1024 * 1024;
+const DEFAULT_ALL_FULL_LOG_MAX_CHARS = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_ITEMS = 16;
 const MAX_DIAGNOSTIC_STRING_CHARS = 512;
 const DEFAULT_LOCAL_TOOL_PROXY_TIMEOUT_MS = 0;
@@ -582,6 +590,18 @@ function truthyEnv(name){
   } catch {
     return false;
   }
+}
+
+function chatLogAllFullEnabled(){
+  return truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_ALL_FULL');
+}
+
+function fullChatLogMaxChars(){
+  try {
+    const raw = Number(process.env.ARCANA_GATEWAY_V2_CHAT_LOG_FULL_MAX_CHARS);
+    if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  } catch {}
+  return chatLogAllFullEnabled() ? DEFAULT_ALL_FULL_LOG_MAX_CHARS : MAX_PROMPT_LOG_CHARS_FULL;
 }
 
 function truncateStringForLog(value, maxLen){
@@ -614,6 +634,92 @@ function safeJsonForLog(value, maxLen){
     json = json.slice(0, headLen) + suffix;
   }
   return json;
+}
+
+function roughByteLength(value){
+  try {
+    return Buffer.byteLength(String(value == null ? '' : value), 'utf8');
+  } catch {
+    return String(value == null ? '' : value).length;
+  }
+}
+
+function classifyCapturePath(pathName, value){
+  const pathLower = String(pathName || '').toLowerCase();
+  const text = typeof value === 'string' ? value : '';
+  const textHead = text.slice(0, 64).toLowerCase();
+  if (textHead.startsWith('data:image/')) return 'data_image';
+  if (textHead.startsWith('data:')) return 'data_url';
+  if (pathLower.includes('image') || pathLower.includes('images')) return 'image';
+  if (pathLower.includes('tool')) return 'tool';
+  if (pathLower.includes('content') || pathLower.includes('message') || pathLower.includes('prompt')) return 'message';
+  if (/^[A-Za-z0-9+/=\r\n]+$/.test(text) && text.length > 4096) return 'base64_like';
+  return 'text';
+}
+
+export function buildChatCaptureSummary({ modelRequest, promptText, stats, diagnostics } = {}){
+  const rows = [];
+  const categoryBytes = new Map();
+  function addRow(pathName, value, typeHint){
+    const text = typeof value === 'string' ? value : safeJsonForLog(value, 2048);
+    const chars = String(text || '').length;
+    const bytes = roughByteLength(text);
+    const category = typeHint || classifyCapturePath(pathName, value);
+    rows.push({
+      path: String(pathName || '$'),
+      category,
+      chars,
+      bytes,
+      preview: truncateStringForLog(text, 160),
+    });
+    categoryBytes.set(category, (categoryBytes.get(category) || 0) + bytes);
+  }
+  function walk(value, pathName, depth){
+    if (value == null) return;
+    if (typeof value === 'string'){
+      addRow(pathName, value);
+      return;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean'){
+      addRow(pathName, String(value), 'scalar');
+      return;
+    }
+    if (depth > 12){
+      addRow(pathName, value, 'object');
+      return;
+    }
+    if (Array.isArray(value)){
+      if (value.length === 0) return;
+      value.forEach((item, index) => walk(item, `${pathName}[${index}]`, depth + 1));
+      return;
+    }
+    if (typeof value === 'object'){
+      const keys = Object.keys(value);
+      if (!keys.length) return;
+      for (const key of keys){
+        walk(value[key], pathName === '$' ? `$.${key}` : `${pathName}.${key}`, depth + 1);
+      }
+    }
+  }
+  if (promptText) addRow('prompt', promptText, 'prompt');
+  walk(modelRequest, 'modelRequest', 0);
+  const topItems = rows
+    .slice()
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 80);
+  return {
+    version: 1,
+    generatedAtMs: nowMs(),
+    totals: {
+      itemCount: rows.length,
+      bytes: rows.reduce((sum, row) => sum + row.bytes, 0),
+      chars: rows.reduce((sum, row) => sum + row.chars, 0),
+    },
+    categoryBytes: Object.fromEntries(Array.from(categoryBytes.entries()).sort((a, b) => b[1] - a[1])),
+    stats: stats || null,
+    diagnostics: diagnostics || null,
+    topItems,
+  };
 }
 
 function asciiSafeBody(text){
@@ -698,7 +804,7 @@ function buildChatLogPath(agentId, sessionKey, sessionId){
 // Minimal self-check examples:
 // - Default mode: "\u4f60\u597d\n" stays "\u4f60\u597d\n" in logs.
 // - ASCII-only mode (env=1): "\u4f60\u597d\n" becomes "??\n".
-async function writeChatLog({ logPath, headerLines, promptText, includePrompt, errorStack, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars }){
+async function writeChatLog({ logPath, headerLines, promptText, includePrompt, errorStack, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars, captureSummary }){
   if (!logPath) return null;
   try {
     const dir = dirname(logPath);
@@ -762,6 +868,18 @@ async function writeChatLog({ logPath, headerLines, promptText, includePrompt, e
   try {
     await fsp.writeFile(logPath, body, 'utf8');
   } catch {}
+  if (captureSummary){
+    try {
+      const summaryPath = `${logPath}.summary.json`;
+      const summary = buildChatCaptureSummary({
+        modelRequest,
+        promptText: includePrompt ? promptText : '',
+        stats,
+        diagnostics,
+      });
+      await fsp.writeFile(summaryPath, JSON.stringify(summary, null, 2) + '\n', 'utf8');
+    } catch {}
+  }
   return logPath;
 }
 
@@ -786,6 +904,54 @@ function buildChatKey({ agentId, sessionKey, sessionId, policy, workspaceRoot, a
   } catch {
     return 'default||default|restricted||';
   }
+}
+
+function releaseChatSessionRecord(record){
+  try {
+    if (!record || !record.cacheKey) return false;
+    const current = chatSessions.get(record.cacheKey);
+    if (current !== record) return false;
+    const sess = record.session;
+    try { forceFlushContextSession(sess); } catch {}
+    try {
+      if (sess && sess.isStreaming) return false;
+    } catch {}
+    chatSessions.delete(record.cacheKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function reloadSessionRuntimeFromContext(session, contextPath){
+  try {
+    if (!session || !contextPath) return false;
+    const manager = session.sessionManager;
+    if (manager && typeof manager.setSessionFile === 'function'){
+      manager.setSessionFile(contextPath);
+    }
+    const context = manager && typeof manager.buildSessionContext === 'function'
+      ? manager.buildSessionContext()
+      : null;
+    const messages = context && Array.isArray(context.messages) ? context.messages : [];
+    const agent = session.agent;
+    if (agent && typeof agent.replaceMessages === 'function'){
+      agent.replaceMessages(messages);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function resetSessionRuntimeMessages(session){
+  try {
+    const agent = session && session.agent ? session.agent : null;
+    if (agent && typeof agent.replaceMessages === 'function'){
+      agent.replaceMessages([]);
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 function stableStringify(value){
@@ -893,6 +1059,15 @@ export function buildLocalAgentSignature(localAgentSignature){
   }
 }
 
+export function buildSystemPromptOverrideSignature(systemPromptOverride){
+  try {
+    const value = normalizeSystemPromptOverride(systemPromptOverride);
+    return value ? stableStringify({ systemPromptOverride: value }) : '';
+  } catch {
+    return '';
+  }
+}
+
 export function estimateProjectedPromptTokens({ liveContextTokens, preludeText, promptMessage } = {}){
   try {
     const promptText = '[Current Question]\n' + String(promptMessage || '');
@@ -925,12 +1100,14 @@ export function estimateProjectedPromptTokens({ liveContextTokens, preludeText, 
   }
 }
 
-async function ensureChatSession({ sessionId, sessionKey, agentId, policy, workspaceRoot, agentHomeRoot, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature }){
+async function ensureChatSession({ sessionId, sessionKey, agentId, policy, workspaceRoot, agentHomeRoot, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, systemPromptOverride }){
   const effectiveAgentId = normalizeAgentId(agentId || DEFAULT_AGENT_ID);
   const sid = String(sessionId || '').trim();
   const sessionKeyNormalized = String(sessionKey || '').trim();
   const pol = String(policy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   const localToolProxyEnabled = !!localToolProxy;
+  const effectiveSystemPromptOverride = localToolProxyEnabled ? normalizeSystemPromptOverride(systemPromptOverride) : '';
+  const systemPromptOverrideSignature = buildSystemPromptOverrideSignature(effectiveSystemPromptOverride);
   const toolRoutingSignature = buildToolRoutingSignature(toolRouting);
   const normalizedToolAllowlist = normalizeToolAllowlist(toolAllowlist);
   const toolAllowlistSignature = buildToolAllowlistSignature(normalizedToolAllowlist);
@@ -952,6 +1129,12 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
     try { ws = resolveWorkspaceRoot(); } catch { ws = process.cwd(); }
   }
   const agentHomeDir = normalizeAgentHomeRootOverride(agentHomeRoot) || arcanaHomePath('agents', effectiveAgentId);
+  const globalCfg = loadArcanaConfig();
+  const agentCfg = loadAgentConfig(agentHomeDir);
+  const contextConfig = {
+    ...(globalCfg && typeof globalCfg === 'object' ? globalCfg : {}),
+    ...(agentCfg && typeof agentCfg === 'object' ? agentCfg : {}),
+  };
   const key = buildChatKey({
     agentId: effectiveAgentId,
     sessionKey: sessionKeyNormalized,
@@ -967,17 +1150,20 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
     const existingToolAllowlistSignature = (typeof existing.toolAllowlistSignature === 'string') ? existing.toolAllowlistSignature : '';
     const existingLocalToolDefinitionsSignature = (typeof existing.localToolDefinitionsSignature === 'string') ? existing.localToolDefinitionsSignature : '';
     const existingLocalAgentSignature = (typeof existing.localAgentSignature === 'string') ? existing.localAgentSignature : '';
+    const existingSystemPromptOverrideSignature = (typeof existing.systemPromptOverrideSignature === 'string') ? existing.systemPromptOverrideSignature : '';
     const localToolProxyChanged = existingLocalToolProxyEnabled !== localToolProxyEnabled;
     const toolRoutingChanged = existingToolRoutingSignature !== toolRoutingSignature;
     const toolAllowlistChanged = existingToolAllowlistSignature !== toolAllowlistSignature;
     const localToolDefinitionsChanged = existingLocalToolDefinitionsSignature !== localToolDefinitionsSignature;
     const localAgentChanged = existingLocalAgentSignature !== effectiveLocalAgentSignature;
+    const systemPromptOverrideChanged = existingSystemPromptOverrideSignature !== systemPromptOverrideSignature;
     const compatible = (
       !localToolProxyChanged &&
       !toolRoutingChanged &&
       !toolAllowlistChanged &&
       !localToolDefinitionsChanged &&
-      !localAgentChanged
+      !localAgentChanged &&
+      !systemPromptOverrideChanged
     );
     localProxyDebugLog('ensureChatSession cache check', {
       agentId: effectiveAgentId,
@@ -991,6 +1177,7 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
       toolAllowlistChanged,
       localToolDefinitionsChanged,
       localAgentChanged,
+      systemPromptOverrideChanged,
       localToolDefinitions: localToolDefinitionsDebug,
     });
     if (compatible){
@@ -1019,6 +1206,7 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
       toolAllowlistChanged,
       localToolDefinitionsChanged,
       localAgentChanged,
+      systemPromptOverrideChanged,
       localToolDefinitions: localToolDefinitionsDebug,
     });
   }
@@ -1036,6 +1224,11 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
       });
     }
     : undefined;
+  const contextStore = openContextSessionManager({
+    agentId: effectiveAgentId,
+    sessionId: sid || 'default',
+    workspaceRoot: ws,
+  });
   await runWithContext(
     { sessionId: sid || 'default', agentId: effectiveAgentId, agentHomeRoot: agentHomeDir, workspaceRoot: ws },
     async () => {
@@ -1048,6 +1241,8 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
         toolAllowlist: normalizedToolAllowlist,
         localToolDefinitions: Array.isArray(localToolDefinitions) ? localToolDefinitions : [],
         localBootstrapFiles: Array.isArray(localBootstrapFiles) ? localBootstrapFiles : [],
+        ...(effectiveSystemPromptOverride ? { systemPromptOverride: effectiveSystemPromptOverride } : {}),
+        ...(contextStore.sessionManager ? { sessionManager: contextStore.sessionManager } : {}),
         ...(localToolProxyInvoke ? { localToolProxyInvoke } : {}),
         ...(toolRouting ? { toolRouting } : {}),
       });
@@ -1070,8 +1265,18 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
     toolAllowlistSignature,
     localToolDefinitionsSignature,
     localAgentSignature: effectiveLocalAgentSignature,
+    systemPromptOverrideSignature,
     skillToolMap: created.skillToolMap || new Map(),
+    cacheKey: key,
+    contextPath: contextStore.contextPath || '',
+    contextConfig,
   };
+  try {
+    if (record.session){
+      record.session.__arcana_context_file = contextStore.contextPath || '';
+      record.session.__arcana_context_config = contextConfig;
+    }
+  } catch {}
 
   localProxyDebugLog('ensureChatSession created', {
     agentId: effectiveAgentId,
@@ -1081,10 +1286,20 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
     localToolProxyEnabled,
     toolAllowlistCount: normalizedToolAllowlist.length,
     localAgentSignature: effectiveLocalAgentSignature,
+    systemPromptOverrideActive: !!effectiveSystemPromptOverride,
     localToolDefinitions: localToolDefinitionsDebug,
   });
   attachChatEventBridge(record, sid || 'default');
   chatSessions.set(key, record);
+  try {
+    pruneContextStore({
+      agentId: effectiveAgentId,
+      config: contextConfig,
+      activeSessionIds: Array.from(chatSessions.values())
+        .filter((rec) => rec && rec.agentId === effectiveAgentId)
+        .map((rec) => rec.sessionId),
+    });
+  } catch {}
   return record;
 }
 
@@ -1101,6 +1316,26 @@ function normalizeUsageObject(raw){
       raw.prompt ??
       0
     ) || 0;
+    let cacheRead = Number(
+      raw.cacheReadTokens ??
+      raw.cache_read_tokens ??
+      raw.cacheRead ??
+      raw.cache_read ??
+      raw.cache_read_input_tokens ??
+      raw.cachedInputTokens ??
+      raw.cached_input_tokens ??
+      raw.input_tokens_details?.cached_tokens ??
+      raw.prompt_tokens_details?.cached_tokens ??
+      0
+    ) || 0;
+    let cacheWrite = Number(
+      raw.cacheWriteTokens ??
+      raw.cache_write_tokens ??
+      raw.cacheWrite ??
+      raw.cache_write ??
+      raw.cache_creation_input_tokens ??
+      0
+    ) || 0;
     let output = Number(
       raw.outputTokens ??
       raw.output_tokens ??
@@ -1109,6 +1344,9 @@ function normalizeUsageObject(raw){
       raw.output ??
       0
     ) || 0;
+    if (cacheRead > 0 && (raw.input_tokens_details?.cached_tokens != null || raw.prompt_tokens_details?.cached_tokens != null)) {
+      input = Math.max(0, input - cacheRead);
+    }
     let total = Number(
       raw.totalTokens ??
       raw.total_tokens ??
@@ -1116,14 +1354,18 @@ function normalizeUsageObject(raw){
       0
     ) || 0;
     if (!Number.isFinite(input) || input < 0) input = 0;
+    if (!Number.isFinite(cacheRead) || cacheRead < 0) cacheRead = 0;
+    if (!Number.isFinite(cacheWrite) || cacheWrite < 0) cacheWrite = 0;
     if (!Number.isFinite(output) || output < 0) output = 0;
     if (!Number.isFinite(total) || total < 0) total = 0;
-    if (!total && (input || output)) total = input + output;
+    if (!total && (input || output || cacheRead || cacheWrite)) total = input + cacheRead + cacheWrite + output;
     input = input ? Math.floor(input) : 0;
+    cacheRead = cacheRead ? Math.floor(cacheRead) : 0;
+    cacheWrite = cacheWrite ? Math.floor(cacheWrite) : 0;
     output = output ? Math.floor(output) : 0;
     total = total ? Math.floor(total) : 0;
-    if (!input && !output && !total) return null;
-    return { inputTokens: input, outputTokens: output, totalTokens: total };
+    if (!input && !output && !cacheRead && !cacheWrite && !total) return null;
+    return { inputTokens: input, cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, outputTokens: output, totalTokens: total };
   } catch {
     return null;
   }
@@ -1151,15 +1393,35 @@ function extractUsageFromToolEvent(ev){
   }
 }
 function extractUsageTotals(u){
+  let inputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
   let ctx = 0;
   let out = 0;
   let tot = 0;
   try {
     if (u && typeof u === 'object'){
-      const input = Number(u.inputTokens ?? u.prompt_tokens ?? u.promptTokens ?? u.input_tokens ?? u.input ?? u.prompt ?? 0) || 0;
+      let input = Number(u.inputTokens ?? u.prompt_tokens ?? u.promptTokens ?? u.input_tokens ?? u.input ?? u.prompt ?? 0) || 0;
       const output = Number(u.outputTokens ?? u.completion_tokens ?? u.completionTokens ?? u.output_tokens ?? u.output ?? 0) || 0;
-      const cacheRead = Number(u.cacheRead ?? u.cache_read_input_tokens ?? u.cacheReadTokens ?? 0) || 0;
-      const cacheWrite = Number(u.cacheWrite ?? u.cache_creation_input_tokens ?? u.cacheWriteTokens ?? 0) || 0;
+      const cacheRead = Number(
+        u.cacheReadTokens ??
+        u.cache_read_tokens ??
+        u.cacheRead ??
+        u.cache_read ??
+        u.cache_read_input_tokens ??
+        u.cachedInputTokens ??
+        u.cached_input_tokens ??
+        u.input_tokens_details?.cached_tokens ??
+        u.prompt_tokens_details?.cached_tokens ??
+        0
+      ) || 0;
+      const cacheWrite = Number(u.cacheWriteTokens ?? u.cache_write_tokens ?? u.cacheWrite ?? u.cache_write ?? u.cache_creation_input_tokens ?? 0) || 0;
+      if (cacheRead > 0 && (u.input_tokens_details?.cached_tokens != null || u.prompt_tokens_details?.cached_tokens != null)) {
+        input = Math.max(0, input - cacheRead);
+      }
+      inputTokens = input;
+      cacheReadTokens = cacheRead;
+      cacheWriteTokens = cacheWrite;
       // Treat context tokens as everything that contributes to the request context
       ctx = input + cacheRead + cacheWrite;
       out = output;
@@ -1168,9 +1430,19 @@ function extractUsageTotals(u){
     }
   } catch {}
   if (!Number.isFinite(tot) || tot < 0) tot = 0;
+  if (!Number.isFinite(inputTokens) || inputTokens < 0) inputTokens = 0;
+  if (!Number.isFinite(cacheReadTokens) || cacheReadTokens < 0) cacheReadTokens = 0;
+  if (!Number.isFinite(cacheWriteTokens) || cacheWriteTokens < 0) cacheWriteTokens = 0;
   if (!Number.isFinite(ctx) || ctx < 0) ctx = 0;
   if (!Number.isFinite(out) || out < 0) out = 0;
-  return { contextTokens: ctx, outputTokens: out, totalTokens: tot };
+  return {
+    inputTokens: Math.floor(inputTokens),
+    cacheReadTokens: Math.floor(cacheReadTokens),
+    cacheWriteTokens: Math.floor(cacheWriteTokens),
+    contextTokens: Math.floor(ctx),
+    outputTokens: Math.floor(out),
+    totalTokens: Math.floor(tot),
+  };
 }
 
 function extractUsageFromAssistantMessage(msg, extractUsageTotalsFn){
@@ -1227,6 +1499,84 @@ function extractUsageFromAssistantMessage(msg, extractUsageTotalsFn){
     }
     if (!bestTotals) return null;
     return { usage: best, totals: bestTotals };
+  } catch {
+    return null;
+  }
+}
+
+function hasRealTokenUsage(usage){
+  try {
+    if (!usage || typeof usage !== 'object') return false;
+    const contextTokens = Number(usage.contextTokens || 0) || 0;
+    const outputTokens = Number(usage.outputTokens || 0) || 0;
+    const totalTokens = Number(usage.totalTokens || 0) || 0;
+    return contextTokens > 0 || outputTokens > 0 || totalTokens > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function isRequiredBillingUsageMissing(record, usage){
+  try {
+    const requiresUsage = !!(record && record.localToolProxyEnabled) || truthyEnv('ARCANA_REQUIRE_LLM_USAGE');
+    if (!requiresUsage) return false;
+    return !hasRealTokenUsage(usage);
+  } catch {
+    return false;
+  }
+}
+
+export function selectUsageSnapshot(primary, observed){
+  try {
+    const primaryUsage = (primary && typeof primary === 'object') ? primary : null;
+    const observedUsage = (observed && typeof observed === 'object') ? observed : null;
+    const primaryHasUsage = hasRealTokenUsage(primaryUsage);
+    const observedHasUsage = hasRealTokenUsage(observedUsage);
+    if (!primaryHasUsage && observedHasUsage) return observedUsage;
+    if (primaryHasUsage && !observedHasUsage) return primaryUsage;
+    if (!primaryHasUsage && !observedHasUsage) {
+      return primaryUsage || observedUsage || { contextTokens: 0, outputTokens: 0, totalTokens: 0 };
+    }
+    const primaryTotal = Number(primaryUsage.totalTokens || 0) || 0;
+    const observedTotal = Number(observedUsage.totalTokens || 0) || 0;
+    return observedTotal > primaryTotal ? observedUsage : primaryUsage;
+  } catch {
+    return primary || observed || { contextTokens: 0, outputTokens: 0, totalTokens: 0 };
+  }
+}
+
+export function buildLlmUsageEvent({ usage, sessionId, sessionKey, agentId, sessionTokens, model, clientTurnId, tsMs } = {}){
+  try {
+    const inputTokens = Number(usage && usage.inputTokens || 0) || 0;
+    const cacheReadTokens = Number(usage && usage.cacheReadTokens || 0) || 0;
+    const cacheWriteTokens = Number(usage && usage.cacheWriteTokens || 0) || 0;
+    const contextTokens = Number(usage && usage.contextTokens || 0) || 0;
+    const outputTokens = Number(usage && usage.outputTokens || 0) || 0;
+    const totalTokens = Number(usage && usage.totalTokens || 0) || 0;
+    const sessionTokensTotal = Number(sessionTokens || 0) || 0;
+    if (contextTokens <= 0 && outputTokens <= 0 && totalTokens <= 0) return null;
+    const ev = {
+      type: 'llm_usage',
+      sessionId,
+      sessionKey,
+      agentId,
+      inputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      contextTokens,
+      outputTokens,
+      totalTokens,
+      lastCallInputTokens: Number(usage && usage.lastCallInputTokens || 0) || 0,
+      lastCallCacheReadTokens: Number(usage && usage.lastCallCacheReadTokens || 0) || 0,
+      lastCallCacheWriteTokens: Number(usage && usage.lastCallCacheWriteTokens || 0) || 0,
+      lastCallContextTokens: Number(usage && usage.lastCallContextTokens || 0) || 0,
+      lastCallTotalTokens: Number(usage && usage.lastCallTotalTokens || 0) || 0,
+      sessionTokens: sessionTokensTotal,
+      tsMs: Number(tsMs || 0) || nowMs(),
+    };
+    if (model) ev.model = String(model);
+    if (clientTurnId) ev.clientTurnId = String(clientTurnId);
+    return ev;
   } catch {
     return null;
   }
@@ -1605,14 +1955,36 @@ async function compactInternalHistoryAndRebuildPrelude({
   }
 
   try {
-    if (session && typeof session.newSession === 'function'){
+    let histForRotation = null;
+    try { histForRotation = ssLoad(sessionId, { agentId }); } catch {}
+    const contextPath = session && session.__arcana_context_file ? String(session.__arcana_context_file || '') : '';
+    if (contextPath){
+      const rotated = rotateContextAfterCompaction({
+        agentId,
+        sessionId,
+        workspaceRoot,
+        historyObj: histForRotation,
+        keepRecentUserTurns: keepTurns,
+        config: session.__arcana_context_config || null,
+      });
+      if (rotated && rotated.ok && reloadSessionRuntimeFromContext(session, rotated.contextPath)){
+        chatContextDebugLog('compaction:context-rotated', {
+          sessionId,
+          agentId,
+          reason: String(reason || ''),
+          contextPath: rotated.contextPath,
+          archivedPath: rotated.archivedPath || '',
+          retainedMessages: rotated.retainedMessages || 0,
+        });
+        return '';
+      }
+    }
+  } catch {}
+
+  try {
+    if (!resetSessionRuntimeMessages(session) && session && typeof session.newSession === 'function'){
       const p = session.newSession();
       if (p && typeof p.then === 'function') await p;
-    } else {
-      const agent = session && session.agent ? session.agent : null;
-      if (agent && typeof agent.replaceMessages === 'function'){
-        agent.replaceMessages([]);
-      }
     }
   } catch {}
 
@@ -1692,10 +2064,16 @@ function attachChatEventBridge(record, sessionId){
   const workspaceRoot = record.workspaceRoot;
 
   // Per-session usage totals for llm_usage
+  let runInputTokens = 0;
+  let runCacheReadTokens = 0;
+  let runCacheWriteTokens = 0;
   let runContextTokens = 0;
   let runOutputTokens = 0;
   let runTotalTokens = 0;
   // Last single LLM call values (for per-card display)
+  let lastCallInputTokens = 0;
+  let lastCallCacheReadTokens = 0;
+  let lastCallCacheWriteTokens = 0;
   let lastCallContextTokens = 0;
   let lastCallTotalTokens = 0;
 
@@ -1785,6 +2163,7 @@ function attachChatEventBridge(record, sessionId){
         const cur = sess.__turnIndexBySession.get(key);
         const next = (typeof cur === 'number' && cur >= 0) ? (cur + 1) : 0;
         sess.__turnIndexBySession.set(key, next);
+        try { forceFlushContextSession(sess); } catch {}
         try { emit(withSessionStreamRouting({ type: 'turn_start' }, { sessionId, sessionKey, agentId })); } catch {}
         return;
       }
@@ -1809,6 +2188,7 @@ function attachChatEventBridge(record, sessionId){
         : baseRaw;
 
       if (t === 'tool_execution_start'){
+        try { forceFlushContextSession(sess); } catch {}
         try { persistToolMetaToDisk({ agentId, sessionId, toolCallId: eventToolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
         try { emit(base); } catch {}
 
@@ -1921,6 +2301,7 @@ function attachChatEventBridge(record, sessionId){
             : ev;
           persistToolResultToDisk({ agentId, sessionId, event: eventForDisk });
         } catch {}
+        try { forceFlushContextSession(sess); } catch {}
         return;
       }
 
@@ -2005,6 +2386,15 @@ function attachChatEventBridge(record, sessionId){
         const usageInfo = extractUsageFromAssistantMessage(ev.message, extractUsageTotals);
         const totals = usageInfo && usageInfo.totals;
         if (totals){
+          if (typeof totals.inputTokens === 'number' && totals.inputTokens > 0){
+            runInputTokens += totals.inputTokens;
+          }
+          if (typeof totals.cacheReadTokens === 'number' && totals.cacheReadTokens > 0){
+            runCacheReadTokens += totals.cacheReadTokens;
+          }
+          if (typeof totals.cacheWriteTokens === 'number' && totals.cacheWriteTokens > 0){
+            runCacheWriteTokens += totals.cacheWriteTokens;
+          }
           if (typeof totals.contextTokens === 'number' && totals.contextTokens > 0){
             runContextTokens += totals.contextTokens;
           }
@@ -2015,6 +2405,9 @@ function attachChatEventBridge(record, sessionId){
             runTotalTokens += totals.totalTokens;
           }
           // Track last single LLM call values for per-card display
+          lastCallInputTokens = (typeof totals.inputTokens === 'number' && totals.inputTokens > 0) ? totals.inputTokens : 0;
+          lastCallCacheReadTokens = (typeof totals.cacheReadTokens === 'number' && totals.cacheReadTokens > 0) ? totals.cacheReadTokens : 0;
+          lastCallCacheWriteTokens = (typeof totals.cacheWriteTokens === 'number' && totals.cacheWriteTokens > 0) ? totals.cacheWriteTokens : 0;
           lastCallContextTokens = (typeof totals.contextTokens === 'number' && totals.contextTokens > 0) ? totals.contextTokens : 0;
           lastCallTotalTokens = (typeof totals.totalTokens === 'number' && totals.totalTokens > 0) ? totals.totalTokens : 0;
           // Emit per-call usage so frontend can update the current LLM card
@@ -2023,6 +2416,9 @@ function attachChatEventBridge(record, sessionId){
               type: 'llm_call_usage',
               sessionId,
               agentId,
+              inputTokens: lastCallInputTokens,
+              cacheReadTokens: lastCallCacheReadTokens,
+              cacheWriteTokens: lastCallCacheWriteTokens,
               contextTokens: lastCallContextTokens,
               totalTokens: lastCallTotalTokens,
             });
@@ -2031,14 +2427,34 @@ function attachChatEventBridge(record, sessionId){
 
 
         assistantRawText = '';
+        try { forceFlushContextSession(sess); } catch {}
       }
     } catch {}
   });
 
   // Attach a helper so callers can drain usage per completed turn
   sess.__arcana_chat_usage = {
-    reset(){ runContextTokens = 0; runOutputTokens = 0; runTotalTokens = 0; lastCallContextTokens = 0; lastCallTotalTokens = 0; },
-    snapshot(){ return { contextTokens: runContextTokens, outputTokens: runOutputTokens, totalTokens: runTotalTokens, lastCallContextTokens, lastCallTotalTokens }; },
+    reset(){
+      runInputTokens = 0; runCacheReadTokens = 0; runCacheWriteTokens = 0;
+      runContextTokens = 0; runOutputTokens = 0; runTotalTokens = 0;
+      lastCallInputTokens = 0; lastCallCacheReadTokens = 0; lastCallCacheWriteTokens = 0;
+      lastCallContextTokens = 0; lastCallTotalTokens = 0;
+    },
+    snapshot(){
+      return {
+        inputTokens: runInputTokens,
+        cacheReadTokens: runCacheReadTokens,
+        cacheWriteTokens: runCacheWriteTokens,
+        contextTokens: runContextTokens,
+        outputTokens: runOutputTokens,
+        totalTokens: runTotalTokens,
+        lastCallInputTokens,
+        lastCallCacheReadTokens,
+        lastCallCacheWriteTokens,
+        lastCallContextTokens,
+        lastCallTotalTokens,
+      };
+    },
   };
 }
 
@@ -2179,7 +2595,7 @@ async function extractUserPromptImages(message, ctx, attachments){
   };
 }
 
-async function runPromptWithSteer({ record, sessionId, sessionKey, message, prelude, isSteer, attachments }){
+async function runPromptWithSteer({ record, sessionId, sessionKey, message, prelude, isSteer, attachments, clientTurnId }){
   const sess = record.session;
   const toolHost = record.toolHost;
   const agentId = record.agentId;
@@ -2241,6 +2657,17 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   let diagnosticEvents = [];
   let assistantMessageMeta = null;
   let promptError = null;
+  let observedInputTokens = 0;
+  let observedCacheReadTokens = 0;
+  let observedCacheWriteTokens = 0;
+  let observedContextTokens = 0;
+  let observedOutputTokens = 0;
+  let observedTotalTokens = 0;
+  let observedLastCallInputTokens = 0;
+  let observedLastCallCacheReadTokens = 0;
+  let observedLastCallCacheWriteTokens = 0;
+  let observedLastCallContextTokens = 0;
+  let observedLastCallTotalTokens = 0;
 
   for (;;){
     // Reset tracking vars for each attempt
@@ -2249,6 +2676,17 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     sawAssistantText = false; diagnosticEvents = []; assistantMessageMeta = null;
     promptError = null;
     lastErrorMessage = '';
+    observedInputTokens = 0;
+    observedCacheReadTokens = 0;
+    observedCacheWriteTokens = 0;
+    observedContextTokens = 0;
+    observedOutputTokens = 0;
+    observedTotalTokens = 0;
+    observedLastCallInputTokens = 0;
+    observedLastCallCacheReadTokens = 0;
+    observedLastCallCacheWriteTokens = 0;
+    observedLastCallContextTokens = 0;
+    observedLastCallTotalTokens = 0;
     // Build payload for this attempt (may be updated on overflow retries)
     payloadMsg = (usePrelude ? usePrelude + '\n\n' : '') + '[Current Question]\n' + promptMessage;
 
@@ -2414,6 +2852,29 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
             const meta = extractAssistantMessageMeta(msg);
             if (meta) assistantMessageMeta = meta;
           } catch {}
+          try {
+            const usageInfo = extractUsageFromAssistantMessage(msg, extractUsageTotals);
+            const totals = usageInfo && usageInfo.totals;
+            if (totals){
+              const inputTokens = Number(totals.inputTokens || 0) || 0;
+              const cacheReadTokens = Number(totals.cacheReadTokens || 0) || 0;
+              const cacheWriteTokens = Number(totals.cacheWriteTokens || 0) || 0;
+              const contextTokens = Number(totals.contextTokens || 0) || 0;
+              const outputTokens = Number(totals.outputTokens || 0) || 0;
+              const totalTokens = Number(totals.totalTokens || 0) || 0;
+              if (inputTokens > 0) observedInputTokens += inputTokens;
+              if (cacheReadTokens > 0) observedCacheReadTokens += cacheReadTokens;
+              if (cacheWriteTokens > 0) observedCacheWriteTokens += cacheWriteTokens;
+              if (contextTokens > 0) observedContextTokens += contextTokens;
+              if (outputTokens > 0) observedOutputTokens += outputTokens;
+              if (totalTokens > 0) observedTotalTokens += totalTokens;
+              observedLastCallInputTokens = inputTokens > 0 ? inputTokens : 0;
+              observedLastCallCacheReadTokens = cacheReadTokens > 0 ? cacheReadTokens : 0;
+              observedLastCallCacheWriteTokens = cacheWriteTokens > 0 ? cacheWriteTokens : 0;
+              observedLastCallContextTokens = contextTokens > 0 ? contextTokens : 0;
+              observedLastCallTotalTokens = totalTokens > 0 ? totalTokens : 0;
+            }
+          } catch {}
         }
       } catch {}
     });
@@ -2511,7 +2972,21 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     }
     break;
   }
-  const usage = sess.__arcana_chat_usage ? sess.__arcana_chat_usage.snapshot() : { contextTokens: 0, outputTokens: 0, totalTokens: 0 };
+  const bridgeUsage = sess.__arcana_chat_usage ? sess.__arcana_chat_usage.snapshot() : { contextTokens: 0, outputTokens: 0, totalTokens: 0 };
+  const observedUsage = {
+    inputTokens: observedInputTokens,
+    cacheReadTokens: observedCacheReadTokens,
+    cacheWriteTokens: observedCacheWriteTokens,
+    contextTokens: observedContextTokens,
+    outputTokens: observedOutputTokens,
+    totalTokens: observedTotalTokens,
+    lastCallInputTokens: observedLastCallInputTokens,
+    lastCallCacheReadTokens: observedLastCallCacheReadTokens,
+    lastCallCacheWriteTokens: observedLastCallCacheWriteTokens,
+    lastCallContextTokens: observedLastCallContextTokens,
+    lastCallTotalTokens: observedLastCallTotalTokens,
+  };
+  const usage = selectUsageSnapshot(bridgeUsage, observedUsage);
   let sessionTokensTotal = 0;
   let sessionObjForTokens = null;
   try {
@@ -2536,24 +3011,18 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
       usageModelLabel = String(modelInfo.label);
     }
   } catch {}
-  if (usage && (usage.totalTokens > 0 || usage.contextTokens > 0 || usage.outputTokens > 0 || sessionTokensTotal > 0)){
+  if (hasRealTokenUsage(usage)){
     try {
-      const ev = {
-        type: 'llm_usage',
+      const ev = buildLlmUsageEvent({
+        usage,
         sessionId,
         sessionKey,
         agentId,
-        contextTokens: usage.contextTokens,
-        outputTokens: usage.outputTokens,
-        totalTokens: usage.totalTokens,
-        lastCallContextTokens: usage.lastCallContextTokens || 0,
-        lastCallTotalTokens: usage.lastCallTotalTokens || 0,
         sessionTokens: sessionTokensTotal,
-        tsMs: nowMs(),
-      };
-      if (usageModelLabel) ev.model = usageModelLabel;
-      if (clientTurnId) ev.clientTurnId = clientTurnId;
-      emit(ev);
+        model: usageModelLabel,
+        clientTurnId,
+      });
+      if (ev) emit(ev);
     } catch {}
   }
 
@@ -2564,7 +3033,7 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
   // Optional model_request logging
   let modelRequest = null;
   try {
-    if (record && record.session && (truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST') || truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL'))){
+    if (record && record.session && (truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST') || truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL') || chatLogAllFullEnabled())){
       const sess = record.session;
       const ctx = sess.__arcana_last_llm_context || null;
       const payload = sess.__arcana_last_provider_payload || null;
@@ -2621,15 +3090,15 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         usageTotalTokens: usage.totalTokens,
       };
       const promptEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
-      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL');
+      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL') || chatLogAllFullEnabled();
       const includePrompt = promptEnv || promptFullEnv;
       const promptText = payloadMsg;
-      const promptMaxChars = promptFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      const promptMaxChars = promptFullEnv ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS;
       const reqEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST');
-      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL');
+      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL') || chatLogAllFullEnabled();
       const includeModelRequest = !!(modelRequest && (reqEnv || reqFullEnv));
-      const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
-      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: stack, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
+      const modelRequestMaxChars = reqFullEnv ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS;
+      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: stack, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars, captureSummary: chatLogAllFullEnabled() });
       logPath = lp;
     } catch {}
     try {
@@ -2719,15 +3188,15 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         usageTotalTokens: usage.totalTokens,
       };
       const promptEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
-      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL');
+      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL') || chatLogAllFullEnabled();
       const includePrompt = promptEnv || promptFullEnv;
       const promptText = payloadMsg;
-      const promptMaxChars = promptFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      const promptMaxChars = promptFullEnv ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS;
       const reqEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST');
-      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL');
+      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL') || chatLogAllFullEnabled();
       const includeModelRequest = !!(modelRequest && (reqEnv || reqFullEnv));
-      const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
-      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
+      const modelRequestMaxChars = reqFullEnv ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS;
+      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars, captureSummary: chatLogAllFullEnabled() });
       logPath = lp;
     } catch {}
     try {
@@ -2738,6 +3207,53 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     } catch {}
     const errCore = core || (reasonShort || completionErrorReason || '');
     return { ok: false, mode: 'turn', error: 'completion_error: ' + errCore, text: lastAssistantText || out, logPath };
+  }
+
+  if (isRequiredBillingUsageMissing(record, usage) && (finalText || sawAssistantText)){
+    const code = 'llm_usage_missing';
+    const messageText = 'llm_usage_missing: provider did not return token usage for a billable Agent turn';
+    try {
+      const lp = buildChatLogPath(agentId, sessionKey, sessionId);
+      const headerLines = [
+        '[arcana:gateway-v2] llm_usage_missing',
+        'timeMs=' + nowMs(),
+        'agentId=' + String(agentId),
+        'sessionId=' + String(sessionId),
+        'sessionKey=' + String(sessionKey || ''),
+      ];
+      const stats = {
+        thinkingChars,
+        toolCalls,
+        assistantBlockTypes: Array.from(assistantBlockTypes),
+        finishReason: finishReason || null,
+        stopReason: stopReason || null,
+        sawAssistantText: sawAssistantText === true,
+        sessionTokensTotal,
+        usageContextTokens: usage && usage.contextTokens || 0,
+        usageOutputTokens: usage && usage.outputTokens || 0,
+        usageTotalTokens: usage && usage.totalTokens || 0,
+      };
+      await writeChatLog({
+        logPath: lp,
+        headerLines,
+        promptText: payloadMsg,
+        includePrompt: chatLogAllFullEnabled(),
+        errorStack: null,
+        stats,
+        diagnostics,
+        promptMaxChars: chatLogAllFullEnabled() ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS,
+        modelRequest,
+        includeModelRequest: chatLogAllFullEnabled() && !!modelRequest,
+        modelRequestMaxChars: chatLogAllFullEnabled() ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS,
+        captureSummary: chatLogAllFullEnabled(),
+      });
+      logPath = lp;
+    } catch {}
+    try {
+      const msg = messageText + (logPath ? ' (log: ' + logPath + ')' : '');
+      emit(withSessionStreamRouting({ type: 'error', code, message: msg }, { sessionId, sessionKey, agentId }));
+    } catch {}
+    return { ok: false, mode: 'turn', error: code, text: finalText, logPath, usage: null };
   }
 
   if (!finalText && !sawAssistantText){
@@ -2763,15 +3279,15 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
         usageTotalTokens: usage.totalTokens,
       };
       const promptEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT');
-      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL');
+      const promptFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_PROMPT_FULL') || chatLogAllFullEnabled();
       const includePrompt = promptEnv || promptFullEnv;
       const promptText = payloadMsg;
-      const promptMaxChars = promptFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
+      const promptMaxChars = promptFullEnv ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS;
       const reqEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST');
-      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL');
+      const reqFullEnv = truthyEnv('ARCANA_GATEWAY_V2_CHAT_LOG_REQUEST_FULL') || chatLogAllFullEnabled();
       const includeModelRequest = !!(modelRequest && (reqEnv || reqFullEnv));
-      const modelRequestMaxChars = reqFullEnv ? MAX_PROMPT_LOG_CHARS_FULL : MAX_PROMPT_LOG_CHARS;
-      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars });
+      const modelRequestMaxChars = reqFullEnv ? fullChatLogMaxChars() : MAX_PROMPT_LOG_CHARS;
+      await writeChatLog({ logPath: lp, headerLines, promptText, includePrompt, errorStack: null, stats, diagnostics, promptMaxChars, modelRequest, includeModelRequest, modelRequestMaxChars, captureSummary: chatLogAllFullEnabled() });
       logPath = lp;
       warning = (toolCalls > 0 || assistantBlockTypes.size > 0)
         ? 'empty_completion_after_tools'
@@ -2785,14 +3301,60 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
 
   const responseUsage = usage && (usage.totalTokens > 0 || usage.contextTokens > 0 || usage.outputTokens > 0)
     ? {
-      inputTokens: usage.contextTokens,
+      inputTokens: usage.inputTokens || Math.max(0, (usage.contextTokens || 0) - (usage.cacheReadTokens || 0) - (usage.cacheWriteTokens || 0)),
+      contextTokens: usage.contextTokens,
+      cacheReadTokens: usage.cacheReadTokens || 0,
+      cacheWriteTokens: usage.cacheWriteTokens || 0,
       outputTokens: usage.outputTokens,
       totalTokens: usage.totalTokens,
-      lastCallInputTokens: usage.lastCallContextTokens || 0,
+      lastCallInputTokens: usage.lastCallInputTokens || Math.max(0, (usage.lastCallContextTokens || 0) - (usage.lastCallCacheReadTokens || 0) - (usage.lastCallCacheWriteTokens || 0)),
+      lastCallCacheReadTokens: usage.lastCallCacheReadTokens || 0,
+      lastCallCacheWriteTokens: usage.lastCallCacheWriteTokens || 0,
+      lastCallContextTokens: usage.lastCallContextTokens || 0,
       lastCallTotalTokens: usage.lastCallTotalTokens || 0,
       ...(usageModelLabel ? { model: usageModelLabel } : {}),
     }
     : null;
+
+  if (chatLogAllFullEnabled() && !logPath && finalText){
+    try {
+      const lp = buildChatLogPath(agentId, sessionKey, sessionId);
+      const headerLines = [
+        '[arcana:gateway-v2] turn_success',
+        'timeMs=' + nowMs(),
+        'agentId=' + String(agentId),
+        'sessionId=' + String(sessionId),
+        'sessionKey=' + String(sessionKey || ''),
+      ];
+      const stats = {
+        thinkingChars,
+        toolCalls,
+        assistantBlockTypes: Array.from(assistantBlockTypes),
+        finishReason: finishReason || null,
+        stopReason: stopReason || null,
+        sawAssistantText: sawAssistantText === true,
+        sessionTokensTotal,
+        usageContextTokens: usage.contextTokens,
+        usageOutputTokens: usage.outputTokens,
+        usageTotalTokens: usage.totalTokens,
+      };
+      await writeChatLog({
+        logPath: lp,
+        headerLines,
+        promptText: payloadMsg,
+        includePrompt: true,
+        errorStack: null,
+        stats,
+        diagnostics,
+        promptMaxChars: fullChatLogMaxChars(),
+        modelRequest,
+        includeModelRequest: !!modelRequest,
+        modelRequestMaxChars: fullChatLogMaxChars(),
+        captureSummary: true,
+      });
+      logPath = lp;
+    } catch {}
+  }
 
   if (warning){
     if (warning === 'empty_completion_after_tools'){
@@ -2804,10 +3366,10 @@ async function runPromptWithSteer({ record, sessionId, sessionKey, message, prel
     }
     return { ok: true, mode: 'turn', text: '', warning, logPath, usage: responseUsage };
   }
-  return { ok: true, mode: 'turn', text: finalText, usage: responseUsage };
+  return { ok: true, mode: 'turn', text: finalText, logPath, usage: responseUsage };
 }
 
-export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId, workspaceRoot: rawWorkspaceRoot, agentHomeRoot: rawAgentHomeRoot, text: rawText, policy: rawPolicy, title, sync, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, clientTurnId: rawClientTurnId, attachments: rawAttachments }){
+export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId, workspaceRoot: rawWorkspaceRoot, agentHomeRoot: rawAgentHomeRoot, text: rawText, policy: rawPolicy, title, sync, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, systemPromptOverride, clientTurnId: rawClientTurnId, attachments: rawAttachments }){
   const agentId = normalizeAgentId(rawAgentId || DEFAULT_AGENT_ID);
   const policy = String(rawPolicy || 'restricted').toLowerCase() === 'open' ? 'open' : 'restricted';
   const trimmed = trimUserMessage(String(rawText || '').trim(), DEFAULT_CONTEXT_POLICY);
@@ -2825,6 +3387,7 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
     localToolProxyEnabled: !!localToolProxy,
     toolAllowlistCount: Array.isArray(toolAllowlist) ? toolAllowlist.length : 0,
     localAgentSignature: buildLocalAgentSignature(localAgentSignature),
+    systemPromptOverrideActive: !!normalizeSystemPromptOverride(systemPromptOverride),
     localToolDefinitions: summarizeInjectedLocalToolDefinitionsForDebug(localToolDefinitions),
     attachmentCount: attachments.length,
   });
@@ -2869,10 +3432,11 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
       toolRouting,
       localToolProxy,
       toolAllowlist,
-      localToolDefinitions,
-      localBootstrapFiles,
-      localAgentSignature,
-    });
+    localToolDefinitions,
+    localBootstrapFiles,
+    localAgentSignature,
+    systemPromptOverride,
+  });
   } catch (e) {
     const code = String((e && e.code) || '').toUpperCase();
     const message = String((e && e.message) || e || 'Failed to start chat session');
@@ -2952,14 +3516,34 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
                   keepRecentUserTurns: keepTurns,
                 });
                 try {
-                  if (session && typeof session.newSession === 'function'){
+                  let rotatedReloaded = false;
+                  try { historyObj = ssLoad(sessionId, { agentId }); } catch {}
+                  const contextPath = session && session.__arcana_context_file ? String(session.__arcana_context_file || '') : '';
+                  if (contextPath){
+                    const rotated = rotateContextAfterCompaction({
+                      agentId,
+                      sessionId,
+                      workspaceRoot: ws,
+                      historyObj,
+                      keepRecentUserTurns: keepTurns,
+                      config: record && record.contextConfig,
+                    });
+                    if (rotated && rotated.ok){
+                      rotatedReloaded = reloadSessionRuntimeFromContext(session, rotated.contextPath);
+                      chatContextDebugLog('turn:context-rotated', {
+                        sessionId,
+                        agentId,
+                        phase: 'run_chat_message',
+                        contextPath: rotated.contextPath,
+                        archivedPath: rotated.archivedPath || '',
+                        retainedMessages: rotated.retainedMessages || 0,
+                        reloaded: rotatedReloaded,
+                      });
+                    }
+                  }
+                  if (!rotatedReloaded && !resetSessionRuntimeMessages(session) && session && typeof session.newSession === 'function'){
                     const p = session.newSession();
                     if (p && typeof p.then === 'function') await p;
-                  } else {
-                    const agent = session && session.agent ? session.agent : null;
-                    if (agent && typeof agent.replaceMessages === 'function'){
-                      agent.replaceMessages([]);
-                    }
                   }
                 } catch {}
 
@@ -2995,31 +3579,43 @@ export async function runChatMessage({ agentId: rawAgentId, sessionKey, sessionI
 
   const isSteer = !!(session && session.isStreaming);
   const turnEndCountBefore = Number(record && record.__arcana_turnEndCount) || 0;
-  const result = await runPromptWithSteer({ record, sessionId, sessionKey, message: promptText, prelude, isSteer, attachments });
-  if (!isSteer && result && result.ok !== false){
-    ensureAssistantTextDelivered({
-      record,
-      sessionId,
-      sessionKey,
-      agentId,
-      text: result.text || '',
-    });
-    ensureTurnEndDelivered({
-      record,
-      sessionId,
-      sessionKey,
-      agentId,
-      turnEndCountBefore,
-      force: true,
-    });
+  let result = null;
+  try {
+    result = await runPromptWithSteer({ record, sessionId, sessionKey, message: promptText, prelude, isSteer, attachments, clientTurnId });
+    if (!isSteer && result && result.ok !== false){
+      ensureAssistantTextDelivered({
+        record,
+        sessionId,
+        sessionKey,
+        agentId,
+        text: result.text || '',
+      });
+      ensureTurnEndDelivered({
+        record,
+        sessionId,
+        sessionKey,
+        agentId,
+        turnEndCountBefore,
+        force: true,
+      });
+    }
+  } finally {
+    try { forceFlushContextSession(session); } catch {}
+    try { if (!session || !session.isStreaming) releaseChatSessionRecord(record); } catch {}
   }
 
-  if (!sync){
-    return { ok: result.ok !== false, mode: result.mode, sessionId, text: result.text || '', error: result.error, warning: result.warning, logPath: result.logPath, usage: result.usage || null };
-  }
-
-  const assistantText = result.text || '';
-  return { ok: result.ok !== false, mode: result.mode, sessionId, text: assistantText, error: result.error, warning: result.warning, logPath: result.logPath, usage: result.usage || null };
+  const response = {
+    ok: result && result.ok !== false,
+    mode: result && result.mode,
+    sessionId,
+    text: result && result.text ? result.text : '',
+    error: result && result.error,
+    warning: result && result.warning,
+    logPath: result && result.logPath,
+    usage: result && result.usage || null,
+  };
+  if (!sync) return response;
+  return response;
 }
 
 export async function abortChat({ agentId: rawAgentId, sessionKey, sessionId: rawSessionId }){
@@ -3071,52 +3667,17 @@ export async function clearChatContext({ agentId: rawAgentId, sessionKey, sessio
   try { await ensureChatSession({ sessionId, sessionKey, agentId, policy: 'restricted' }); } catch {}
 
   let cleared = false;
-  for (const rec of chatSessions.values()){
+  for (const rec of Array.from(chatSessions.values())){
     if (!rec || rec.agentId !== agentId) continue;
     if (String(rec.sessionId || '') !== sessionId) continue;
 
     const sess = rec.session;
-    const agent = sess && sess.agent ? sess.agent : null;
-    let thisCleared = false;
-
-    if (sess && typeof sess.newSession === 'function'){
-      try {
-        const p = sess.newSession();
-        if (p && typeof p.then === 'function'){
-          await p;
-        }
-        thisCleared = true;
-      } catch {}
-    }
-
-    if (!thisCleared && agent){
-      try {
-        if (typeof agent.reset === 'function'){
-          const p = agent.reset();
-          if (p && typeof p.then === 'function'){
-            await p;
-          }
-          thisCleared = true;
-        } else if (typeof agent.clearMessages === 'function'){
-          agent.clearMessages();
-          thisCleared = true;
-        }
-      } catch {}
-    }
-
-    if (!thisCleared && sess && typeof sess.reset === 'function'){
-      try {
-        const p = sess.reset();
-        if (p && typeof p.then === 'function'){
-          await p;
-        }
-        thisCleared = true;
-      } catch {}
-    }
-
+    let thisCleared = resetSessionRuntimeMessages(sess);
     if (thisCleared) cleared = true;
+    try { releaseChatSessionRecord(rec); } catch {}
   }
-  return { ok: cleared };
+  const diskCleared = deleteContextFile({ agentId, sessionId });
+  return { ok: cleared || diskCleared };
 }
 
 export default {

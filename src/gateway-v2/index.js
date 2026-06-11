@@ -746,6 +746,17 @@ export async function startGatewayV2({ port } = {}) {
             let contextTokens = Number(
               data.contextTokens ?? data.context_tokens ?? ev.contextTokens ?? ev.context_tokens ?? 0,
             ) || 0;
+            let inputTokens = Number(
+              data.inputTokens ?? data.input_tokens ?? ev.inputTokens ?? ev.input_tokens ?? 0,
+            ) || 0;
+            let cacheReadTokens = Number(
+              data.cacheReadTokens ?? data.cache_read_tokens ?? data.cacheRead ?? data.cache_read ??
+              ev.cacheReadTokens ?? ev.cache_read_tokens ?? ev.cacheRead ?? ev.cache_read ?? 0,
+            ) || 0;
+            let cacheWriteTokens = Number(
+              data.cacheWriteTokens ?? data.cache_write_tokens ?? data.cacheWrite ?? data.cache_write ??
+              ev.cacheWriteTokens ?? ev.cache_write_tokens ?? ev.cacheWrite ?? ev.cache_write ?? 0,
+            ) || 0;
             let outputTokens = Number(
               data.outputTokens ?? data.output_tokens ?? ev.outputTokens ?? ev.output_tokens ?? 0,
             ) || 0;
@@ -758,12 +769,29 @@ export async function startGatewayV2({ port } = {}) {
             let lastCallContextTokens = Number(
               data.lastCallContextTokens ?? data.last_call_context_tokens ?? ev.lastCallContextTokens ?? ev.last_call_context_tokens ?? 0,
             ) || 0;
+            let lastCallInputTokens = Number(
+              data.lastCallInputTokens ?? data.last_call_input_tokens ?? ev.lastCallInputTokens ?? ev.last_call_input_tokens ?? 0,
+            ) || 0;
+            let lastCallCacheReadTokens = Number(
+              data.lastCallCacheReadTokens ?? data.last_call_cache_read_tokens ??
+              ev.lastCallCacheReadTokens ?? ev.last_call_cache_read_tokens ?? 0,
+            ) || 0;
+            let lastCallCacheWriteTokens = Number(
+              data.lastCallCacheWriteTokens ?? data.last_call_cache_write_tokens ??
+              ev.lastCallCacheWriteTokens ?? ev.last_call_cache_write_tokens ?? 0,
+            ) || 0;
             let lastCallTotalTokens = Number(
               data.lastCallTotalTokens ?? data.last_call_total_tokens ?? ev.lastCallTotalTokens ?? ev.last_call_total_tokens ?? 0,
             ) || 0;
 
+            if (!contextTokens && (inputTokens || cacheReadTokens || cacheWriteTokens)){
+              contextTokens = inputTokens + cacheReadTokens + cacheWriteTokens;
+            }
             if (!totalTokens && (contextTokens || outputTokens)){
               totalTokens = contextTokens + outputTokens;
+            }
+            if (!lastCallContextTokens && (lastCallInputTokens || lastCallCacheReadTokens || lastCallCacheWriteTokens)){
+              lastCallContextTokens = lastCallInputTokens + lastCallCacheReadTokens + lastCallCacheWriteTokens;
             }
 
             if (contextTokens > 0 || outputTokens > 0 || totalTokens > 0 || sessionTokens > 0){
@@ -783,6 +811,13 @@ export async function startGatewayV2({ port } = {}) {
                   model = String(ev.model);
                 }
               } catch {}
+              let clientTurnId = '';
+              try {
+                const rawClientTurnId = data.clientTurnId ?? data.client_turn_id ?? ev.clientTurnId ?? ev.client_turn_id;
+                if (rawClientTurnId != null && String(rawClientTurnId).trim()){
+                  clientTurnId = String(rawClientTurnId).trim();
+                }
+              } catch {}
 
               void eventStore.appendEvent({
                 agentId,
@@ -792,13 +827,20 @@ export async function startGatewayV2({ port } = {}) {
                 tsMs,
                 data: {
                   sessionId,
+                  inputTokens,
+                  cacheReadTokens,
+                  cacheWriteTokens,
                   contextTokens,
                   outputTokens,
                   totalTokens,
+                  lastCallInputTokens: lastCallInputTokens || undefined,
+                  lastCallCacheReadTokens: lastCallCacheReadTokens || undefined,
+                  lastCallCacheWriteTokens: lastCallCacheWriteTokens || undefined,
                   lastCallContextTokens: lastCallContextTokens || undefined,
                   lastCallTotalTokens: lastCallTotalTokens || undefined,
                   sessionTokens,
                   model: model || undefined,
+                  clientTurnId: clientTurnId || undefined,
                 },
               }).catch(() => {});
 
@@ -807,14 +849,21 @@ export async function startGatewayV2({ port } = {}) {
                 agentId,
                 sessionKey,
                 sessionId,
+                inputTokens,
+                cacheReadTokens,
+                cacheWriteTokens,
                 contextTokens,
                 outputTokens,
                 totalTokens,
+                lastCallInputTokens,
+                lastCallCacheReadTokens,
+                lastCallCacheWriteTokens,
                 lastCallContextTokens,
                 lastCallTotalTokens,
                 sessionTokens,
               };
               if (model) normalizedEv.model = model;
+              if (clientTurnId) normalizedEv.clientTurnId = clientTurnId;
               if (tsMs) normalizedEv.tsMs = tsMs;
 
               wsHub.broadcast(normalizedEv);
@@ -1007,6 +1056,7 @@ export async function startGatewayV2({ port } = {}) {
         const localToolDefinitions = Array.isArray(body && body.localToolDefinitions) ? body.localToolDefinitions : [];
         const localBootstrapFiles = Array.isArray(body && body.localBootstrapFiles) ? body.localBootstrapFiles : [];
         const localAgentSignature = body && body.localAgentSignature ? String(body.localAgentSignature) : '';
+        const systemPromptOverride = typeof (body && body.systemPromptOverride) === 'string' ? body.systemPromptOverride : '';
         const clientTurnId = body && body.clientTurnId ? String(body.clientTurnId).trim() : '';
         const workspaceRoot = normalizeWorkspaceRootOverride(body && (body.workspaceRoot || body.projectRootDir));
         const agentHomeRoot = normalizeAgentHomeRootOverride(body && (body.agentHomeRoot || body.agentHomeDir));
@@ -1077,6 +1127,7 @@ export async function startGatewayV2({ port } = {}) {
               localToolDefinitions,
               localBootstrapFiles,
               localAgentSignature,
+              systemPromptOverride,
               clientTurnId,
               attachments,
             }).then((chat) => {
@@ -1399,6 +1450,7 @@ export async function startGatewayV2({ port } = {}) {
         const localToolDefinitions = Array.isArray(body && body.localToolDefinitions) ? body.localToolDefinitions : [];
         const localBootstrapFiles = Array.isArray(body && body.localBootstrapFiles) ? body.localBootstrapFiles : [];
         const localAgentSignature = body && body.localAgentSignature ? String(body.localAgentSignature) : '';
+        const systemPromptOverride = typeof (body && body.systemPromptOverride) === 'string' ? body.systemPromptOverride : '';
         const clientTurnId = body && body.clientTurnId ? String(body.clientTurnId).trim() : '';
         const workspaceRoot = normalizeWorkspaceRootOverride(body && (body.workspaceRoot || body.projectRootDir));
         const agentHomeRoot = normalizeAgentHomeRootOverride(body && (body.agentHomeRoot || body.agentHomeDir));
@@ -1476,7 +1528,7 @@ export async function startGatewayV2({ port } = {}) {
           }
         }
 
-        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: false, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, clientTurnId, attachments });
+        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: false, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, systemPromptOverride, clientTurnId, attachments });
         if (!chat || chat.ok === false){
           const errMsg = chat && chat.error ? String(chat.error) : 'turn_failed';
           const status = chat && typeof chat.status === 'number' ? chat.status : 500;
@@ -1528,6 +1580,7 @@ export async function startGatewayV2({ port } = {}) {
         const localToolDefinitions = Array.isArray(body && body.localToolDefinitions) ? body.localToolDefinitions : [];
         const localBootstrapFiles = Array.isArray(body && body.localBootstrapFiles) ? body.localBootstrapFiles : [];
         const localAgentSignature = body && body.localAgentSignature ? String(body.localAgentSignature) : '';
+        const systemPromptOverride = typeof (body && body.systemPromptOverride) === 'string' ? body.systemPromptOverride : '';
         const clientTurnId = body && body.clientTurnId ? String(body.clientTurnId).trim() : '';
         const workspaceRoot = normalizeWorkspaceRootOverride(body && (body.workspaceRoot || body.projectRootDir));
         const agentHomeRoot = normalizeAgentHomeRootOverride(body && (body.agentHomeRoot || body.agentHomeDir));
@@ -1594,7 +1647,7 @@ export async function startGatewayV2({ port } = {}) {
           }
         }
 
-        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: true, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, clientTurnId, attachments });
+        const chat = await runChatMessage({ agentId, sessionKey, sessionId: sessionIdRaw || null, workspaceRoot, agentHomeRoot, text, policy, title: 'Arcana Web', sync: true, toolRouting, localToolProxy, toolAllowlist, localToolDefinitions, localBootstrapFiles, localAgentSignature, systemPromptOverride, clientTurnId, attachments });
         if (!chat || chat.ok === false){
           const status = chat && typeof chat.status === 'number' ? chat.status : 500;
           const respBody = {

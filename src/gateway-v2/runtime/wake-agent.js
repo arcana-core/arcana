@@ -282,6 +282,9 @@ function validateDecision(raw){
 
 async function decideWakeLLM(runResult, options = {}){
   const fallback = decideWake(runResult);
+  if (runResult && runResult.ok && runResult.hasOutput){
+    return fallback;
+  }
   const blockedDecision = ruleStopIfBlocked(runResult, buildRunResultSummary(runResult));
   const concurrencyDecision = decideConcurrencyRetry(runResult, buildRunResultSummary(runResult));
   if (concurrencyDecision){
