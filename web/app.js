@@ -262,6 +262,80 @@ function takePendingAssistantBubble(replyId, msgSessionId){
   return null;
 }
 
+// Item-lifecycle protocol: server identifies each assistant message with an
+// itemId (item_started / item_updated / item_completed). Bubbles are keyed by
+// itemId so multiple messages in one turn render separately and re-delivered
+// events update in place instead of duplicating.
+const itemBubbles = new Map(); // itemId -> bubble element
+let itemBubblesSession = ''; // sessionId the registry belongs to
+
+function resetItemBubbles(){
+  try { itemBubbles.clear(); } catch {}
+  itemBubblesSession = '';
+}
+
+function claimItemBubble(itemId, sessionId){
+  const id = String(itemId || '').trim();
+  if (!id) return null;
+  const sid = String(sessionId || '');
+  if (itemBubblesSession !== sid){
+    resetItemBubbles();
+    itemBubblesSession = sid;
+  }
+  let bubble = itemBubbles.get(id) || null;
+  if (bubble && bubble.isConnected === false){
+    try { itemBubbles.delete(id); } catch {}
+    bubble = null;
+  }
+  if (!bubble){
+    // First item of a turn claims the pending typing bubble created on send;
+    // later items (text after a tool call) get their own bubble.
+    if (activeAssistant && activeAssistant.isConnected !== false && !activeAssistant.__arcanaItemId){
+      bubble = activeAssistant;
+    } else {
+      bubble = appendMessage('assistant', '');
+    }
+    if (!bubble) return null;
+    try { bubble.__arcanaItemId = id; } catch {}
+    itemBubbles.set(id, bubble);
+  }
+  activeAssistant = bubble;
+  return bubble;
+}
+
+function appendMediaRefsToBubble(bubble, refs){
+  if (!bubble || !Array.isArray(refs) || !refs.length) return;
+  const parts = ensureBubbleParts(bubble);
+  const mediaEl = parts && parts.media;
+  if (!mediaEl) return;
+  let sidCurrent = '';
+  try { sidCurrent = String((typeof getCurrentSessionId === 'function' ? getCurrentSessionId() : currentId) || ''); } catch{}
+  const existingSrcs = new Set();
+  try { for (const img of mediaEl.querySelectorAll('img')) existingSrcs.add(img.src); } catch{}
+  for (const refRaw of refs){
+    const ref = String(refRaw || '').trim();
+    if (!ref) continue;
+    const lower = ref.toLowerCase();
+    let src = ref;
+    if (!(lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:'))){
+      const pathParam = encodeURIComponent(ref);
+      const sidParam = sidCurrent ? '&sessionId=' + encodeURIComponent(sidCurrent) : '';
+      src = '/api/local-file?path=' + pathParam + sidParam;
+    }
+    let isDup = false;
+    try { for (const existing of existingSrcs) { if (existing.includes(encodeURIComponent(ref)) || existing === src) { isDup = true; break; } } } catch{}
+    if (isDup) continue;
+    const img = document.createElement('img');
+    img.src = src;
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '6px';
+    img.style.display = 'block';
+    img.style.marginTop = '8px';
+    mediaEl.appendChild(img);
+    try { existingSrcs.add(src); } catch {}
+  }
+}
+
 function hasVoiceOpenIntent(text){
   try{
     const raw = String(text || '');
@@ -4520,6 +4594,7 @@ async function openSession(id, agentId){
   if (prevId && prevId !== sid){
     try{ gatewayV2Pending.clear(); } catch{}
     activeAssistant = null;
+    resetItemBubbles();
   }
   try{
     bindGatewayV2ReactorToSession(sid).catch(()=>{});
@@ -4591,6 +4666,7 @@ async function openGroup(id){
   try { syncGatewayV2Subscription(); } catch {}
   renderMessages([]);
   activeAssistant = null;
+  resetItemBubbles();
   const obj = await loadGroupSession(gid);
   if (!obj) return;
   currentGroupEvents = dedupeGroupEvents(Array.isArray(obj.events) ? obj.events : []);
@@ -5989,12 +6065,46 @@ function handleArcanaEvent(data){
         return;
       }
 
+      if (data.type === 'item_started' || data.type === 'item_updated' || data.type === 'item_completed'){
+        if (data.sessionId && data.sessionId !== currentId){ return; }
+        const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
+        const bubble = claimItemBubble(data.itemId, sid2);
+        if (!bubble) return;
+        if (data.type === 'item_started'){
+          setTyping(bubble, true);
+          return;
+        }
+        setTyping(bubble, false);
+        const itemText = typeof data.text === 'string' ? data.text : '';
+        try {
+          const snap = ensureLiveForSession(sid2);
+          const ti = getTurnIndexForEvent(sid2, snap);
+          upsertLlmAction(sid2, ti, { argsSummary: 'Output: ' + itemText.length + ' chars' });
+        } catch {}
+        {
+          const parts = ensureBubbleParts(bubble);
+          if (parts && parts.text) parts.text.textContent = itemText;
+          else bubble.textContent = itemText;
+        }
+        appendMediaRefsToBubble(bubble, data.mediaRefs);
+        if (data.type === 'item_completed'){
+          try { bubble.__arcanaItemCompleted = true; } catch {}
+        }
+        messages.scrollTop = messages.scrollHeight;
+        try { if (currentId) markSessionSeen(currentId); } catch {}
+        return;
+      }
       if (data.type === 'assistant_text'){
         // For non-current sessions, skip UI updates; list refresh happens on turn_end.
         if (data.sessionId && data.sessionId !== currentId){
           return;
         }
         const sid2 = data.sessionId || streamingId; if (sid2 !== currentId) return;
+        if (itemBubbles.size && itemBubblesSession === sid2){
+          // The item-lifecycle events already render this session's stream;
+          // the legacy snapshot would double-render into a second bubble.
+          return;
+        }
         // Extract MEDIA refs from text so they render as images instead of raw text
         const extracted = extractMediaFromAssistantText(data.text || '');
         const cleanText = extracted && typeof extracted.text === 'string' ? extracted.text : (data.text || '');

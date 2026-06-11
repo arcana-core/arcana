@@ -224,7 +224,7 @@ export function saveSession(obj, opts){
   }
 }
 
-export function appendMessage(sessionId, { role, text, agentId, mediaRefs } = {}){
+export function appendMessage(sessionId, { role, text, agentId, mediaRefs, itemId } = {}){
   const id = String(sessionId || '').trim();
   if (!id) return null;
   const normAgentId = normalizeAgentId(agentId);
@@ -253,6 +253,8 @@ export function appendMessage(sessionId, { role, text, agentId, mediaRefs } = {}
       : [];
     const message = { role: roleStr, text: textStr, ts: nowIso() };
     if (normalizedMediaRefs.length) message.mediaRefs = normalizedMediaRefs;
+    const itemIdStr = String(itemId || '').trim();
+    if (itemIdStr) message.itemId = itemIdStr;
     obj.messages.push(message);
 
     if (hadNoMessages && String(roleStr || '').toLowerCase() === 'user'){

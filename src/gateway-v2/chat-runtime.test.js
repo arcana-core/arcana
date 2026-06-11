@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  attachChatEventBridge,
   attachLocalToolProxyHub,
   buildChatCaptureSummary,
   buildLocalAgentSignature,
@@ -738,5 +739,147 @@ test('emitUserMessageDelivered broadcasts a session-scoped user message', () => 
     }]);
   } finally {
     eventBus.off('event', listener);
+  }
+});
+
+function setupBridgeProbe(){
+  const previousHome = process.env.ARCANA_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'arcana-chat-runtime-test-'));
+  process.env.ARCANA_HOME = home;
+  const events = [];
+  const listener = (event) => events.push(event);
+  eventBus.on('event', listener);
+  let handler = null;
+  const session = createSession({ title: 'Probe', workspace: home, agentId: 'cutpilot' });
+  const fakeSess = { subscribe(fn){ handler = fn; } };
+  const record = {
+    session: fakeSess,
+    agentId: 'cutpilot',
+    sessionKey: 'cp:cutpilot:project:client',
+    agentHomeDir: home,
+    workspaceRoot: home,
+  };
+  const cleanup = () => {
+    eventBus.off('event', listener);
+    if (previousHome == null) delete process.env.ARCANA_HOME;
+    else process.env.ARCANA_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  };
+  return {
+    events,
+    record,
+    sessionId: session.id,
+    attach(){ attachChatEventBridge(record, session.id); return handler; },
+    cleanup,
+  };
+}
+
+test('chat event bridge assigns one itemId per assistant message in a turn', () => {
+  const probe = setupBridgeProbe();
+  try {
+    const handler = probe.attach();
+    handler({ type: 'turn_start' });
+    handler({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    handler({ type: 'message_update', message: { role: 'assistant', content: [{ type: 'text', text: 'First' }] } });
+    handler({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'First answer' }] } });
+    handler({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    handler({ type: 'message_update', message: { role: 'assistant', content: [{ type: 'text', text: 'Second' }] } });
+    handler({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'Second answer' }] } });
+    handler({ type: 'turn_end' });
+
+    const itemEvents = probe.events.filter((ev) => String(ev.type || '').startsWith('item_'));
+    assert.deepEqual(itemEvents.map((ev) => ev.type), [
+      'item_started', 'item_updated', 'item_completed',
+      'item_started', 'item_updated', 'item_completed',
+    ]);
+    const firstId = itemEvents[0].itemId;
+    const secondId = itemEvents[3].itemId;
+    assert.ok(firstId && secondId, 'item ids assigned');
+    assert.notEqual(firstId, secondId, 'each assistant message gets its own item');
+    assert.deepEqual(itemEvents.slice(0, 3).map((ev) => ev.itemId), [firstId, firstId, firstId]);
+    assert.deepEqual(itemEvents.slice(3).map((ev) => ev.itemId), [secondId, secondId, secondId]);
+    assert.equal(itemEvents[2].text, 'First answer');
+    assert.equal(itemEvents[5].text, 'Second answer');
+
+    const turnStart = probe.events.find((ev) => ev.type === 'turn_start');
+    const turnEnd = probe.events.find((ev) => ev.type === 'turn_end');
+    assert.ok(turnStart.turnId, 'turn_start carries turnId');
+    assert.equal(turnEnd.turnId, turnStart.turnId);
+    for (const ev of itemEvents){
+      assert.equal(ev.turnId, turnStart.turnId);
+    }
+
+    const seqs = probe.events.filter((ev) => typeof ev.seq === 'number').map((ev) => ev.seq);
+    const sorted = [...seqs].sort((a, b) => a - b);
+    assert.deepEqual(seqs, sorted, 'seq is monotonic');
+    assert.equal(new Set(seqs).size, seqs.length, 'seq has no duplicates');
+
+    // Legacy snapshots still flow for older consumers.
+    assert.deepEqual(
+      probe.events.filter((ev) => ev.type === 'assistant_text').map((ev) => ev.text),
+      ['First', 'First answer', 'Second', 'Second answer'],
+    );
+
+    // History rows carry the itemId for future uuid-based dedup.
+    const loaded = loadSession(probe.sessionId, { agentId: 'cutpilot' });
+    const assistantRows = (loaded.messages || []).filter((m) => m.role === 'assistant');
+    assert.deepEqual(assistantRows.map((m) => m.text), ['First answer', 'Second answer']);
+    assert.deepEqual(assistantRows.map((m) => m.itemId), [firstId, secondId]);
+  } finally {
+    probe.cleanup();
+  }
+});
+
+test('chat event bridge skips SDK tool events for locally proxied tools', () => {
+  const probe = setupBridgeProbe();
+  try {
+    probe.record.localToolProxyEnabled = true;
+    probe.record.injectedLocalToolNames = new Set(['client_tool']);
+    probe.record.toolRouting = { tools: { routed_local: { execution: 'local', fallback: 'deny' } } };
+    const handler = probe.attach();
+    handler({ type: 'tool_execution_start', toolName: 'client_tool', toolCallId: 'c1', args: {} });
+    handler({ type: 'tool_execution_end', toolName: 'client_tool', toolCallId: 'c1' });
+    handler({ type: 'tool_execution_start', toolName: 'routed_local', toolCallId: 'c2', args: {} });
+    handler({ type: 'tool_execution_start', toolName: 'host_tool', toolCallId: 'c3', args: {} });
+
+    const toolEvents = probe.events.filter((ev) => String(ev.type || '').startsWith('tool_execution'));
+    assert.deepEqual(toolEvents.map((ev) => [ev.type, ev.toolName]), [
+      ['tool_execution_start', 'host_tool'],
+    ]);
+  } finally {
+    probe.cleanup();
+  }
+});
+
+test('ensureAssistantTextDelivered re-delivers as idempotent item_completed', () => {
+  const previousHome = process.env.ARCANA_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'arcana-chat-runtime-test-'));
+  process.env.ARCANA_HOME = home;
+  const events = [];
+  const listener = (event) => events.push(event);
+  eventBus.on('event', listener);
+  try {
+    const session = createSession({ title: 'Probe', workspace: home, agentId: 'cutpilot' });
+    const record = {
+      __arcana_lastAssistantItemId: 'item-abc',
+      __arcana_currentTurnId: 'turn-xyz',
+    };
+    assert.equal(ensureAssistantTextDelivered({
+      record,
+      sessionId: session.id,
+      sessionKey: 'cp:cutpilot:project:client',
+      agentId: 'cutpilot',
+      text: 'Recovered final text',
+    }), true);
+    const completed = events.filter((ev) => ev.type === 'item_completed');
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].itemId, 'item-abc');
+    assert.equal(completed[0].turnId, 'turn-xyz');
+    assert.equal(completed[0].text, 'Recovered final text');
+  } finally {
+    eventBus.off('event', listener);
+    if (previousHome == null) delete process.env.ARCANA_HOME;
+    else process.env.ARCANA_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
   }
 });

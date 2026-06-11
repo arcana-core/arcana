@@ -24,6 +24,8 @@ import {
 } from '../context-manager.js';
 import { buildErrorStack } from '../util/error.js';
 import { nowMs, ensureDir } from './util.js';
+import { nextEventSeq, newTurnId, newItemId } from './events.js';
+import { resolveToolRoute } from '../tool-routing.js';
 import { persistToolMetaToDisk, persistToolResultToDisk, scheduleAppendToolStream } from '../tool-output-store.js';
 import { thinkingStart, appendThinkingDelta, thinkingEnd } from '../thinking-output-store.js';
 import { mergeStreamingText, mergeTextBlocks } from '../streaming-text.js';
@@ -1261,6 +1263,12 @@ async function ensureChatSession({ sessionId, sessionKey, agentId, policy, works
     sessionId: sid || 'default',
     sessionKey: sessionKeyNormalized,
     localToolProxyEnabled,
+    toolRouting: toolRouting || null,
+    injectedLocalToolNames: new Set(
+      (Array.isArray(localToolDefinitions) ? localToolDefinitions : [])
+        .map((d) => (d && typeof d.name === 'string') ? d.name.trim() : '')
+        .filter(Boolean),
+    ),
     toolRoutingSignature,
     toolAllowlistSignature,
     localToolDefinitionsSignature,
@@ -2120,7 +2128,7 @@ function dedupeNormalizedMediaRefs(refs){
   return out;
 }
 
-function attachChatEventBridge(record, sessionId){
+export function attachChatEventBridge(record, sessionId){
   const sess = record && record.session;
   if (!sess || typeof sess.subscribe !== 'function') return;
   if (sess.__arcana_chat_bridged) return;
@@ -2129,6 +2137,31 @@ function attachChatEventBridge(record, sessionId){
   const agentId = record.agentId;
   const agentHomeDir = record.agentHomeDir;
   const workspaceRoot = record.workspaceRoot;
+  // NOTE: this used to be an undeclared identifier inside this function. Every
+  // bridge emit referencing it threw a swallowed ReferenceError, so the bridge
+  // never actually delivered turn_start/turn_end/assistant_text/tool events —
+  // downstream code compensated with force-re-emits (duplicate source).
+  // Refreshed per event because ensureChatSession may rebind the record's
+  // sessionKey when a cached session is reused under a different key.
+  let sessionKey = String((record && record.sessionKey) || '');
+
+  // Tools routed through the local tool proxy emit their own canonical
+  // tool_execution_* events (source: 'local_tool_proxy') with a proxy callId.
+  // Forwarding the SDK-side events for the same call would render two tool
+  // cards, so the bridge skips them.
+  function isProxiedLocalToolEvent(toolName){
+    if (!record || record.localToolProxyEnabled !== true) return false;
+    const name = String(toolName || '').trim();
+    if (!name) return false;
+    try {
+      if (record.injectedLocalToolNames && record.injectedLocalToolNames.has(name)) return true;
+    } catch {}
+    try {
+      const route = resolveToolRoute(record.toolRouting, name);
+      if (route && route.execution === 'local') return true;
+    } catch {}
+    return false;
+  }
 
   // Per-session usage totals for llm_usage
   let runInputTokens = 0;
@@ -2148,11 +2181,25 @@ function attachChatEventBridge(record, sessionId){
   const mediaRefsSeen = new Set();
   let assistantRawText = '';
   let lastAssistantTextEmitted = '';
+  // Item-lifecycle protocol state: one itemId per assistant message so the
+  // client can render each message in its own bubble and dedupe re-delivery.
+  let currentTurnId = '';
+  let currentAssistantItemId = '';
+
+  function emitItemEvent(event){
+    try {
+      const payload = withSessionStreamRouting({ ...event }, { sessionId, sessionKey, agentId });
+      if (currentTurnId && !payload.turnId) payload.turnId = currentTurnId;
+      payload.seq = nextEventSeq(sessionId);
+      emit(payload);
+    } catch {}
+  }
 
   sess.subscribe((ev) => {
     try {
       if (!ev) return;
       const t = ev.type ? String(ev.type) : '';
+      sessionKey = String((record && record.sessionKey) || '');
 
       if (t === 'turn_start'){
         // Maintain a stable, per-session turnIndex counter in-memory during the
@@ -2163,8 +2210,11 @@ function attachChatEventBridge(record, sessionId){
         const cur = sess.__turnIndexBySession.get(key);
         const next = (typeof cur === 'number' && cur >= 0) ? (cur + 1) : 0;
         sess.__turnIndexBySession.set(key, next);
+        currentTurnId = newTurnId();
+        currentAssistantItemId = '';
+        try { record.__arcana_currentTurnId = currentTurnId; } catch {}
         try { forceFlushContextSession(sess); } catch {}
-        try { emit(withSessionStreamRouting({ type: 'turn_start' }, { sessionId, sessionKey, agentId })); } catch {}
+        emitItemEvent({ type: 'turn_start' });
         return;
       }
 
@@ -2172,7 +2222,8 @@ function attachChatEventBridge(record, sessionId){
         const key = String(sessionId || 'default');
         const idx = (sess.__turnIndexBySession && sess.__turnIndexBySession.get) ? sess.__turnIndexBySession.get(key) : undefined;
         try { record.__arcana_turnEndCount = (Number(record.__arcana_turnEndCount) || 0) + 1; } catch {}
-        try { emit(withSessionStreamRouting({ type: 'turn_end' }, { sessionId, sessionKey, agentId })); } catch {}
+        emitItemEvent({ type: 'turn_end' });
+        currentAssistantItemId = '';
         return;
       }
 
@@ -2189,6 +2240,7 @@ function attachChatEventBridge(record, sessionId){
 
       if (t === 'tool_execution_start'){
         try { forceFlushContextSession(sess); } catch {}
+        if (isProxiedLocalToolEvent(ev.toolName)) return;
         try { persistToolMetaToDisk({ agentId, sessionId, toolCallId: eventToolCallId, toolName: ev.toolName, args: ev.args || {} }); } catch {}
         try { emit(base); } catch {}
 
@@ -2272,6 +2324,7 @@ function attachChatEventBridge(record, sessionId){
       }
 
       if (t === 'tool_execution_update'){
+        if (isProxiedLocalToolEvent(ev.toolName)) return;
         try {
           const raw = (typeof ev.partialResult !== 'undefined') ? ev.partialResult : ev.update;
           if (raw && typeof raw === 'object'){
@@ -2287,6 +2340,10 @@ function attachChatEventBridge(record, sessionId){
       }
 
       if (t === 'tool_execution_end'){
+        if (isProxiedLocalToolEvent(ev.toolName)){
+          try { forceFlushContextSession(sess); } catch {}
+          return;
+        }
         let payload = base;
         try {
           const usage = extractUsageFromToolEvent(ev);
@@ -2334,6 +2391,15 @@ function attachChatEventBridge(record, sessionId){
         return;
       }
 
+      if (t === 'message_start' && ev.message && ev.message.role === 'assistant'){
+        // One item per assistant message: clients render each item in its own
+        // bubble, so text before and after tool calls no longer share one.
+        currentAssistantItemId = newItemId();
+        try { record.__arcana_lastAssistantItemId = currentAssistantItemId; } catch {}
+        emitItemEvent({ type: 'item_started', itemId: currentAssistantItemId, itemType: 'assistant_text' });
+        return;
+      }
+
       if (t === 'message_update' && ev.message && ev.message.role === 'assistant'){
         const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
         const rawText = mergeTextBlocks(blocks);
@@ -2345,6 +2411,18 @@ function attachChatEventBridge(record, sessionId){
           lastAssistantTextEmitted = cleanText;
           try { record.__arcana_lastAssistantTextEmitted = cleanText; } catch {}
           try { emit(withSessionStreamRouting({ type: 'assistant_text', text: cleanText }, { sessionId, sessionKey, agentId })); } catch {}
+          if (!currentAssistantItemId){
+            // Upstream skipped message_start; allocate lazily.
+            currentAssistantItemId = newItemId();
+            try { record.__arcana_lastAssistantItemId = currentAssistantItemId; } catch {}
+            emitItemEvent({ type: 'item_started', itemId: currentAssistantItemId, itemType: 'assistant_text' });
+          }
+          emitItemEvent({
+            type: 'item_updated',
+            itemId: currentAssistantItemId,
+            text: cleanText,
+            mediaRefs: dedupeNormalizedMediaRefs(mediaRefs),
+          });
         }
         if (mediaRefs.length){
           for (const raw of mediaRefs){
@@ -2370,9 +2448,21 @@ function attachChatEventBridge(record, sessionId){
             try { emit(withSessionStreamRouting({ type: 'assistant_text', text: cleanText }, { sessionId, sessionKey, agentId })); } catch {}
           }
           if (cleanText || mediaRefs.length){
+            if (!currentAssistantItemId){
+              currentAssistantItemId = newItemId();
+              emitItemEvent({ type: 'item_started', itemId: currentAssistantItemId, itemType: 'assistant_text' });
+            }
+            try { record.__arcana_lastAssistantItemId = currentAssistantItemId; } catch {}
             try { record.__arcana_lastAssistantTextPersisted = cleanText; } catch {}
-            try { ssAppend(sessionId, { role: 'assistant', text: cleanText, agentId, mediaRefs }); } catch {}
+            try { ssAppend(sessionId, { role: 'assistant', text: cleanText, agentId, mediaRefs, itemId: currentAssistantItemId }); } catch {}
+            emitItemEvent({
+              type: 'item_completed',
+              itemId: currentAssistantItemId,
+              text: cleanText,
+              mediaRefs,
+            });
           }
+          currentAssistantItemId = '';
           if (mediaRefs.length){
             for (const raw of mediaRefs){
               const ref = normalizeMediaRef(raw);
@@ -2487,6 +2577,20 @@ export function ensureAssistantTextDelivered({ record, sessionId, sessionKey, ag
   try {
     if (finalText.trim() && String(record && record.__arcana_lastAssistantTextEmitted || '') !== finalText){
       emit(withSessionStreamRouting({ type: 'assistant_text', text: finalText }, { sessionId, sessionKey, agentId }));
+      // Re-deliver as item_completed too. Keyed by itemId, so a client that
+      // already rendered this item just refreshes its content in place.
+      const itemId = String(record && record.__arcana_lastAssistantItemId || '') || newItemId();
+      if (record) record.__arcana_lastAssistantItemId = itemId;
+      const itemEvent = withSessionStreamRouting({
+        type: 'item_completed',
+        itemId,
+        text: finalText,
+        mediaRefs,
+      }, { sessionId, sessionKey, agentId });
+      const turnId = String(record && record.__arcana_currentTurnId || '');
+      if (turnId) itemEvent.turnId = turnId;
+      itemEvent.seq = nextEventSeq(sessionId);
+      emit(itemEvent);
       if (record) record.__arcana_lastAssistantTextEmitted = finalText;
       delivered = true;
     }
