@@ -16,6 +16,26 @@ function wsDebugLog(...args){
   } catch {}
 }
 
+function envByteLimit(name, fallback){
+  try {
+    const n = Number(process.env[name] || 0);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  } catch {}
+  return fallback;
+}
+
+// Above the soft limit, high-frequency progressive events are dropped for
+// that client (the next snapshot supersedes them). Above the hard limit the
+// client is effectively dead and nothing more is queued for it.
+const WS_BUFFER_SOFT_LIMIT = envByteLimit('ARCANA_WS_BUFFER_SOFT_LIMIT', 1 * 1024 * 1024);
+const WS_BUFFER_HARD_LIMIT = envByteLimit('ARCANA_WS_BUFFER_HARD_LIMIT', 16 * 1024 * 1024);
+const DROPPABLE_EVENT_TYPES = new Set([
+  'item_updated',
+  'assistant_text',
+  'thinking_delta',
+  'tool_execution_update',
+]);
+
 export function createWsHub(options = {}){
   const getInitialMessages = (options && typeof options.getInitialMessages === 'function')
     ? options.getInitialMessages
@@ -260,6 +280,7 @@ export function createWsHub(options = {}){
     } catch {
       return 0;
     }
+    const type = String(obj && obj.type || '');
     let sent = 0;
     for (const client of clients){
       const ws = client && client.ws;
@@ -267,6 +288,21 @@ export function createWsHub(options = {}){
       if (!shouldDeliver(client, obj)) continue;
       try {
         if (ws.readyState === ws.OPEN){
+          // Backpressure: a slow client otherwise accumulates every streamed
+          // event in the kernel/ws buffer until the process OOMs.
+          const buffered = Number(ws.bufferedAmount || 0);
+          if (buffered >= WS_BUFFER_HARD_LIMIT){
+            client.droppedEvents = (Number(client.droppedEvents) || 0) + 1;
+            wsDebugLog('backpressure_drop', { type, buffered, hard: true, clientId: client.clientId || '' });
+            continue;
+          }
+          if (buffered >= WS_BUFFER_SOFT_LIMIT && DROPPABLE_EVENT_TYPES.has(type)){
+            // Progressive events are superseded by the next snapshot or the
+            // item_completed/turn_end that follows; lifecycle events still flow.
+            client.droppedEvents = (Number(client.droppedEvents) || 0) + 1;
+            wsDebugLog('backpressure_drop', { type, buffered, hard: false, clientId: client.clientId || '' });
+            continue;
+          }
           ws.send(payload);
           sent += 1;
         }

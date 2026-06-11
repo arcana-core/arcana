@@ -208,3 +208,36 @@ test('unscoped events remain process-wide notifications', () => {
   assert.equal(second.sent.length, 1);
   hub.stop();
 });
+
+test('broadcast drops progressive events for a backpressured client but keeps lifecycle events', () => {
+  const hub = createWsHub();
+  const slow = new FakeSocket();
+  slow.bufferedAmount = 2 * 1024 * 1024; // above soft limit, below hard
+  const fast = new FakeSocket();
+
+  hub.addClient(slow, { agentId: 'default', sessionId: 'a', threadKind: 'session' });
+  hub.addClient(fast, { agentId: 'default', sessionId: 'a', threadKind: 'session' });
+
+  const progressive = { type: 'item_updated', agentId: 'default', sessionId: 'a', itemId: 'i1', text: 'partial' };
+  const lifecycle = { type: 'item_completed', agentId: 'default', sessionId: 'a', itemId: 'i1', text: 'final' };
+
+  hub.broadcast(progressive);
+  hub.broadcast(lifecycle);
+
+  assert.deepEqual(slow.sent.map((m) => m.type), ['item_completed'], 'slow client skips progressive, gets lifecycle');
+  assert.deepEqual(fast.sent.map((m) => m.type), ['item_updated', 'item_completed']);
+  hub.stop();
+});
+
+test('broadcast sends nothing to a client past the hard buffer limit', () => {
+  const hub = createWsHub();
+  const dead = new FakeSocket();
+  dead.bufferedAmount = 32 * 1024 * 1024;
+
+  hub.addClient(dead, { agentId: 'default', sessionId: 'a', threadKind: 'session' });
+
+  const sent = hub.broadcast({ type: 'item_completed', agentId: 'default', sessionId: 'a', text: 'final' });
+  assert.equal(sent, 0);
+  assert.equal(dead.sent.length, 0);
+  hub.stop();
+});
