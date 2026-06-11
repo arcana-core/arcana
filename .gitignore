@@ -15,3 +15,7 @@ cutpilot-client/
 *.swp
 dist/
 whiteboard/
+
+# cutpilot is maintained in cutpilot-client/services and copied into services/ to install
+services/cutpilot.mjs
+services/services.config.json
